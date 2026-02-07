@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test
+      - run: npx playwright install --with-deps
+        if: ${{ secrets.TEST_AUTH_TOKEN != '' }}
+      - run: npm run test:e2e
+        if: ${{ secrets.TEST_AUTH_TOKEN != '' }}
+        env:
+          TEST_AUTH_TOKEN: ${{ secrets.TEST_AUTH_TOKEN }}
+          TEST_LOGIN_MODE: token
