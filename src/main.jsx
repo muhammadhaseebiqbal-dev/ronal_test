@@ -79,7 +79,6 @@ function AuthDebug() {
 
     useEffect(() => {
         const timer = setTimeout(() => {
-            console.log('[main] Auth timeout - forcing Login button visibility');
             setForceShowLogin(true);
         }, AUTH_TIMEOUT_MS);
 

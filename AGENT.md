@@ -109,6 +109,24 @@ window.diagnoseTokenStorage()    // Check token persistence
 
 ## Last Change Log
 
+**2026-02-09 — Raouf: Milestone 5 — Security Hardening + Build 2**
+- Created `src/lib/logger.js` — production-gated logger (suppresses log() in prod)
+- Removed ALL token value logging (substring, previews, values) across 6 files
+- Gated `window.diagnoseBase44Config`, `window.diagnoseTokenStorage`, `window.getBase44Report` behind `import.meta.env.DEV`
+- Replaced 80+ console.log calls with production-gated `log()` from logger.js
+- Fixed hasToken proof: checks `base44_access_token || token || base44_auth_token`
+- Bumped build number: 1 → 2
+- Verification: lint ✅ (0 src/ errors) test ✅ (42/42) build ✅
+
+**2026-02-09 — Raouf: Milestone 4 — Pre-TestFlight Submission Audit**
+- Full 5-phase adversarial audit (build config, policy, runtime, security, readiness)
+- Build config: 9/9 PASS — version, bundle ID, signing, arm64, no debug flags
+- Policy: Guideline 4.2 HIGH risk (web wrapper), privacy policy URL missing
+- Security: 80+ console.log in production including token previews — needs stripping
+- Runtime: 85/100 determinism — WebView HTTP error handling partial
+- Verdict: Internal TestFlight ✅ SAFE WITH WARNINGS | App Store ⛔ DO NOT UPLOAD
+- Report: `docs/TESTFLIGHT_AUDIT_REPORT.md`
+
 **2026-02-08 — Raouf: Milestone 3 — App Store Blocker Fixes**
 - Fixed Bundle ID → `com.abideandanchor.app`
 - Created `PrivacyInfo.xcprivacy` (UserDefaults API, CA92.1)

@@ -10,6 +10,7 @@ import {
 } from '@/lib/app-params';
 import { saveToken, loadToken, clearToken } from '@/lib/tokenStorage';
 import { initDeepLinkListener, getOAuthCallbackUrl, openOAuthLogin } from '@/lib/deepLinkHandler';
+import { log, error as logError } from '@/lib/logger';
 
 const AuthContext = createContext();
 
@@ -57,19 +58,14 @@ export const AuthProvider = ({ children }) => {
      * @param {string} token - The received token.
      */
     const handleDeepLinkToken = async (token) => {
-        console.log('[AuthContext] === TOKEN RECEIVED VIA DEEP LINK ===');
-        console.log('[AuthContext] Token length:', token.length);
+        log('[AuthContext] token received via deep link, len:', token.length);
 
-        // Bump token version to invalidate any in-flight auth checks with old tokens
         setTokenVersion(v => v + 1);
 
-        // Update state
         setCurrentToken(token);
         appParams.token = token;
-        // Skip localStorage save on iOS (we use Preferences)
         base44.setToken(token, !isCapacitorRuntime());
 
-        // Check user auth with the new token
         await checkUserAuthWithToken(token);
     };
 
@@ -78,59 +74,43 @@ export const AuthProvider = ({ children }) => {
      * Includes proper error handling and logging for iOS debugging.
      */
     const initializeAuth = async () => {
-        console.log('[AuthContext] === INITIALIZING AUTH ===');
-        console.log('[app-params] hasToken:', !!localStorage.getItem('base44_access_token'));
-        console.log('[AuthContext] isCapacitor:', isCapacitorRuntime());
-        console.log('[AuthContext] protocol:', window.location?.protocol);
+        const t = localStorage.getItem('base44_access_token') || localStorage.getItem('token') || localStorage.getItem('base44_auth_token');
+        log('[app-params] hasToken:', !!t);
+        log('[AuthContext] isCapacitor:', isCapacitorRuntime());
 
         try {
             let token = null;
 
-            // Check URL/hash first (OAuth callback - for web)
             const urlToken = getTokenFromLocation(window);
 
             if (urlToken) {
-                console.log('[AuthContext] Token found in URL (OAuth callback)');
-                console.log('[AuthContext] Token length:', urlToken.length);
+                log('[AuthContext] token present in URL:', true, 'len:', urlToken.length);
                 token = urlToken;
 
-                // Persist the new token to native storage
                 const saved = await saveToken(token);
-                console.log('[AuthContext] Token save result:', saved);
+                log('[AuthContext] Token save result:', saved);
 
-                // Clean the URL (remove token params)
                 clearTokenFromLocation(window);
             } else {
-                // Load from native storage (waits for Capacitor bridge)
-                console.log('[auth] restoring token');
+                log('[auth] restoring token');
                 token = await loadToken();
-                if (token) {
-                    console.log('[auth] token restored successfully');
-                    console.log('[AuthContext] Token loaded from storage, length:', token.length);
-                } else {
-                    console.log('[AuthContext] No token in storage');
-                }
+                log('[auth] token restored:', !!token);
             }
 
-            // Update state atomically
             setCurrentToken(token);
             setTokenVersion(v => v + 1);
             appParams.token = token || null;
 
-            // Update the SDK client with the token
             if (token) {
-                // Skip localStorage save on iOS (we use Preferences)
                 base44.setToken(token, !isCapacitorRuntime());
             }
 
-            // Log hasToken status for acceptance test (exact format required)
-            console.log('[app-params] hasToken:', Boolean(token));
-            console.log('[AuthContext] hasToken:', Boolean(token));
+            log('[app-params] hasToken:', Boolean(token));
+            log('[AuthContext] hasToken:', Boolean(token));
 
-            // Now proceed with app state check
             await checkAppStateWithToken(token);
         } catch (error) {
-            console.error('[AuthContext] Init error:', error);
+            logError('[AuthContext] Init error:', error);
             setAuthError({
                 type: 'init_error',
                 message: error.message || 'Failed to initialize authentication'
@@ -138,7 +118,6 @@ export const AuthProvider = ({ children }) => {
             setIsLoadingPublicSettings(false);
             setIsLoadingAuth(false);
         } finally {
-            // Always mark token as loaded, even on error
             setIsTokenLoaded(true);
         }
     };
@@ -182,17 +161,17 @@ export const AuthProvider = ({ children }) => {
                 if (token) {
                     await checkUserAuthWithToken(token);
                 } else {
-                    console.log('[AuthContext] No token available, user needs to login');
+                    log('[AuthContext] No token available, user needs to login');
                     setIsLoadingAuth(false);
                     setIsAuthenticated(false);
                 }
                 setIsLoadingPublicSettings(false);
             } catch (appError) {
-                console.error('[AuthContext] App state check failed:', appError);
+                logError('[AuthContext] App state check failed:', appError);
                 handleAppError(appError);
             }
         } catch (error) {
-            console.error('[AuthContext] Unexpected error:', error);
+            logError('[AuthContext] Unexpected error:', error);
             setAuthError({
                 type: 'unknown',
                 message: error.message || 'An unexpected error occurred'
@@ -239,37 +218,33 @@ export const AuthProvider = ({ children }) => {
      * @param {string} token - The auth token.
      */
     const checkUserAuthWithToken = async (token) => {
-        // Capture token version at start of check to detect if token changed mid-flight
         const versionAtStart = tokenVersion;
         try {
             setIsLoadingAuth(true);
-            console.log('[AuthContext] Checking user auth with token...');
+            log('[AuthContext] Checking user auth...');
 
-            // Ensure SDK has the token
             base44.setToken(token, !isCapacitorRuntime());
 
             const currentUser = await base44.auth.me();
-            console.log('[auth] /User/me status:', 200);
-            console.log('[AuthContext] User authenticated:', { userId: currentUser?.id });
+            log('[auth] /User/me status:', 200);
+            log('[AuthContext] User authenticated:', { userId: currentUser?.id });
 
             setUser(currentUser);
             setIsAuthenticated(true);
             setIsLoadingAuth(false);
         } catch (error) {
             const status = error.status || error.response?.status || 'unknown';
-            console.log('[auth] /User/me status:', status);
-            console.error('[AuthContext] User auth check failed:', error);
+            log('[auth] /User/me status:', status);
+            logError('[AuthContext] User auth check failed:', error);
             setIsLoadingAuth(false);
             setIsAuthenticated(false);
 
-            // If auth fails with 401/403, token might be expired
-            // BUT only clear if the token hasn't been replaced by a newer one (deep link race guard)
             if (error.status === 401 || error.status === 403) {
                 if (tokenVersion !== versionAtStart) {
-                    console.log('[AuthContext] Token was updated during auth check — skipping clear (race guard)');
+                    log('[AuthContext] Token was updated during auth check — skipping clear (race guard)');
                     return;
                 }
-                console.log('[AuthContext] Token appears expired, clearing storage');
+                log('[AuthContext] Token appears expired, clearing storage');
                 await clearToken();
                 setCurrentToken(null);
                 appParams.token = null;
@@ -294,7 +269,7 @@ export const AuthProvider = ({ children }) => {
      * @param {boolean} shouldRedirect - Whether to redirect to login.
      */
     const logout = async (shouldRedirect = true) => {
-        console.log('[AuthContext] Logging out...');
+        log('[AuthContext] Logging out...');
         setUser(null);
         setIsAuthenticated(false);
         setCurrentToken(null);
@@ -322,7 +297,7 @@ export const AuthProvider = ({ children }) => {
             const callbackUrl = getOAuthCallbackUrl();
             const encodedCallback = encodeURIComponent(callbackUrl);
             const loginUrl = `${appParams.appBaseUrl}/login?from_url=${encodedCallback}`;
-            console.log('[AuthContext] Opening OAuth in SFSafariViewController:', loginUrl);
+            log('[AuthContext] Opening OAuth in SFSafariViewController');
             openOAuthLogin(loginUrl);
         } else {
             // Web: Use SDK's redirectToLogin (navigates in same window)
@@ -330,10 +305,10 @@ export const AuthProvider = ({ children }) => {
         }
     };
 
-    // Log current state for debugging
+    // Log current state for debugging (dev only)
     useEffect(() => {
         if (isCapacitorRuntime()) {
-            console.log('[AuthContext] State update:', {
+            log('[AuthContext] State update:', {
                 isTokenLoaded,
                 hasToken: Boolean(currentToken),
                 isLoadingAuth,

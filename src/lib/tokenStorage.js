@@ -10,6 +10,7 @@
 
 import { Preferences } from '@capacitor/preferences';
 import { isCapacitorRuntime } from './runtime.js';
+import { log, error as logError, warn } from './logger.js';
 
 const TOKEN_KEY = 'base44_auth_token';
 
@@ -28,39 +29,32 @@ const isNative = () => isCapacitorRuntime();
  */
 const waitForCapacitorReady = async (timeout = 5000) => {
     if (typeof window === 'undefined') {
-        console.log('[tokenStorage] No window object');
+        log('[tokenStorage] No window object');
         return false;
     }
 
     const start = Date.now();
 
-    // Already ready?
     if (window.Capacitor?.isNativePlatform?.()) {
-        console.log('[tokenStorage] Capacitor already ready');
+        log('[tokenStorage] Capacitor already ready');
         return true;
     }
 
-    // Wait for Capacitor bridge (protocol may be https: with remote URL mode)
-    console.log('[tokenStorage] Waiting for Capacitor...', {
-        protocol: window.location?.protocol,
-        hasCapacitor: Boolean(window.Capacitor)
-    });
+    log('[tokenStorage] Waiting for Capacitor...');
 
     if (window.Capacitor) {
         while (Date.now() - start < timeout) {
             if (window.Capacitor?.isNativePlatform?.()) {
-                console.log('[tokenStorage] Capacitor bridge ready after', Date.now() - start, 'ms');
+                log('[tokenStorage] Capacitor bridge ready after', Date.now() - start, 'ms');
                 return true;
             }
-            // Also check if Capacitor exists without isNativePlatform (older versions)
             if (window.Capacitor && typeof window.Capacitor.isNativePlatform !== 'function') {
-                console.log('[tokenStorage] Capacitor detected (legacy mode) after', Date.now() - start, 'ms');
+                log('[tokenStorage] Capacitor detected (legacy mode) after', Date.now() - start, 'ms');
                 return true;
             }
             await new Promise(r => setTimeout(r, 100));
         }
-        console.error('[tokenStorage] Capacitor bridge TIMEOUT after', timeout, 'ms');
-        console.error('[tokenStorage] window.Capacitor =', window.Capacitor);
+        logError('[tokenStorage] Capacitor bridge TIMEOUT after', timeout, 'ms');
         return false;
     }
 
@@ -86,49 +80,43 @@ export const createTokenStorage = ({
      */
     const saveToken = async (token) => {
         if (!token) {
-            console.warn('[tokenStorage] Attempted to save null/empty token');
+            warn('[tokenStorage] Attempted to save null/empty token');
             return false;
         }
 
         const native = isNativeImpl();
-        console.log('[tokenStorage] === SAVING TOKEN ===');
-        console.log('[tokenStorage] isNative:', native);
-        console.log('[tokenStorage] tokenLength:', token.length);
-        console.log('[tokenStorage] tokenPreview:', token.substring(0, 20) + '...');
+        log('[tokenStorage] saveToken: isNative:', native, 'len:', token.length);
 
         if (native) {
-            // iOS: ONLY use Capacitor Preferences
             const ready = await waitForCapacitorReady();
             if (!ready) {
-                console.error('[tokenStorage] CRITICAL: Capacitor not ready, cannot save token!');
+                logError('[tokenStorage] CRITICAL: Capacitor not ready, cannot save token!');
                 return false;
             }
 
             try {
                 await PreferencesImpl.set({ key: TOKEN_KEY, value: token });
-                console.log('[tokenStorage] ✅ Token SAVED to Capacitor Preferences');
+                log('[tokenStorage] ✅ Token SAVED to Capacitor Preferences');
 
-                // Verify it was saved
                 const verify = await PreferencesImpl.get({ key: TOKEN_KEY });
                 if (verify.value === token) {
-                    console.log('[tokenStorage] ✅ Token verified in Preferences');
+                    log('[tokenStorage] ✅ Token verified in Preferences');
                     return true;
                 } else {
-                    console.error('[tokenStorage] ❌ Token verification FAILED!');
+                    logError('[tokenStorage] ❌ Token verification FAILED!');
                     return false;
                 }
-            } catch (error) {
-                console.error('[tokenStorage] ❌ Failed to save token:', error);
+            } catch (err) {
+                logError('[tokenStorage] ❌ Failed to save token:', err);
                 return false;
             }
         } else {
-            // Web: Use localStorage
             try {
                 storageImpl?.setItem(TOKEN_KEY, token);
-                console.log('[tokenStorage] Token saved to localStorage (web)');
+                log('[tokenStorage] Token saved to localStorage (web)');
                 return true;
             } catch (e) {
-                console.warn('[tokenStorage] localStorage save failed:', e);
+                warn('[tokenStorage] localStorage save failed:', e);
                 return false;
             }
         }
@@ -143,40 +131,26 @@ export const createTokenStorage = ({
      */
     const loadToken = async () => {
         const native = isNativeImpl();
-        console.log('[tokenStorage] === LOADING TOKEN ===');
-        console.log('[tokenStorage] isNative:', native);
+        log('[tokenStorage] loadToken: isNative:', native);
 
         if (native) {
-            // iOS: ONLY use Capacitor Preferences
             const ready = await waitForCapacitorReady();
             if (!ready) {
-                console.error('[tokenStorage] CRITICAL: Capacitor not ready, cannot load token!');
+                logError('[tokenStorage] CRITICAL: Capacitor not ready, cannot load token!');
                 return null;
             }
 
             try {
                 const { value } = await PreferencesImpl.get({ key: TOKEN_KEY });
-                console.log('[tokenStorage] Preferences.get result:', {
-                    hasValue: Boolean(value),
-                    valueLength: value?.length || 0,
-                    valuePreview: value ? value.substring(0, 20) + '...' : null
-                });
-
-                if (value) {
-                    console.log('[tokenStorage] ✅ Token LOADED from Capacitor Preferences');
-                    return value;
-                } else {
-                    console.log('[tokenStorage] No token in Capacitor Preferences');
-                    return null;
-                }
-            } catch (error) {
-                console.error('[tokenStorage] ❌ Failed to load token:', error);
+                log('[tokenStorage] token present:', !!value, 'len:', value?.length ?? 0);
+                return value || null;
+            } catch (err) {
+                logError('[tokenStorage] ❌ Failed to load token:', err);
                 return null;
             }
         } else {
-            // Web: Use localStorage
             const token = storageImpl?.getItem(TOKEN_KEY) ?? null;
-            console.log('[tokenStorage] Token from localStorage:', { hasToken: Boolean(token) });
+            log('[tokenStorage] token present:', !!token);
             return token;
         }
     };
@@ -188,22 +162,20 @@ export const createTokenStorage = ({
      */
     const clearToken = async () => {
         const native = isNativeImpl();
-        console.log('[tokenStorage] === CLEARING TOKEN ===');
-        console.log('[tokenStorage] isNative:', native);
+        log('[tokenStorage] clearToken: isNative:', native);
 
         if (native) {
             const ready = await waitForCapacitorReady();
             if (ready) {
                 try {
                     await PreferencesImpl.remove({ key: TOKEN_KEY });
-                    console.log('[tokenStorage] Token cleared from Capacitor Preferences');
-                } catch (error) {
-                    console.error('[tokenStorage] Failed to clear token:', error);
+                    log('[tokenStorage] Token cleared from Capacitor Preferences');
+                } catch (err) {
+                    logError('[tokenStorage] Failed to clear token:', err);
                 }
             }
         }
 
-        // Also clear localStorage (for web and cleanup)
         try {
             storageImpl?.removeItem(TOKEN_KEY);
         } catch {
@@ -229,31 +201,25 @@ export const createTokenStorage = ({
      */
     const diagnoseTokenStorage = async () => {
         const native = isNativeImpl();
-        let nativeToken = null;
+        let hasNativeToken = false;
         let nativeError = null;
-        let localToken = null;
+        let hasLocalToken = false;
         let bridgeReady = false;
-
-        console.log('[tokenStorage] === DIAGNOSTICS ===');
 
         if (native) {
             bridgeReady = await waitForCapacitorReady(2000);
-            console.log('[tokenStorage] Bridge ready:', bridgeReady);
-
             if (bridgeReady) {
                 try {
                     const result = await PreferencesImpl.get({ key: TOKEN_KEY });
-                    nativeToken = result.value;
-                    console.log('[tokenStorage] Native token:', nativeToken ? 'EXISTS' : 'NULL');
+                    hasNativeToken = Boolean(result.value);
                 } catch (e) {
                     nativeError = e.message;
-                    console.error('[tokenStorage] Native error:', e);
                 }
             }
         }
 
         try {
-            localToken = storageImpl?.getItem(TOKEN_KEY);
+            hasLocalToken = Boolean(storageImpl?.getItem(TOKEN_KEY));
         } catch {
             // Ignore
         }
@@ -261,16 +227,14 @@ export const createTokenStorage = ({
         const report = {
             isNative: native,
             protocol: typeof window !== 'undefined' ? window.location?.protocol : 'N/A',
-            capacitorExists: typeof window !== 'undefined' ? Boolean(window.Capacitor) : false,
-            capacitorIsNative: typeof window !== 'undefined' ? window.Capacitor?.isNativePlatform?.() : false,
             bridgeReady,
-            nativeToken: nativeToken ? `${nativeToken.substring(0, 20)}... (${nativeToken.length} chars)` : null,
+            hasNativeToken,
             nativeError,
-            localToken: localToken ? `${localToken.substring(0, 20)}... (${localToken.length} chars)` : null,
-            hasToken: Boolean(nativeToken || localToken),
+            hasLocalToken,
+            hasToken: hasNativeToken || hasLocalToken,
             recommendation: native
-                ? (nativeToken ? '✅ Token in Preferences - should persist' : '❌ No token in Preferences - need to login')
-                : (localToken ? '✅ Token in localStorage (web mode)' : '❌ No token - need to login')
+                ? (hasNativeToken ? '✅ Token in Preferences - should persist' : '❌ No token in Preferences - need to login')
+                : (hasLocalToken ? '✅ Token in localStorage (web mode)' : '❌ No token - need to login')
         };
 
         console.log('%c[Token Storage Diagnostics]', 'color: #007AFF; font-weight: bold;');
@@ -295,7 +259,7 @@ export const clearToken = defaultStorage.clearToken;
 export const hasStoredToken = defaultStorage.hasStoredToken;
 export const diagnoseTokenStorage = defaultStorage.diagnoseTokenStorage;
 
-// Expose diagnostic function globally
-if (typeof window !== 'undefined') {
+// Expose diagnostic function only in development
+if (typeof window !== 'undefined' && typeof import.meta !== 'undefined' && import.meta.env?.DEV) {
     window.diagnoseTokenStorage = diagnoseTokenStorage;
 }

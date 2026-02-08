@@ -6,6 +6,7 @@
  */
 
 import { isCapacitorRuntime } from './runtime.js';
+import { log, warn, error as logError } from './logger.js';
 
 // =============================================================================
 // CONFIGURATION - Update these values for your Base44 app
@@ -138,7 +139,7 @@ export const resolveAppId = (env, isCapacitor) => {
     if (envAppId) return envAppId;
 
     if (isCapacitor && FALLBACK_APP_ID !== 'YOUR_BASE44_APP_ID') {
-        console.warn('[app-params] Using fallback App ID for Capacitor build.');
+        warn('[app-params] Using fallback App ID for Capacitor build.');
         return FALLBACK_APP_ID;
     }
 
@@ -223,15 +224,14 @@ export const clearTokenFromLocation = (win) => {
 export const getTokenFromUrl = (win) => {
     const token = getTokenFromLocation(win);
     if (token) {
-        console.log('[app-params] Token found in URL (OAuth callback)');
+        log('[app-params] token present in URL:', true);
         return token;
     }
 
-    // Then check localStorage for persisted token
     try {
         const storedToken = localStorage.getItem('base44_auth_token');
         if (storedToken) {
-            console.log('[app-params] Token found in localStorage (persisted)');
+            log('[app-params] token present in localStorage:', true);
             return storedToken;
         }
     } catch {
@@ -408,28 +408,23 @@ export const printDiagnostics = () => {
     return report;
 };
 
-// Expose diagnostics globally for Safari Web Inspector
-if (typeof window !== 'undefined') {
+// Expose diagnostics only in development
+if (typeof window !== 'undefined' && typeof import.meta !== 'undefined' && import.meta.env?.DEV) {
     window.diagnoseBase44Config = printDiagnostics;
     window.getBase44Report = generateDiagnosticReport;
 }
 
-// Debug logging for troubleshooting (only in development or Capacitor)
-if (typeof import.meta !== 'undefined' && (import.meta.env?.DEV || isCapacitorRuntime())) {
+// Configuration logging (dev only)
+if (typeof import.meta !== 'undefined' && import.meta.env?.DEV) {
     const validation = validateAppParams(appParams);
-    console.log('[app-params] Configuration loaded:', {
+    log('[app-params] Configuration loaded:', {
         appId: appParams.appId ? `${appParams.appId.substring(0, 8)}...` : 'NULL',
         serverUrl: appParams.serverUrl,
-        appBaseUrl: appParams.appBaseUrl,
         hasToken: Boolean(appParams.token),
-        functionsVersion: appParams.functionsVersion,
-        isCapacitor: isCapacitorRuntime(),
-        protocol: typeof window !== 'undefined' ? window.location.protocol : 'N/A',
         valid: validation.valid
     });
 
     if (!validation.valid) {
-        console.error('[app-params] Configuration issues:', validation.issues);
-        console.log('[app-params] Run window.diagnoseBase44Config() for full diagnostics');
+        logError('[app-params] Configuration issues:', validation.issues);
     }
 }

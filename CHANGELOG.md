@@ -4,6 +4,67 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-09 — Raouf: Pre-TestFlight Submission Audit (Milestone 4)
+
+**Scope:** Full 5-phase pre-TestFlight audit — build config, App Store policy, runtime stability, security, readiness  
+**Summary:** Adversarial audit of all iOS project files simulating App Store review rejection scenarios.
+
+**Findings:**
+1. **Build Configuration** — 9/9 PASS (version, bundle ID, signing, arm64, no debug flags in Release)
+2. **App Store Policy** — 2 HIGH findings: Guideline 4.2 web wrapper risk, missing privacy policy URL
+3. **Runtime Stability** — 85/100 determinism score. Offline handling, token persistence, cold start all pass. WebView HTTP error handling is partial.
+4. **Security** — 80+ console.log statements in production JS including token previews (first 20 chars). Diagnostic functions globally exposed.
+5. **TestFlight Readiness** — Internal testing: 88% ready (SAFE WITH WARNINGS). App Store: 55% (DO NOT UPLOAD).
+
+**Files Changed:**
+- `docs/TESTFLIGHT_AUDIT_REPORT.md` — **NEW** — Full audit report with per-item PASS/FAIL, severity ratings, fix recommendations
+
+**Verdict:**
+- ✅ SAFE WITH WARNINGS for internal TestFlight
+- ⛔ DO NOT UPLOAD for App Store (4 blocking issues)
+
+**Follow-ups (Priority Order):**
+1. Strip console.log in production builds (Vite terser/esbuild drop)
+2. Guard diagnostic functions behind import.meta.env.DEV
+3. Host privacy policy URL
+4. Add native features to mitigate Guideline 4.2
+5. Add WebView error handling beyond offline detection
+
+---
+
+### 2026-02-09 — Raouf: Security Hardening + Build 2 (Milestone 5)
+
+**Scope:** Fix all security/professionalism issues from Milestone 4 audit — token logging, debug globals, build bump  
+**Summary:** Removed all token value logging, created production-gated logger, gated debug globals behind DEV, bumped build to 2.
+
+**Fixes Applied:**
+1. **Created `src/lib/logger.js`** — Production-safe logger that suppresses `log()` in prod, keeps `warn()`/`error()`
+2. **Removed all token value logging** — No `token.substring()`, no token previews, no token values in console
+3. **Gated `window.diagnoseBase44Config`** behind `import.meta.env.DEV`
+4. **Gated `window.diagnoseTokenStorage`** behind `import.meta.env.DEV`
+5. **Gated `window.getBase44Report`** behind `import.meta.env.DEV`
+6. **Replaced 80+ console.log calls** across 6 files with production-gated `log()` from logger.js
+7. **Fixed hasToken proof** — Now checks `base44_access_token || token || base44_auth_token`
+8. **Bumped build number** — `CURRENT_PROJECT_VERSION = 2` in both Debug and Release
+9. **Removed unused import** — `isCapacitorRuntime` from `base44Client.js`
+
+**Files Changed:**
+- `src/lib/logger.js` — **NEW**
+- `src/lib/tokenStorage.js` — Safe logging, gated diagnostics
+- `src/lib/deepLinkHandler.js` — Safe logging
+- `src/context/AuthContext.jsx` — Safe logging, fixed hasToken proof
+- `src/lib/app-params.js` — Gated window globals, safe logging
+- `src/api/base44Client.js` — Safe logging, removed unused import
+- `src/main.jsx` — Removed console.log
+- `ios/App/App.xcodeproj/project.pbxproj` — Build 1 → 2
+
+**Verification:**
+- `npm run lint` — ✅ (0 errors in src/)
+- `npm run test` — ✅ (42/42 passed)
+- `npm run build` — ✅
+
+---
+
 ### 2026-02-08 — Raouf: App Store Blocker Fixes (Milestone 3)
 
 **Scope:** iOS release engineering — fix all critical blockers from Milestone 2 audit  

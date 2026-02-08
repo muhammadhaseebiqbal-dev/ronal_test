@@ -5,13 +5,14 @@
  */
 
 import { createClient } from '@base44/sdk';
-import { appParams, validateAppParams, isCapacitorRuntime } from '@/lib/app-params';
+import { appParams, validateAppParams } from '@/lib/app-params';
+import { log, error as logError } from '@/lib/logger';
 
 const validation = validateAppParams(appParams);
 
 if (!validation.valid) {
-    console.error('[base44Client] Invalid configuration detected.');
-    console.error('[base44Client] Fix these issues before building for iOS:', validation.issues);
+    logError('[base44Client] Invalid configuration detected.');
+    logError('[base44Client] Fix these issues before building for iOS:', validation.issues);
 }
 
 /**
@@ -26,12 +27,10 @@ export const base44 = createClient({
     requiresAuth: false
 });
 
-if (typeof import.meta !== 'undefined' && (import.meta.env?.DEV || isCapacitorRuntime())) {
-    console.log('[base44Client] Client created:', {
+if (typeof import.meta !== 'undefined' && import.meta.env?.DEV) {
+    log('[base44Client] Client created:', {
         appId: appParams.appId ? 'SET' : 'MISSING',
         hasToken: Boolean(appParams.token),
-        functionsVersion: appParams.functionsVersion,
-        serverUrl: appParams.serverUrl,
-        appBaseUrl: appParams.appBaseUrl
+        serverUrl: appParams.serverUrl
     });
 }

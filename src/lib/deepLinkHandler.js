@@ -12,6 +12,7 @@ import { App } from '@capacitor/app';
 import { Browser } from '@capacitor/browser';
 import { saveToken } from './tokenStorage.js';
 import { isCapacitorRuntime } from './runtime.js';
+import { log, error as logError, warn } from './logger.js';
 
 /**
  * Custom URL scheme for the app.
@@ -75,7 +76,7 @@ export const parseDeepLink = (url) => {
 
         return { token: token || null, isAuthCallback: true };
     } catch (error) {
-        console.error('[deepLinkHandler] Failed to parse URL:', error);
+        logError('[deepLinkHandler] Failed to parse URL:', error);
         return { token: null, isAuthCallback: false };
     }
 };
@@ -109,47 +110,41 @@ export const setTokenCallback = (callback) => {
  * @returns {Promise<boolean>} True if token was handled.
  */
 export const handleDeepLink = async (url) => {
-    console.log('[deepLinkHandler] === DEEP LINK RECEIVED ===');
-    console.log('[deepLinkHandler] URL:', url);
+    log('[deepLinkHandler] deep link received');
 
-    // Guard: skip if we already processed this exact URL
     if (url && url === lastProcessedUrl) {
-        console.log('[deepLinkHandler] Duplicate deep link, skipping');
+        log('[deepLinkHandler] Duplicate deep link, skipping');
         return false;
     }
 
     const { token, isAuthCallback } = parseDeepLink(url);
 
     if (!isAuthCallback) {
-        console.log('[deepLinkHandler] Not an auth callback, ignoring');
+        log('[deepLinkHandler] Not an auth callback, ignoring');
         return false;
     }
 
     if (!token) {
-        console.warn('[deepLinkHandler] Auth callback but no token found!');
+        warn('[deepLinkHandler] Auth callback but no token found!');
         return false;
     }
 
-    console.log('[deepLinkHandler] Token received, length:', token.length);
-    console.log('[deepLinkHandler] Token preview:', token.substring(0, 20) + '...');
+    log('[deepLinkHandler] token present:', true, 'len:', token.length);
 
-    // Mark as processed to prevent double-handling
     lastProcessedUrl = url;
 
-    // Save token to Capacitor Preferences
     const saved = await saveToken(token);
-    console.log('[deepLinkHandler] Token save result:', saved);
+    log('[deepLinkHandler] Token save result:', saved);
 
-    // Close the in-app browser (SFSafariViewController) if it was used for OAuth
     try {
         await Browser.close();
-        console.log('[deepLinkHandler] Browser closed');
+        log('[deepLinkHandler] Browser closed');
     } catch {
         // Browser might not be open, ignore
     }
 
     if (saved && tokenCallback) {
-        console.log('[deepLinkHandler] Triggering token callback');
+        log('[deepLinkHandler] Triggering token callback');
         tokenCallback(token);
     }
 
@@ -165,35 +160,32 @@ export const handleDeepLink = async (url) => {
  */
 export const initDeepLinkListener = async (onTokenReceived) => {
     if (!isCapacitorRuntime()) {
-        console.log('[deepLinkHandler] Not in Capacitor, skipping deep link setup');
+        log('[deepLinkHandler] Not in Capacitor, skipping deep link setup');
         return;
     }
 
-    console.log('[deepLinkHandler] Initializing deep link listener...');
+    log('[deepLinkHandler] Initializing deep link listener...');
 
     if (onTokenReceived) {
         setTokenCallback(onTokenReceived);
     }
 
-    // Listen for future deep links (app already running)
     App.addListener('appUrlOpen', async (event) => {
-        console.log('[deep-link] received:', event.url);
-        console.log('[deepLinkHandler] appUrlOpen event:', event.url);
+        log('[deep-link] received');
         await handleDeepLink(event.url);
     });
 
-    // Check if app was opened via deep link (cold start)
     try {
         const launchUrl = await App.getLaunchUrl();
         if (launchUrl?.url) {
-            console.log('[deepLinkHandler] App launched with URL:', launchUrl.url);
+            log('[deepLinkHandler] App launched with URL');
             await handleDeepLink(launchUrl.url);
         }
     } catch {
-        console.log('[deepLinkHandler] No launch URL (normal cold start)');
+        log('[deepLinkHandler] No launch URL (normal cold start)');
     }
 
-    console.log('[deepLinkHandler] Deep link listener initialized');
+    log('[deepLinkHandler] Deep link listener initialized');
 };
 
 /**
@@ -217,12 +209,11 @@ export const removeDeepLinkListener = () => {
  * @returns {Promise<void>}
  */
 export const openOAuthLogin = async (loginUrl) => {
-    console.log('[deepLinkHandler] Opening OAuth in SFSafariViewController:', loginUrl);
+    log('[deepLinkHandler] Opening OAuth in SFSafariViewController');
     try {
         await Browser.open({ url: loginUrl, presentationStyle: 'popover' });
-    } catch (error) {
-        console.error('[deepLinkHandler] Failed to open browser, falling back to WebView:', error);
-        // Fallback: navigate WebView directly (less reliable for deep links)
+    } catch (err) {
+        logError('[deepLinkHandler] Failed to open browser, falling back to WebView:', err);
         window.location.href = loginUrl;
     }
 };
