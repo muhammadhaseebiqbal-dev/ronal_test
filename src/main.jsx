@@ -8,6 +8,58 @@ import { AuthProvider, useAuth } from '@/context/AuthContext';
  */
 const AUTH_TIMEOUT_MS = 5000;
 
+/** Shared inline styles for consistent native-like appearance */
+const containerStyle = {
+    padding: '40px 20px',
+    fontFamily: '-apple-system, BlinkMacSystemFont, system-ui, sans-serif',
+    maxWidth: '400px',
+    margin: '0 auto',
+    textAlign: 'center',
+    minHeight: '100vh',
+    display: 'flex',
+    flexDirection: 'column',
+    justifyContent: 'center',
+    backgroundColor: '#0b1f2a',
+    color: '#e8dcc8'
+};
+
+const buttonStyle = {
+    padding: '14px 28px',
+    fontSize: '18px',
+    marginTop: '20px',
+    cursor: 'pointer',
+    backgroundColor: '#c9a96e',
+    color: '#0b1f2a',
+    border: 'none',
+    borderRadius: '12px',
+    fontWeight: '600',
+    width: '100%',
+    maxWidth: '280px'
+};
+
+/**
+ * Offline fallback — shown when the device has no network.
+ * Prevents blank white screen, which triggers Guideline 4.2 rejection.
+ */
+function OfflineScreen() {
+    const retry = () => window.location.reload();
+
+    return (
+        <div style={containerStyle}>
+            <h1 style={{ fontSize: '28px', marginBottom: '8px' }}>Abide &amp; Anchor</h1>
+            <p style={{ color: '#c9a96e', fontSize: '16px', marginBottom: '24px' }}>
+                No internet connection
+            </p>
+            <p style={{ fontSize: '14px', opacity: 0.7, lineHeight: '1.5' }}>
+                Please check your Wi-Fi or cellular connection and try again.
+            </p>
+            <button onClick={retry} style={buttonStyle}>
+                Retry
+            </button>
+        </div>
+    );
+}
+
 /**
  * Main auth UI component.
  * ALWAYS shows Login button after timeout, regardless of loading state.
@@ -17,14 +69,12 @@ function AuthDebug() {
         isLoadingAuth,
         isLoadingPublicSettings,
         isAuthenticated,
-        hasToken,
         isTokenLoaded,
         user,
         authError,
         navigateToLogin
     } = useAuth();
 
-    // Force show login button after timeout
     const [forceShowLogin, setForceShowLogin] = useState(false);
 
     useEffect(() => {
@@ -36,92 +86,48 @@ function AuthDebug() {
         return () => clearTimeout(timer);
     }, []);
 
-    // If authenticated, show success
     if (isAuthenticated && user) {
         return (
-            <div style={{ padding: '20px', fontFamily: 'system-ui, sans-serif' }}>
-                <h1>Abide & Anchor</h1>
-                <p style={{ color: 'green', fontSize: '18px' }}>✅ Authenticated!</p>
-                <pre style={{ fontSize: '11px', background: '#f0f0f0', padding: '10px', borderRadius: '5px' }}>
-                    {JSON.stringify({
-                        userId: user.id,
-                        email: user.email,
-                        hasToken
-                    }, null, 2)}
-                </pre>
-                <p style={{ fontSize: '13px', color: '#666', marginTop: '20px' }}>
+            <div style={containerStyle}>
+                <h1 style={{ fontSize: '28px', marginBottom: '8px' }}>Abide &amp; Anchor</h1>
+                <p style={{ color: '#4ade80', fontSize: '18px' }}>✅ Authenticated</p>
+                <p style={{ fontSize: '14px', opacity: 0.7, marginTop: '16px', lineHeight: '1.5' }}>
                     Token persistence test: Kill the app and reopen.<br />
-                    You should still be authenticated.
+                    You should remain authenticated.
                 </p>
             </div>
         );
     }
 
-    // If auth error, show error and Login button
     if (authError) {
         return (
-            <div style={{ padding: '20px', fontFamily: 'system-ui, sans-serif' }}>
-                <h1>Abide & Anchor</h1>
-                <p style={{ color: '#cc0000' }}>{authError.message}</p>
-                <pre style={{ fontSize: '11px', background: '#fff0f0', padding: '10px', borderRadius: '5px' }}>
-                    {JSON.stringify({ type: authError.type, hasToken }, null, 2)}
-                </pre>
-                <button
-                    onClick={navigateToLogin}
-                    style={{
-                        padding: '14px 28px',
-                        fontSize: '18px',
-                        marginTop: '15px',
-                        cursor: 'pointer',
-                        backgroundColor: '#007AFF',
-                        color: 'white',
-                        border: 'none',
-                        borderRadius: '8px',
-                        fontWeight: '600'
-                    }}
-                >
+            <div style={containerStyle}>
+                <h1 style={{ fontSize: '28px', marginBottom: '8px' }}>Abide &amp; Anchor</h1>
+                <p style={{ color: '#c9a96e', fontSize: '16px', marginBottom: '16px' }}>
+                    {authError.type === 'auth_required' ? 'Please log in to continue' : authError.message}
+                </p>
+                <button onClick={navigateToLogin} style={buttonStyle}>
                     Log In
                 </button>
             </div>
         );
     }
 
-    // Loading state - but ALWAYS show Login after timeout
     const isLoading = !isTokenLoaded || isLoadingAuth || isLoadingPublicSettings;
     const showLogin = forceShowLogin || !isLoading;
 
     return (
-        <div style={{ padding: '20px', fontFamily: 'system-ui, sans-serif' }}>
-            <h1>Abide & Anchor</h1>
+        <div style={containerStyle}>
+            <h1 style={{ fontSize: '28px', marginBottom: '8px' }}>Abide &amp; Anchor</h1>
 
             {isLoading && !forceShowLogin ? (
-                <p>Loading...</p>
+                <p style={{ color: '#c9a96e' }}>Loading...</p>
             ) : (
-                <p>Please log in to continue</p>
+                <p style={{ color: '#c9a96e' }}>Please log in to continue</p>
             )}
 
-            <pre style={{ fontSize: '11px', background: '#f0f0f0', padding: '10px', borderRadius: '5px', marginTop: '10px' }}>
-                isTokenLoaded: {String(isTokenLoaded)}{'\n'}
-                isLoadingAuth: {String(isLoadingAuth)}{'\n'}
-                hasToken: {String(hasToken)}{'\n'}
-                forceShowLogin: {String(forceShowLogin)}
-            </pre>
-
             {showLogin && (
-                <button
-                    onClick={navigateToLogin}
-                    style={{
-                        padding: '14px 28px',
-                        fontSize: '18px',
-                        marginTop: '15px',
-                        cursor: 'pointer',
-                        backgroundColor: '#007AFF',
-                        color: 'white',
-                        border: 'none',
-                        borderRadius: '8px',
-                        fontWeight: '600'
-                    }}
-                >
+                <button onClick={navigateToLogin} style={buttonStyle}>
                     Log In
                 </button>
             )}
@@ -130,9 +136,26 @@ function AuthDebug() {
 }
 
 /**
- * Root component with auth provider.
+ * Root component with auth provider and offline detection.
  */
 function App() {
+    const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+    useEffect(() => {
+        const handleOnline = () => setIsOnline(true);
+        const handleOffline = () => setIsOnline(false);
+        window.addEventListener('online', handleOnline);
+        window.addEventListener('offline', handleOffline);
+        return () => {
+            window.removeEventListener('online', handleOnline);
+            window.removeEventListener('offline', handleOffline);
+        };
+    }, []);
+
+    if (!isOnline) {
+        return <OfflineScreen />;
+    }
+
     return (
         <AuthProvider>
             <AuthDebug />

@@ -15,13 +15,23 @@ const config: CapacitorConfig = {
     // iOS-specific configuration
     ios: {
         preferredContentMode: 'mobile',
-        allowsLinkPreview: false
+        allowsLinkPreview: false,
+        // Disable overscroll bounce — native feel, avoids "web app" appearance
+        scrollEnabled: true,
+        backgroundColor: '#0b1f2a'
         // NOTE: Do NOT set ios.scheme — it would change the WebView origin
         // and collide with the deep link scheme in Info.plist.
     },
     // Plugins configuration
     plugins: {
-        Preferences: {}
+        Preferences: {},
+        // SplashScreen persists until web content loads — prevents blank white flash
+        SplashScreen: {
+            launchAutoHide: true,
+            launchShowDuration: 0,
+            backgroundColor: '#0b1f2a',
+            showSpinner: false
+        }
     }
 };
 

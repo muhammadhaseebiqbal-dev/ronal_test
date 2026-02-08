@@ -1,5 +1,12 @@
 # AGENT.md — Project Rules for Abide & Anchor iOS
 
+## Project Overview
+
+**App Name:** Abide & Anchor  
+**Client:** Roland L.  
+**Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
+**Current Phase:** Milestone 3 — App Store submission preparation
+
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
 
@@ -10,14 +17,49 @@ Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin 
 - **Auth:** Base44 OAuth via deep links (abideandanchor://)
 - **Token Storage:** Capacitor Preferences (iOS UserDefaults)
 
+---
+
 ## Critical Rules
 
-1. **Never set `ios.scheme`** in `capacitor.config.ts` — it would change the WebView origin and break localStorage persistence.
-2. **Always use `server.url: 'https://abideandanchor.app'`** — this is the production remote URL mode.
-3. **App ID must never be null** — `VITE_BASE44_APP_ID=69586539f13402a151c12aa3` must be set in `.env.production` and baked into the build.
-4. **Token storage must use Capacitor Preferences on iOS** — localStorage alone is unreliable across cold restarts under some WKWebView configurations.
-5. **Deep links use custom URL scheme** `abideandanchor://` — NOT universal links.
-6. **Bundle ID:** `com.abideandanchor.app` (must match Xcode project, App Store Connect, and provisioning profiles).
+### 1. Never set `ios.scheme` in `capacitor.config.ts`
+It would change the WebView origin and break localStorage persistence. It would also collide with the deep link scheme in Info.plist.
+
+### 2. Always use `server.url: 'https://abideandanchor.app'`
+This is the production remote URL mode. The WKWebView loads the live site directly.
+
+### 3. App ID must never be null
+`VITE_BASE44_APP_ID=69586539f13402a151c12aa3` must be set in `.env.production` and baked into the build. Fallback hardcoded in `app-params.js`.
+
+### 4. Token storage must use Capacitor Preferences on iOS
+localStorage alone is unreliable across cold restarts under some WKWebView configurations. The `tokenStorage.js` module handles this.
+
+### 5. Deep links use custom URL scheme `abideandanchor://`
+NOT universal links. Registered in Info.plist under CFBundleURLTypes.
+
+### 6. Bundle ID: `com.abideandanchor.app`
+Must match Xcode project, App Store Connect, and provisioning profiles.
+
+### 7. Environment Variables
+- **ALWAYS** ensure `VITE_BASE44_APP_ID` is set before iOS builds.
+- Environment variables are baked in at **build time** (not runtime).
+- Use `.env.production` for production/iOS builds.
+- Never commit actual API keys — use placeholders.
+
+### 8. Token Persistence (CRITICAL)
+- **Same-origin mode**: App loads `https://abideandanchor.app` directly in WKWebView
+- localStorage at `https://` origin DOES persist across cold restarts in WKWebView
+- Capacitor Preferences (`@capacitor/preferences`) remains available as backup
+- **⚠️ WKWebView does NOT share localStorage with Safari** — they are separate data stores
+- Auth must happen WITHIN the WebView (not in a separate Safari session) for persistence
+
+### 9. OAuth Deep Link Flow (CRITICAL for iOS)
+- Safari CANNOT redirect back to `capacitor://localhost`
+- Must use custom URL scheme: `abideandanchor://auth-callback?token=...`
+- `@capacitor/app` plugin handles `appUrlOpen` events
+- `@capacitor/browser` opens OAuth in SFSafariViewController (NOT in WebView)
+- Deep links from inside the WebView do NOT trigger `appUrlOpen`
+
+---
 
 ## Build Commands
 ```bash
@@ -40,6 +82,41 @@ npm run test           # Unit tests
 | `src/lib/runtime.js` | Capacitor runtime detection |
 | `src/context/AuthContext.jsx` | Auth state management |
 | `ios/App/App/Info.plist` | iOS app configuration |
+| `ios/App/App/PrivacyInfo.xcprivacy` | Apple privacy manifest (iOS 17+) |
+
+## Known Issues (Status)
+| Issue | Status |
+|-------|--------|
+| NULL App ID Bug | ✅ FIXED — Hardcoded fallback |
+| API returns HTML not JSON | ✅ FIXED — App ID wired correctly |
+| Onboarding stuck | ✅ FIXED — 5s timeout with Login button |
+| Token not persisting | ✅ FIXED — Same-origin mode |
+| OAuth redirect loop | ✅ FIXED — Custom URL scheme deep link |
+| Scheme collision | ✅ FIXED — Removed ios.scheme |
+| Race condition: old token clears new | ✅ FIXED — tokenVersion guard |
+| Deep link double-processing | ✅ FIXED — lastProcessedUrl guard |
+| Bundle ID mismatch | ✅ FIXED — com.abideandanchor.app |
+| Missing privacy manifest | ✅ FIXED — PrivacyInfo.xcprivacy |
+| armv7 architecture | ✅ FIXED — arm64 only |
+| No offline handling | ✅ FIXED — OfflineScreen component |
+| Debug config in Release | ✅ FIXED — Separate release.xcconfig |
+
+## Safari Web Inspector Diagnostics
+```javascript
+window.diagnoseBase44Config()    // Check App ID & config
+window.diagnoseTokenStorage()    // Check token persistence
+```
+
+## Last Change Log
+
+**2026-02-08 — Raouf: Milestone 3 — App Store Blocker Fixes**
+- Fixed Bundle ID → `com.abideandanchor.app`
+- Created `PrivacyInfo.xcprivacy` (UserDefaults API, CA92.1)
+- Created `release.xcconfig` for Release builds
+- arm64 only, version 1.0.0, ITSAppUsesNonExemptEncryption
+- Guideline 4.2 mitigation: dark theme, offline screen, no debug output
+- Merged duplicate AGENT/CHANGELOG files
+- Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Change Protocol
 - Read this file before making changes
