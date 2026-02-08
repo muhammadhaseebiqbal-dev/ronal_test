@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-09 — Raouf: Privacy Policy URL Wired (Milestone 6)
+
+**Scope:** Wire privacy policy URL into all project files — unblock external TestFlight + App Store  
+**Summary:** Added `https://the-right-perspective.com/abide-anchor-privacy-policy/` to capacitor config, audit reports, README, and SECURITY.md. Updated audit verdicts to reflect resolved status.
+
+**Changes:**
+1. **`capacitor.config.ts`** — Added privacy policy URL reference comment
+2. **`docs/TESTFLIGHT_AUDIT_REPORT.md`** — Privacy policy: 🔴 MISSING → ✅ PASS. External TestFlight: ⛔ Blocked → ✅ Ready. Strikethrough resolved issues (#2-4). Updated executive summary and fix priority list.
+3. **`docs/APP_STORE_AUDIT_REPORT.md`** — Privacy policy: ❌ FAIL → ✅ PASS. Updated blocker table and action items.
+4. **`README.md`** — Added privacy policy link to Additional Resources
+5. **`SECURITY.md`** — Added Privacy Policy section with URL
+
+**Verification:**
+- `npm run lint` — ✅ (0 errors in src/)
+- `npm run test` — ✅ (42/42 passed)
+- `npm run build` — ✅
+
+**Note:** The privacy policy URL must also be entered manually in App Store Connect under **App Information → Privacy Policy URL**.
+
+---
+
 ### 2026-02-09 — Raouf: Pre-TestFlight Submission Audit (Milestone 4)
 
 **Scope:** Full 5-phase pre-TestFlight audit — build config, App Store policy, runtime stability, security, readiness  

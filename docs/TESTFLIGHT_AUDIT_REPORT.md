@@ -19,7 +19,7 @@ The Capacitor iOS app has been audited across 5 phases: Build Configuration, App
 | ✅ **SAFE WITH WARNINGS** | Internal TestFlight testing |
 | ⛔ **DO NOT UPLOAD** | App Store / External TestFlight |
 
-The primary blockers for App Store submission are: Guideline 4.2 web wrapper risk (HIGH), 80+ unstripped console.log statements including token previews (MEDIUM-HIGH), missing privacy policy URL (MEDIUM), and globally-exposed diagnostic functions (MEDIUM).
+The primary blockers for App Store submission are: Guideline 4.2 web wrapper risk (HIGH). Previously identified issues — console.log token exposure, missing privacy policy URL, and globally-exposed diagnostic functions — have been resolved in Milestone 5 and Milestone 6.
 
 ---
 
@@ -76,7 +76,7 @@ The primary blockers for App Store submission are: Guideline 4.2 web wrapper ris
 | NSPrivacyTrackingDomains | ✅ PASS | Empty array |
 | NSPrivacyCollectedDataTypes | ⚠️ WARNING | Empty array — if user accounts collect email/name, this should declare data categories. Defensible since collection happens on remote website, not via native APIs |
 | NSPrivacyAccessedAPITypes | ✅ PASS | UserDefaults (CA92.1) declared |
-| Privacy Policy URL | 🔴 **MISSING** | CHANGELOG lists "Host privacy policy URL" as follow-up. **Blocks external TestFlight and App Store** |
+| Privacy Policy URL | ✅ PASS | `https://the-right-perspective.com/abide-anchor-privacy-policy/` — set in App Store Connect |
 
 ### 2.3 Export Compliance
 
@@ -225,8 +225,8 @@ if (import.meta.env.DEV) {
 | **Upload** | ✅ Ready | ITSAppUsesNonExemptEncryption=false prevents compliance dialog |
 | **Processing** | ✅ Ready | Single 1024px app icon (universal), arm64 architecture, no bitcode |
 | **Internal Testing** | ✅ Ready | No privacy policy URL required for internal testers |
-| **External Testing** | ⛔ Blocked | Privacy policy URL required |
-| **App Store Submission** | ⛔ Blocked | Privacy policy URL + Guideline 4.2 risk + console.log exposure |
+| **External Testing** | ✅ Ready | Privacy policy URL set: `https://the-right-perspective.com/abide-anchor-privacy-policy/` |
+| **App Store Submission** | ⛔ Blocked | Guideline 4.2 web wrapper risk remains |
 
 ### App Icon Verification
 
@@ -252,25 +252,25 @@ if (import.meta.env.DEV) {
 | # | Severity | Issue | Blocks |
 |---|----------|-------|--------|
 | 1 | 🔴 HIGH | Guideline 4.2 — app is a thin web wrapper loading remote URL with minimal native-only features | App Store |
-| 2 | 🟠 MEDIUM-HIGH | 80+ console.log statements in production JS, including token preview exposure (first 20 chars) | App Store (security review) |
-| 3 | 🟠 MEDIUM | Privacy policy URL not hosted | External TestFlight + App Store |
-| 4 | 🟡 MEDIUM | Diagnostic functions (`window.diagnoseBase44Config`, `window.diagnoseTokenStorage`) globally exposed in production | App Store (security review) |
+| 2 | ~~🟠 MEDIUM-HIGH~~ | ~~80+ console.log statements~~ | ✅ RESOLVED (Milestone 5) |
+| 3 | ~~🟠 MEDIUM~~ | ~~Privacy policy URL not hosted~~ | ✅ RESOLVED (Milestone 6) |
+| 4 | ~~🟡 MEDIUM~~ | ~~Diagnostic functions globally exposed~~ | ✅ RESOLVED (Milestone 5) |
 
 ### Recommended Fix Priority
 
-1. **Strip console output for production** — Add Vite production build stripping for console.log/warn/debug
-2. **Remove global diagnostic functions in production** — Guard behind `import.meta.env.DEV`
-3. **Host privacy policy URL** — Required before external TestFlight
+1. ~~Strip console output for production~~ — ✅ DONE (Milestone 5)
+2. ~~Remove global diagnostic functions in production~~ — ✅ DONE (Milestone 5)
+3. ~~Host privacy policy URL~~ — ✅ DONE (Milestone 6)
 4. **Add 1-2 native features** — Push notifications, haptic feedback, or biometric auth to mitigate 4.2 risk
 5. **Add WebView error handling** — Catch HTTP-level failures beyond offline detection
 
 ### For Internal TestFlight (Current State)
 
 **✅ SAFE TO UPLOAD** for internal testing with the following acknowledged warnings:
-- Console output will be visible via Safari Web Inspector (acceptable for internal testing)
-- Diagnostic functions accessible (useful for internal debugging)
-- Privacy policy URL not required for internal testers
-- Guideline 4.2 is not evaluated during internal TestFlight distribution
+- Privacy policy URL set: `https://the-right-perspective.com/abide-anchor-privacy-policy/`
+- Console output stripped in production (Milestone 5)
+- Diagnostic functions gated behind DEV (Milestone 5)
+- Guideline 4.2 is not evaluated during TestFlight distribution
 
 ---
 

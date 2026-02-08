@@ -1,5 +1,9 @@
 # Security Policy
 
+## Privacy Policy
+
+[Abide & Anchor Privacy Policy](https://the-right-perspective.com/abide-anchor-privacy-policy/)
+
 ## Reporting a Vulnerability
 If you discover a security issue, do not open a public issue. Please email the project maintainer with:
 - A clear description of the issue.

@@ -109,6 +109,15 @@ window.diagnoseTokenStorage()    // Check token persistence
 
 ## Last Change Log
 
+**2026-02-09 — Raouf: Milestone 6 — Privacy Policy URL Wired**
+- Wired privacy policy URL (`https://the-right-perspective.com/abide-anchor-privacy-policy/`) across all project files
+- Updated `capacitor.config.ts` with privacy policy reference comment
+- Updated `docs/TESTFLIGHT_AUDIT_REPORT.md` — privacy policy status MISSING → PASS, external TestFlight unblocked
+- Updated `docs/APP_STORE_AUDIT_REPORT.md` — privacy policy status FAIL → PASS
+- Updated `README.md` — added privacy policy link to Additional Resources
+- Updated `SECURITY.md` — added privacy policy section
+- Verification: lint ✅ (0 src/ errors) test ✅ (42/42) build ✅
+
 **2026-02-09 — Raouf: Milestone 5 — Security Hardening + Build 2**
 - Created `src/lib/logger.js` — production-gated logger (suppresses log() in prod)
 - Removed ALL token value logging (substring, previews, values) across 6 files

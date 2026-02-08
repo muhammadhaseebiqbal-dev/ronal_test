@@ -231,6 +231,7 @@ npm run verify:ios  # Shows what's wrong
 - [API Reference](docs/API.md) — SDK usage
 - [Changelog](CHANGELOG.md) — Full change history
 - [Agent Rules](AGENT.md) — AI development guidelines
+- [Privacy Policy](https://the-right-perspective.com/abide-anchor-privacy-policy/) — App privacy policy
 
 ---
 

@@ -1,5 +1,8 @@
 import type { CapacitorConfig } from '@capacitor/cli';
 
+// Privacy Policy: https://the-right-perspective.com/abide-anchor-privacy-policy/
+// Required in App Store Connect metadata for external TestFlight + App Store submission.
+
 const config: CapacitorConfig = {
     appId: 'com.abideandanchor.app',
     appName: 'Abide & Anchor',

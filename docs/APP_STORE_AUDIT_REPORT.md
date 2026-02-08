@@ -286,20 +286,17 @@ The following are REQUIRED for App Store submission but cannot be verified from 
 | App Store screenshots (6.7", 6.5", 5.5") | ❓ Unknown |
 | iPad screenshots (if universal) | ❓ Unknown (TARGETED_DEVICE_FAMILY = "1,2" includes iPad) |
 | App description (max 4000 chars) | ❓ Unknown |
-| Privacy Policy URL | ❓ Unknown (REQUIRED) |
+| Privacy Policy URL | ✅ `https://the-right-perspective.com/abide-anchor-privacy-policy/` |
 | Support URL | ❓ Unknown (REQUIRED) |
 | App category | ❓ Unknown |
 | Age rating questionnaire | ❓ Unknown |
 | App review contact info | ❓ Unknown |
 
-### ❌ FAIL — Privacy Policy URL
+### ✅ PASS — Privacy Policy URL
 
-Apple REQUIRES a privacy policy URL for all apps. The app collects:
-- Authentication tokens
-- Journal entries (user-generated content)
-- Usage data
+Privacy policy is hosted at: `https://the-right-perspective.com/abide-anchor-privacy-policy/`
 
-**A privacy policy MUST be hosted at a public URL and linked in App Store Connect.**
+This URL must be entered in App Store Connect under **App Information → Privacy Policy URL**.
 
 ---
 
@@ -392,7 +389,7 @@ android/
 | 1 | Bundle ID mismatch (Xcode vs Capacitor) | Change Xcode to `com.abideandanchor.app` |
 | 2 | Missing PrivacyInfo.xcprivacy | Create privacy manifest file |
 | 3 | Web wrapper rejection risk (Guideline 4.2) | Add native features |
-| 4 | Missing Privacy Policy URL | Host and link privacy policy |
+| 4 | ~~Missing Privacy Policy URL~~ | ✅ RESOLVED — `https://the-right-perspective.com/abide-anchor-privacy-policy/` |
 | 5 | `ios/` in `.gitignore` | Remove and commit iOS project |
 | 6 | `armv7` in UIRequiredDeviceCapabilities | Change to `arm64` |
 
@@ -423,7 +420,7 @@ android/
 4. **Fix `armv7` → `arm64`** in Info.plist
 5. **Create `release.xcconfig`** without CAPACITOR_DEBUG
 6. **Implement at least 3 native features** to mitigate Guideline 4.2 risk
-7. **Create and host privacy policy**
+7. ~~**Create and host privacy policy**~~ — ✅ DONE: `https://the-right-perspective.com/abide-anchor-privacy-policy/`
 8. **Prepare App Store Connect listing** (screenshots, description, URLs)
 9. **Audit web app for API usage** and add Info.plist usage descriptions
 10. **Synchronize version numbers** across package.json and Xcode
