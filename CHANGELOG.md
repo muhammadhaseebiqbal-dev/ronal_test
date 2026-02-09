@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-09 — Raouf: Prepared Project Handover Checklist
+
+**Scope:** Full pre-handover audit + README_HANDOVER.md creation
+**Summary:** Verified every item on the "Prepared project" checklist before sending to Roland:
+- ✅ Clean git state — `main`, 4 commits, no uncommitted changes
+- ✅ npm: 530 packages, `package-lock.json` present
+- ✅ SPM: 3 Capacitor plugins resolved (app, browser, preferences)
+- ✅ Bundle ID: `com.abideandanchor.app`
+- ✅ Version 1.0.0 / Build 2
+- ✅ Release build without signing — **BUILD SUCCEEDED**
+- ✅ No hardcoded secrets — Stripe/RevenueCat are `REDACTED`
+- ✅ `.env.example` with safe placeholders
+- ✅ Deep link scheme `abideandanchor://` registered
+
+**Changes:**
+- `README_HANDOVER.md` — NEW: Complete handover (install → build → run → verify → troubleshoot)
+- `AGENT.md` — Update log entry
+- `CHANGELOG.md` — This entry
+
+**Verification:**
+- `npx eslint --quiet src/` — 0 errors ✅
+- `npm run test` — 42/42 passed ✅
+- `npm run build` — Success ✅
+- `npx cap sync ios` — 3 plugins ✅
+- `xcodebuild Release CODE_SIGNING_REQUIRED=NO` — BUILD SUCCEEDED ✅
+
+---
+
 ### 2026-02-09 — Raouf: Privacy Policy URL Wired (Milestone 6)
 
 **Scope:** Wire privacy policy URL into all project files — unblock external TestFlight + App Store  
