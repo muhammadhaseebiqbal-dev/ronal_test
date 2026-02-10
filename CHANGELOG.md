@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-10 — Raouf: Build 3 — TestFlight Bug Fixes (Milestone 7)
+
+**Scope:** Fix all production issues reported in TestFlight Build 2 (iOS 1.0.0 build 2)
+**Summary:** Injected client-side patches via custom WKWebView controller to fix remote Base44 app issues without modifying the hosted platform code.
+
+**Root Cause Analysis:**
+The app loads `https://abideandanchor.app` (remote Base44 platform) in WKWebView. The remote app's React code has a `SelectTrigger` component rendered outside a `Select` Radix UI context, causing an unhandled error (`"SelectTrigger must be used within Select"`) that crashes the React render tree on pages using select dropdowns (Prayer Corner, About Abide, Prayer Wall, New Request). The layout also renders duplicate back buttons on some routes and omits them on others. Bottom nav with 5 tabs (Prayer Wall enabled) squashes icons below the 44px Apple HIG minimum tap target.
+
+**Fixes Applied:**
+1. **Created `PatchedBridgeViewController.swift`** — Custom CAPBridgeViewController subclass that injects CSS+JS patches via WKUserScript at document end
+2. **Error boundary (JS)** — Global `window.onerror` + `unhandledrejection` handlers catch "must be used within" React context errors, prevent white screens, show a "Go Back" / "Go Home" fallback UI
+3. **Duplicate back button fix (JS)** — MutationObserver detects and hides duplicate back button elements in headers
+4. **Missing back button fix (JS)** — Injects a back button with proper chevron icon on routes that lack one (Journal/Captain's Log, More)
+5. **Bottom nav layout fix (CSS)** — `flex: 1 1 0%`, `min-width: 48px`, proper icon sizing, and text truncation for 5-tab mode
+6. **Safe area padding (CSS)** — `padding-bottom: max(env(safe-area-inset-bottom), 8px)` on bottom nav
+7. **SPA navigation tracking (JS)** — Patches `history.pushState/replaceState` + `popstate` to re-run DOM fixes on client-side route changes
+8. **Updated Main.storyboard** — Points to `PatchedBridgeViewController` (module: App) instead of default `CAPBridgeViewController`
+9. **Bumped build number** — `CURRENT_PROJECT_VERSION` 2 → 3 (both Debug and Release)
+
+**Login Persistence Confirmation:**
+Login persistence remains correct. The same-origin mode (`server.url: https://abideandanchor.app`) means WKWebView localStorage persists across cold restarts. No changes were made to auth or token storage logic.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — **NEW** — Custom VC with WKUserScript injection
+- `ios/App/App/Base.lproj/Main.storyboard` — Updated customClass to PatchedBridgeViewController
+- `ios/App/App.xcodeproj/project.pbxproj` — Added new Swift file, bumped build 2 → 3
+- `AGENT.md` — Updated known issues, last change log
+- `CHANGELOG.md` — This entry
+
+**Verification:**
+- `npx eslint --quiet src/` — ✅ (0 errors)
+- `npm run test` — ✅ (42/42 passed)
+- `npm run build` — ✅
+- `npx cap sync ios` — ✅ (3 plugins)
+- `xcodebuild Release CODE_SIGNING_REQUIRED=NO` — ✅ BUILD SUCCEEDED
+
+---
+
 ### 2026-02-09 — Raouf: Prepared Project Handover Checklist
 
 **Scope:** Full pre-handover audit + README_HANDOVER.md creation

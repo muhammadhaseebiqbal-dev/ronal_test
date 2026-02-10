@@ -95,6 +95,11 @@ npm run test           # Unit tests
 | Scheme collision | ✅ FIXED — Removed ios.scheme |
 | Race condition: old token clears new | ✅ FIXED — tokenVersion guard |
 | Deep link double-processing | ✅ FIXED — lastProcessedUrl guard |
+| SelectTrigger context error | ✅ FIXED — WKUserScript error boundary |
+| Duplicate back buttons | ✅ FIXED — DOM patch removes duplicates |
+| Missing back buttons | ✅ FIXED — DOM patch injects back nav |
+| Bottom nav squashed (5 tabs) | ✅ FIXED — CSS flex/min-width patch |
+| White screen on error | ✅ FIXED — Global error handler fallback |
 | Bundle ID mismatch | ✅ FIXED — com.abideandanchor.app |
 | Missing privacy manifest | ✅ FIXED — PrivacyInfo.xcprivacy |
 | armv7 architecture | ✅ FIXED — arm64 only |
@@ -109,14 +114,12 @@ window.diagnoseTokenStorage()    // Check token persistence
 
 ## Last Change Log
 
-**2026-02-09 — Raouf: Milestone 6 — Privacy Policy URL Wired**
-- Wired privacy policy URL (`https://the-right-perspective.com/abide-anchor-privacy-policy/`) across all project files
-- Updated `capacitor.config.ts` with privacy policy reference comment
-- Updated `docs/TESTFLIGHT_AUDIT_REPORT.md` — privacy policy status MISSING → PASS, external TestFlight unblocked
-- Updated `docs/APP_STORE_AUDIT_REPORT.md` — privacy policy status FAIL → PASS
-- Updated `README.md` — added privacy policy link to Additional Resources
-- Updated `SECURITY.md` — added privacy policy section
-- Verification: lint ✅ (0 src/ errors) test ✅ (42/42) build ✅
+**2026-02-10 — Raouf: Milestone 7 — Build 3 TestFlight Bug Fixes**
+- Created PatchedBridgeViewController.swift — WKUserScript injection for error boundary, DOM fixes, CSS patches
+- Fixes: SelectTrigger context error, duplicate back buttons, missing back buttons, bottom nav squash, white screens
+- Updated Main.storyboard to use PatchedBridgeViewController
+- Bumped build number: 2 → 3
+- Verification: lint ✅ (0 src/ errors) test ✅ (42/42) build ✅ xcodebuild Release ✅
 
 **2026-02-09 — Raouf: Milestone 5 — Security Hardening + Build 2**
 - Created `src/lib/logger.js` — production-gated logger (suppresses log() in prod)
@@ -148,15 +151,17 @@ window.diagnoseTokenStorage()    // Check token persistence
 ## Update Log
 
 **Raouf:**
-- **Date:** 2026-02-09 (Australia/Sydney)
-- **Scope:** Prepared Project Handover Checklist
-- **Summary:** Full pre-handover audit. Verified clean repo, deps (npm+SPM), Bundle ID, version/build, Release build (no signing), no secrets, env files. Created README_HANDOVER.md.
+- **Date:** 2026-02-10 (Australia/Sydney)
+- **Scope:** Build 3 — TestFlight Bug Fixes (Milestone 7)
+- **Summary:** Fixed all production issues reported in TestFlight Build 2. Created PatchedBridgeViewController with WKUserScript injection to patch remote Base44 app issues: SelectTrigger context error (ErrorBoundary), duplicate/missing back buttons (DOM patches), bottom nav squash with 5 tabs (CSS fixes), white screen prevention (global error handler).
 - **Files Changed:**
-  - `README_HANDOVER.md` — NEW: Complete handover with exact build steps
+  - `ios/App/App/PatchedBridgeViewController.swift` — NEW: Custom VC with WKUserScript patches
+  - `ios/App/App/Base.lproj/Main.storyboard` — Updated to PatchedBridgeViewController
+  - `ios/App/App.xcodeproj/project.pbxproj` — New file ref + build 2→3
   - `AGENT.md` — This entry
   - `CHANGELOG.md` — New entry
 - **Verification:** lint ✅ tests 42/42 ✅ build ✅ cap sync ✅ xcodebuild Release ✅
-- **Follow-ups:** Roland sets signing team in Xcode, verifies Base44 OAuth redirect
+- **Follow-ups:** Roland builds and deploys Build 3 to TestFlight, verifies fixes on physical iPhone
 
 ## Change Protocol
 - Read this file before making changes
