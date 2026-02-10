@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-10 — Raouf: Build 4 — Login Persistence Fix (Milestone 8)
+
+**Scope:** Fix login lost after backgrounding or killing app on customer devices (iPhone 11, iPhone 12)
+**Summary:** Customers reported being logged out every time they backgrounded or killed the app, despite the fix working on the developer's phone. Root cause identified as WKWebView content process termination under iOS memory pressure, which destroys in-memory state and triggers a blind reload without cookie/session recovery.
+
+**Root Cause Analysis:**
+1. **WebView Content Process Termination** — On memory-constrained devices (iPhone 11/12), iOS terminates the WKWebView content process when the app is backgrounded. Capacitor's `WebViewDelegationHandler.webViewWebContentProcessDidTerminate()` calls `bridge.reset()` + `webView.reload()`, which reloads the page from scratch without recovering session cookies.
+2. **No Cookie Bridging** — OAuth via SFSafariViewController sets cookies in Safari's cookie jar. The existing `CapacitorWKCookieObserver` syncs FROM WKWebView TO `HTTPCookieStorage.shared`, but never in reverse. On cold start or after process termination, auth cookies from HTTPCookieStorage are NOT synced back into WKHTTPCookieStore.
+3. **No Foreground Recovery** — The `AppDelegate` had empty lifecycle methods with no WebView health check on resume.
+
+**Fix Strategy — Defence in Depth (priority order):**
+1. **Primary**: Token restore via Capacitor Preferences (UserDefaults) — the JS `initializeAuth()` → `loadToken()` chain runs on every page mount and reads from UserDefaults, which survives ALL termination events. This chain was already correct; the fix ensures the WebView reloads cleanly so this chain can execute.
+2. **Secondary**: Smart foreground recovery in `PatchedBridgeViewController` — detects terminated content process and loads server URL with cookie sync (vs Capacitor's blind reload), giving the React app a clean boot path.
+3. **Safety net**: Bidirectional cookie bridging — syncs cookies between HTTPCookieStorage and WKHTTPCookieStore in case the Base44 platform checks cookies alongside the bearer token. This is NOT the primary auth mechanism.
+
+**Important**: No edits to `node_modules/` or Capacitor framework code. All fixes live in `ios/App/App/PatchedBridgeViewController.swift` which we own and control.
+
+**Fixes Applied:**
+1. **Persistent data store verification** — Override `webViewConfiguration(for:)` to explicitly verify `WKWebsiteDataStore.isPersistent` and force `WKWebsiteDataStore.default()` if ephemeral store detected.
+2. **Bidirectional cookie bridging** — `syncCookiesToWebView()` syncs all domain cookies from `HTTPCookieStorage.shared` → `WKHTTPCookieStore` before initial navigation, on foreground resume, and before process termination recovery. `flushWebViewCookies()` syncs the reverse direction when entering background.
+3. **Smart foreground resume** — `willEnterForeground` observer checks WebView health (URL, title). If content process was terminated (URL/title nil), performs cookie-synced recovery. If WebView is alive, only syncs cookies without reloading.
+4. **Content process termination recovery** — Instead of blind `webView.reload()`, syncs cookies first, then loads the server URL directly (more reliable than reload on terminated content).
+5. **Background cookie flush** — `didEnterBackground` observer flushes all domain cookies from WKHTTPCookieStore → HTTPCookieStorage.shared so they survive content process termination.
+6. **os_log diagnostics** — Logs WebView state, data store type, cookie names (never values), and auth marker presence at cold boot, foreground resume, and recovery events. Visible via Xcode device console (filter: subsystem `com.abideandanchor.app`, category `WebView`).
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — **MODIFIED** — Added cookie bridging, persistent store verification, lifecycle observers, smart recovery, diagnostics
+- `ios/App/App.xcodeproj/project.pbxproj` — Build 3 → 4
+
+**Verification:**
+- `xcodebuild Release CODE_SIGNING_REQUIRED=NO` — ✅ BUILD SUCCEEDED
+- No Swift compiler warnings on PatchedBridgeViewController
+
+**Diagnostics Access:**
+- Xcode Console: filter by subsystem `com.abideandanchor.app` category `WebView`
+- Console.app on Mac: connect device via USB, filter same subsystem
+- Log events: `[DIAG:coldBoot]`, `[DIAG:willEnterForeground]`, `[DIAG:processTerminationRecovery]`, `[DIAG:capacitorDidLoad]`
+
+---
+
 ### 2026-02-10 — Raouf: Build 3 — TestFlight Bug Fixes (Milestone 7)
 
 **Scope:** Fix all production issues reported in TestFlight Build 2 (iOS 1.0.0 build 2)

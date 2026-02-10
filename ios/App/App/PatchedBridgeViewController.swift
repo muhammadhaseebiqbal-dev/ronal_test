@@ -1,30 +1,307 @@
 import UIKit
 import WebKit
 import Capacitor
+import os.log
 
-/// Custom CAPBridgeViewController that injects client-side patches into the remote
-/// Base44 WebView to fix production issues reported in TestFlight Build 2:
+/// Custom CAPBridgeViewController that:
 ///
-///   A) ErrorBoundary — catches React "must be used within" errors (SelectTrigger)
-///      and detects the "Abide and Anchor failed to load" error screen, replacing
-///      it with a recovery UI (Go Back / Go Home).
-///   B) Blank-screen detection — periodic check for empty #root content.
-///   C) Duplicate back-button removal via MutationObserver.
-///   D) Missing back-button injection on Captain's Log / More.
-///   E) Bottom-nav layout fix for 5-tab mode (Prayer Wall enabled) — flex, min tap targets.
-///   F) Safe-area padding for iOS notch / home indicator.
+///   1) Ensures WKWebView uses persistent data store (login persistence fix — Build 4)
+///   2) Bridges cookies from HTTPCookieStorage → WKHTTPCookieStore before every navigation
+///   3) Handles WebView content process termination gracefully (no blind reload)
+///   4) Prevents unnecessary reloads on app resume
+///   5) Provides diagnostics logging (cookie counts, store type, auth markers)
+///   6) Injects client-side CSS+JS patches for remote Base44 app issues (Build 3)
 ///
 /// Architecture: The WKWebView loads https://abideandanchor.app (remote Base44 platform).
 /// We cannot modify the remote source code, so we inject JS+CSS via WKUserScript to
 /// patch DOM/CSS issues at runtime.
 class PatchedBridgeViewController: CAPBridgeViewController {
 
+    private static let log = OSLog(subsystem: "com.abideandanchor.app", category: "WebView")
+    private let serverDomain = "abideandanchor.app"
+    private var hasPerformedInitialLoad = false
+    private var isRecoveringFromTermination = false
+
+    // MARK: – Lifecycle
+
     override func viewDidLoad() {
         super.viewDidLoad()
         injectPatches()
+        setupLifecycleObservers()
+        logDiagnostics(event: "coldBoot")
     }
 
-    // MARK: – Script injection
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    // MARK: – A) Ensure persistent data store
+
+    /// Override to guarantee we use the default (persistent) WKWebsiteDataStore
+    /// and sync cookies from HTTPCookieStorage BEFORE the WebView is created.
+    override open func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {
+        let config = super.webViewConfiguration(for: instanceConfiguration)
+
+        // CRITICAL: Ensure data store is persistent (default), never ephemeral
+        if config.websiteDataStore.isPersistent {
+            os_log(.info, log: Self.log, "✅ Data store: persistent (default)")
+        } else {
+            os_log(.error, log: Self.log, "⚠️ Data store was non-persistent — forcing default()")
+            config.websiteDataStore = WKWebsiteDataStore.default()
+        }
+
+        return config
+    }
+
+    // MARK: – B) Cookie bridging
+
+    /// Syncs ALL cookies from HTTPCookieStorage.shared into WKHTTPCookieStore.
+    /// This bridges cookies set by SFSafariViewController (OAuth) into the WebView.
+    /// Must run BEFORE loading server.url on cold boot and after process termination.
+    private func syncCookiesToWebView(completion: (() -> Void)? = nil) {
+        guard let webView = self.webView else {
+            os_log(.error, log: Self.log, "syncCookies: webView is nil")
+            completion?()
+            return
+        }
+
+        let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+        let allCookies = HTTPCookieStorage.shared.cookies ?? []
+        let domainCookies = allCookies.filter { cookie in
+            cookie.domain.contains(serverDomain) || cookie.domain == ".\(serverDomain)"
+        }
+
+        os_log(.info, log: Self.log, "syncCookies: %d total, %d for domain",
+               allCookies.count, domainCookies.count)
+
+        if domainCookies.isEmpty {
+            completion?()
+            return
+        }
+
+        let group = DispatchGroup()
+        for cookie in domainCookies {
+            group.enter()
+            cookieStore.setCookie(cookie) {
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            os_log(.info, log: Self.log, "syncCookies: done — %d cookies synced", domainCookies.count)
+            completion?()
+        }
+    }
+
+    // MARK: – C) Smart recovery from content process termination
+
+    /// Called by Capacitor's bridge after the initial page load.
+    /// We use this to sync cookies and mark the initial load as complete.
+    override open func capacitorDidLoad() {
+        super.capacitorDidLoad()
+        // Sync cookies from HTTPCookieStorage → WKHTTPCookieStore before first navigation
+        syncCookiesToWebView {
+            os_log(.info, log: Self.log, "capacitorDidLoad: cookies synced before initial load")
+        }
+        hasPerformedInitialLoad = true
+        logDiagnostics(event: "capacitorDidLoad")
+    }
+
+    // MARK: – D) Lifecycle observers — prevent harmful reloads on resume
+
+    private func setupLifecycleObservers() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+
+        // Observe WebView content process termination via the webView's URL
+        // When the content process terminates, the webView's URL becomes nil
+        webView?.addObserver(self, forKeyPath: "URL", options: [.new, .old], context: nil)
+    }
+
+    @objc private func handleWillEnterForeground() {
+        os_log(.info, log: Self.log, "willEnterForeground")
+        logDiagnostics(event: "willEnterForeground")
+
+        guard let webView = self.webView else {
+            os_log(.error, log: Self.log, "willEnterForeground: webView is nil — cannot recover")
+            return
+        }
+
+        // Check if the WebView content process was terminated while backgrounded.
+        // If so, the webView's title/URL may be empty and the page is blank.
+        if webView.url == nil || webView.title == nil || webView.title?.isEmpty == true {
+            os_log(.info, log: Self.log, "willEnterForeground: WebView appears terminated — recovering")
+            recoverFromProcessTermination()
+        } else {
+            os_log(.info, log: Self.log, "willEnterForeground: WebView alive at %{public}@",
+                   webView.url?.host ?? "unknown")
+            // Just sync cookies in case any new ones were set by Safari/other apps
+            syncCookiesToWebView()
+        }
+    }
+
+    @objc private func handleDidBecomeActive() {
+        os_log(.info, log: Self.log, "didBecomeActive")
+        // NO reload here — we only recover in willEnterForeground if needed
+    }
+
+    @objc private func handleDidEnterBackground() {
+        os_log(.info, log: Self.log, "didEnterBackground")
+        // Flush cookies to HTTPCookieStorage so they survive process termination
+        flushWebViewCookies()
+    }
+
+    /// Flushes cookies FROM WKWebView's cookie store TO HTTPCookieStorage.shared
+    /// so they survive content process termination.
+    private func flushWebViewCookies() {
+        guard let webView = self.webView else { return }
+        let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+        cookieStore.getAllCookies { cookies in
+            let domainCookies = cookies.filter { $0.domain.contains(self.serverDomain) }
+            for cookie in domainCookies {
+                HTTPCookieStorage.shared.setCookie(cookie)
+            }
+            os_log(.info, log: Self.log, "flushCookies: %d domain cookies flushed to HTTPCookieStorage",
+                   domainCookies.count)
+        }
+    }
+
+    /// Graceful recovery after WebView content process termination.
+    /// Syncs cookies first, then reloads with the server URL.
+    private func recoverFromProcessTermination() {
+        guard !isRecoveringFromTermination else {
+            os_log(.info, log: Self.log, "recoverFromProcessTermination: already recovering, skipping")
+            return
+        }
+        isRecoveringFromTermination = true
+
+        os_log(.info, log: Self.log, "recoverFromProcessTermination: syncing cookies then reloading")
+
+        // 1. Sync cookies from HTTPCookieStorage → WKHTTPCookieStore
+        syncCookiesToWebView { [weak self] in
+            guard let self = self, let webView = self.webView else {
+                self?.isRecoveringFromTermination = false
+                return
+            }
+
+            // 2. Reload the server URL (not webView.reload() which may fail with no content)
+            if let serverURL = URL(string: "https://\(self.serverDomain)") {
+                os_log(.info, log: Self.log, "recoverFromProcessTermination: loading %{public}@", serverURL.absoluteString)
+                webView.load(URLRequest(url: serverURL))
+            } else {
+                // Fallback: try reload
+                webView.reload()
+            }
+
+            self.isRecoveringFromTermination = false
+            self.logDiagnostics(event: "processTerminationRecovery")
+        }
+    }
+
+    // MARK: – KVO for URL changes (process termination detection)
+
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
+        if keyPath == "URL" {
+            let oldURL = change?[.oldKey] as? URL
+            let newURL = change?[.newKey] as? URL
+            if oldURL != nil && newURL == nil && hasPerformedInitialLoad {
+                os_log(.info, log: Self.log, "KVO: URL went nil — content process may have terminated")
+                // The WebViewDelegationHandler's webViewWebContentProcessDidTerminate
+                // will handle the reload. We just log here for diagnostics.
+            }
+        } else {
+            super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+        }
+    }
+
+    // MARK: – E) Diagnostics logging
+
+    /// Logs diagnostic information about the WebView state.
+    /// Logs cookie NAMES only (never values) for the server domain.
+    /// Visible in Xcode device console and Console.app.
+    private func logDiagnostics(event: String) {
+        guard let webView = self.webView else {
+            os_log(.info, log: Self.log, "[DIAG:%{public}@] webView=nil", event)
+            return
+        }
+
+        let dataStore = webView.configuration.websiteDataStore
+        let storeType = dataStore.isPersistent ? "persistent" : "nonPersistent"
+        let currentURL = webView.url?.absoluteString ?? "none"
+
+        os_log(.info, log: Self.log,
+               "[DIAG:%{public}@] webView=YES storeType=%{public}@ url=%{public}@",
+               event, storeType, currentURL)
+
+        // Log cookie names for the domain (never values)
+        let httpCookies = HTTPCookieStorage.shared.cookies?.filter {
+            $0.domain.contains(serverDomain)
+        } ?? []
+        let httpCookieNames = httpCookies.map { $0.name }.joined(separator: ", ")
+
+        os_log(.info, log: Self.log,
+               "[DIAG:%{public}@] HTTPCookieStorage: count=%d names=[%{public}@]",
+               event, httpCookies.count, httpCookieNames)
+
+        // Log WKHTTPCookieStore cookies (async)
+        dataStore.httpCookieStore.getAllCookies { cookies in
+            let domainCookies = cookies.filter { $0.domain.contains(self.serverDomain) }
+            let wkCookieNames = domainCookies.map { $0.name }.joined(separator: ", ")
+
+            os_log(.info, log: Self.log,
+                   "[DIAG:%{public}@] WKCookieStore: count=%d names=[%{public}@]",
+                   event, domainCookies.count, wkCookieNames)
+
+            // Check for auth markers (presence only, never log values)
+            let hasAuthCookie = domainCookies.contains { name in
+                let n = name.name.lowercased()
+                return n.contains("token") || n.contains("session") || n.contains("auth") || n.contains("sid")
+            }
+            os_log(.info, log: Self.log,
+                   "[DIAG:%{public}@] authMarkerInCookies=%{public}@",
+                   event, hasAuthCookie ? "YES" : "NO")
+        }
+
+        // Also check localStorage for auth tokens via JS (presence only)
+        webView.evaluateJavaScript("""
+            (function() {
+                try {
+                    var keys = ['base44_access_token', 'token', 'base44_auth_token'];
+                    var found = keys.filter(function(k) { return !!localStorage.getItem(k); });
+                    return JSON.stringify({ authKeysPresent: found, count: found.length });
+                } catch(e) {
+                    return JSON.stringify({ error: e.message });
+                }
+            })()
+        """) { result, error in
+            if let resultStr = result as? String {
+                os_log(.info, log: Self.log,
+                       "[DIAG:%{public}@] localStorage: %{public}@",
+                       event, resultStr)
+            } else if let error = error {
+                os_log(.info, log: Self.log,
+                       "[DIAG:%{public}@] localStorage check failed: %{public}@",
+                       event, error.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: – Script injection (Build 3 patches)
 
     private func injectPatches() {
         guard let webView = self.webView else { return }

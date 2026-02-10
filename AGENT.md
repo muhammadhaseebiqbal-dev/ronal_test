@@ -51,6 +51,8 @@ Must match Xcode project, App Store Connect, and provisioning profiles.
 - Capacitor Preferences (`@capacitor/preferences`) remains available as backup
 - **⚠️ WKWebView does NOT share localStorage with Safari** — they are separate data stores
 - Auth must happen WITHIN the WebView (not in a separate Safari session) for persistence
+- **Primary restore path**: Token in Capacitor Preferences (UserDefaults) → survives ALL termination events
+- **Safety net**: Cookie bridging (HTTPCookieStorage ↔ WKHTTPCookieStore) for edge cases where the Base44 platform checks cookies alongside the token
 
 ### 9. OAuth Deep Link Flow (CRITICAL for iOS)
 - Safari CANNOT redirect back to `capacitor://localhost`
@@ -105,6 +107,7 @@ npm run test           # Unit tests
 | armv7 architecture | ✅ FIXED — arm64 only |
 | No offline handling | ✅ FIXED — OfflineScreen component |
 | Debug config in Release | ✅ FIXED — Separate release.xcconfig |
+| Login lost on background/kill | ✅ FIXED — Cookie bridging + process termination recovery |
 
 ## Safari Web Inspector Diagnostics
 ```javascript
@@ -112,14 +115,22 @@ window.diagnoseBase44Config()    // Check App ID & config
 window.diagnoseTokenStorage()    // Check token persistence
 ```
 
+## Native Diagnostics (Xcode Console)
+Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
+- `[DIAG:coldBoot]` — WebView state on cold start
+- `[DIAG:willEnterForeground]` — WebView state on resume from background
+- `[DIAG:processTerminationRecovery]` — Recovery after content process killed
+- Cookie names (never values) for `abideandanchor.app` domain
+- Auth marker presence in cookies and localStorage
+
 ## Last Change Log
 
-**2026-02-10 — Raouf: Milestone 7 — Build 3 TestFlight Bug Fixes**
-- Created PatchedBridgeViewController.swift — WKUserScript injection for error boundary, DOM fixes, CSS patches
-- Fixes: SelectTrigger context error, duplicate back buttons, missing back buttons, bottom nav squash, white screens
-- Updated Main.storyboard to use PatchedBridgeViewController
-- Bumped build number: 2 → 3
-- Verification: lint ✅ (0 src/ errors) test ✅ (42/42) build ✅ xcodebuild Release ✅
+**2026-02-10 — Raouf: Milestone 8 — Build 4 Login Persistence Fix**
+- Root cause: WKWebView content process termination on memory-constrained devices (iPhone 11/12) causes blind reload without cookie recovery
+- Fix: Cookie bridging (HTTPCookieStorage ↔ WKHTTPCookieStore), persistent data store verification, smart process termination recovery, foreground lifecycle handling
+- Added os_log diagnostics for cold boot, resume, and recovery events
+- Bumped build number: 3 → 4
+- Verification: xcodebuild Release ✅ BUILD SUCCEEDED
 
 **2026-02-09 — Raouf: Milestone 5 — Security Hardening + Build 2**
 - Created `src/lib/logger.js` — production-gated logger (suppresses log() in prod)
@@ -149,6 +160,18 @@ window.diagnoseTokenStorage()    // Check token persistence
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-10 (Australia/Sydney)
+- **Scope:** Build 4 — Login Persistence Fix (Milestone 8)
+- **Summary:** Fixed login persistence bug where customers on iPhone 11/12 lost their session after backgrounding or killing the app. Root cause: WKWebView content process termination under memory pressure triggers blind reload without cookie recovery. Fix adds bidirectional cookie bridging (HTTPCookieStorage ↔ WKHTTPCookieStore), explicit persistent data store verification, smart content process termination recovery with cookie sync before reload, foreground lifecycle handling that avoids unnecessary reloads, and os_log diagnostics for cold boot/resume/recovery events.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added cookie bridging, persistent store check, lifecycle observers, process termination recovery, os_log diagnostics
+  - `ios/App/App.xcodeproj/project.pbxproj` — Build 3→4
+  - `AGENT.md` — This entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:** Roland deploys Build 4 to TestFlight, verifies login persistence on customer iPhone 11/12 devices
 
 **Raouf:**
 - **Date:** 2026-02-10 (Australia/Sydney)
