@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-10 — Raouf: Build 5 — Back Button Top-Left Fix
+
+**Scope:** Move back buttons from top-middle to top-left on all pages
+**Summary:** Back buttons on various pages appeared centered at the top of the screen instead of the standard top-left position. Fixed via CSS absolute positioning and JS class injection on all detected back buttons.
+
+**Fixes Applied:**
+1. **CSS `.aa-back-topleft` class** — `position:absolute; top:8px; left:12px; z-index:50` forces any element with this class to top-left corner of its positioned parent
+2. **Header containers** — Added `position:relative` to `header`, `.sticky.top-0`, `.pt-8` so absolute positioning works correctly
+3. **`fixDuplicateBackButtons()` update** — Surviving (first visible) back button now gets `aa-back-topleft` class
+4. **Global back button scan** — All visible back buttons found in `#root` get `aa-back-topleft` class
+5. **`cleanupStalePatches()` update** — Re-applies `aa-back-topleft` to visible back buttons after SPA navigation cleanup
+6. **Injected back button update** — Removed old `margin-left:-8px; margin-bottom:8px` inline styles, uses `aa-back-topleft` class instead
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — **MODIFIED** — CSS + JS back button positioning
+- `ios/App/App.xcodeproj/project.pbxproj` — Build 4 → 5
+
+**Verification:**
+- `xcodebuild Release CODE_SIGNING_REQUIRED=NO` — ✅ BUILD SUCCEEDED
+
+---
+
 ### 2026-02-10 — Raouf: Build 4 — Login Persistence Fix (Milestone 8)
 
 **Scope:** Fix login lost after backgrounding or killing app on customer devices (iPhone 11, iPhone 12)

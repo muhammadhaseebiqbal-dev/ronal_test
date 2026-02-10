@@ -408,6 +408,23 @@ class PatchedBridgeViewController: CAPBridgeViewController {
 
         /* ── Hide our injected back button when a native one exists ── */
         .aa-injected-back + * .aa-injected-back { display: none !important; }
+
+        /* ── B8: Force ALL back buttons to top-left ── */
+        .aa-injected-back,
+        .aa-back-topleft {
+          position: absolute !important;
+          top: 8px !important;
+          left: 12px !important;
+          z-index: 50 !important;
+          margin: 0 !important;
+        }
+        /* Ensure parent containers of back buttons are positioned */
+        header,
+        .sticky.top-0,
+        [class*="sticky"][class*="top-0"],
+        .pt-8 {
+          position: relative !important;
+        }
       `;
       document.head.appendChild(style);
     })();
@@ -536,6 +553,10 @@ class PatchedBridgeViewController: CAPBridgeViewController {
             if (el.style.display === 'none' || el.offsetParent === null) return;
             if (!firstVisible) {
               firstVisible = el;
+              // Move surviving back button to top-left
+              if (!el.classList.contains('aa-back-topleft')) {
+                el.classList.add('aa-back-topleft');
+              }
             } else {
               el.style.display = 'none';
               el.setAttribute('data-aa-hidden', 'duplicate');
@@ -553,6 +574,10 @@ class PatchedBridgeViewController: CAPBridgeViewController {
           var text = (el.textContent || '').trim();
           if (/^(\\u2190\\s*)?Back$/i.test(text)) {
             allBackBtns.push(el);
+            // Move ALL back buttons to top-left
+            if (!el.classList.contains('aa-back-topleft') && el.style.display !== 'none') {
+              el.classList.add('aa-back-topleft');
+            }
           }
         });
         // Group by proximity — if two back buttons are within 200px vertically, hide the second
@@ -605,13 +630,12 @@ class PatchedBridgeViewController: CAPBridgeViewController {
         if (header.querySelector('.aa-injected-back')) return;
 
         var backBtn = document.createElement('button');
-        backBtn.className = 'aa-injected-back';
+        backBtn.className = 'aa-injected-back aa-back-topleft';
         backBtn.setAttribute('aria-label', 'Back');
         backBtn.style.cssText =
           'background:none;border:none;color:inherit;font-size:15px;font-weight:500;' +
           'padding:8px 12px;cursor:pointer;display:flex;align-items:center;gap:4px;' +
-          'min-height:44px;min-width:44px;-webkit-tap-highlight-color:transparent;' +
-          'margin-left:-8px;margin-bottom:8px;';
+          'min-height:44px;min-width:44px;-webkit-tap-highlight-color:transparent;';
         backBtn.innerHTML =
           '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
           'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
@@ -647,6 +671,17 @@ class PatchedBridgeViewController: CAPBridgeViewController {
         document.querySelectorAll('[data-aa-hidden]').forEach(function(el) {
           el.style.display = '';
           el.removeAttribute('data-aa-hidden');
+        });
+        // Re-apply top-left positioning on visible back buttons after cleanup
+        document.querySelectorAll('button, a').forEach(function(el) {
+          if (el.closest('.aa-error-fallback')) return;
+          if (el.closest('nav.fixed.bottom-0')) return;
+          var text = (el.textContent || '').trim();
+          if (/^(\\u2190\\s*)?Back$/i.test(text) && el.style.display !== 'none') {
+            if (!el.classList.contains('aa-back-topleft')) {
+              el.classList.add('aa-back-topleft');
+            }
+          }
         });
         // Remove stale error fallbacks
         var root = document.getElementById('root');

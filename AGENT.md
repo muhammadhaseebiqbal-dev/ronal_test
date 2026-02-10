@@ -108,6 +108,7 @@ npm run test           # Unit tests
 | No offline handling | ✅ FIXED — OfflineScreen component |
 | Debug config in Release | ✅ FIXED — Separate release.xcconfig |
 | Login lost on background/kill | ✅ FIXED — Cookie bridging + process termination recovery |
+| Back button in top middle | ✅ FIXED — CSS+JS moves all back buttons to top-left |
 
 ## Safari Web Inspector Diagnostics
 ```javascript
@@ -125,11 +126,11 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 
 ## Last Change Log
 
-**2026-02-10 — Raouf: Milestone 8 — Build 4 Login Persistence Fix**
-- Root cause: WKWebView content process termination on memory-constrained devices (iPhone 11/12) causes blind reload without cookie recovery
-- Fix: Cookie bridging (HTTPCookieStorage ↔ WKHTTPCookieStore), persistent data store verification, smart process termination recovery, foreground lifecycle handling
-- Added os_log diagnostics for cold boot, resume, and recovery events
-- Bumped build number: 3 → 4
+**2026-02-10 — Raouf: Build 5 — Back Button Top-Left Fix**
+- Moved all back buttons from top-middle to top-left on every page
+- CSS: `.aa-back-topleft` class with `position:absolute; top:8px; left:12px`
+- JS: `fixDuplicateBackButtons()` and global scan now add `aa-back-topleft` to all visible back buttons
+- Bumped build number: 4 → 5
 - Verification: xcodebuild Release ✅ BUILD SUCCEEDED
 
 **2026-02-09 — Raouf: Milestone 5 — Security Hardening + Build 2**
@@ -160,6 +161,18 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-10 (Australia/Sydney)
+- **Scope:** Build 5 — Back Button Top-Left Fix
+- **Summary:** Moved all back buttons from top-middle to top-left on every page. Added CSS class `.aa-back-topleft` with absolute positioning (top:8px, left:12px, z-index:50). Updated JS `fixDuplicateBackButtons()` to apply class to surviving back button, global scan to apply to all visible back buttons, `cleanupStalePatches()` to re-apply on navigation, and injected back button to use the class.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: CSS + JS back button positioning
+  - `ios/App/App.xcodeproj/project.pbxproj` — Build 4→5
+  - `AGENT.md` — This entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:** Roland verifies back button position on all pages on physical device
 
 **Raouf:**
 - **Date:** 2026-02-10 (Australia/Sydney)
