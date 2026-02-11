@@ -788,13 +788,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         /* ── Hide our injected back button when a native one exists ── */
         .aa-injected-back + * .aa-injected-back { display: none !important; }
 
-        /* ── B8: Force ALL back buttons to top-left ── */
+        /* ── B8: Force ALL back buttons to top-left, below safe area ── */
         .aa-injected-back,
         .aa-back-topleft {
-          position: absolute !important;
-          top: 8px !important;
+          position: fixed !important;
+          top: calc(env(safe-area-inset-top, 44px) + 4px) !important;
           left: 12px !important;
-          z-index: 50 !important;
+          z-index: 9999 !important;
           margin: 0 !important;
         }
         /* Ensure parent containers of back buttons are positioned */
@@ -1064,18 +1064,25 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         container.appendChild(fallback);
       }
 
-      // ── 2. BLANK SCREEN DETECTION (improved for Prayer List) ──
+      // ── 2. BLANK SCREEN DETECTION (safe: respects loading states) ──
 
+      var blankConsecutiveHits = 0;
       function detectBlankScreen() {
         var root = document.getElementById('root');
         if (!root) return;
         if (root.children.length === 0) return;
+
+        // Skip if loading indicators are present (app is still fetching data)
+        if (root.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="skeleton"], [class*="spinner"], .aa-error-fallback')) return;
+
         var text = (root.innerText || '').trim();
         var imgs = root.querySelectorAll('img, svg, canvas');
         var nav = root.querySelector('nav');
-        // If there's a nav bar but no page content, the page failed to render
-        // Lowered threshold: text < 30 chars catches more blank states
-        if (nav && text.length < 30 && imgs.length < 3) {
+
+        if (nav && text.length < 20 && imgs.length < 2) {
+          blankConsecutiveHits++;
+          // Only show error after 3 consecutive blank detections (9+ seconds)
+          if (blankConsecutiveHits < 3) return;
           if (root.querySelector('.aa-error-fallback')) return;
           var main = root.querySelector('main') || nav.previousElementSibling || root;
           var fallback = document.createElement('div');
@@ -1086,33 +1093,48 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             '<button class="aa-btn aa-btn-primary" onclick="window.location.reload()">Retry</button>' +
             '<button class="aa-btn aa-btn-secondary" onclick="window.history.back()">Go Back</button>';
           main.appendChild(fallback);
+        } else {
+          blankConsecutiveHits = 0;
         }
       }
 
       // ── 2b. PRAYER CORNER ROUTE MONITORING ──
-      // Specifically monitor Prayer Corner sub-routes for failed loads.
-      // These pages sometimes silently fail without triggering a JS error.
+      // Only show fallback after sustained blank state (not on first check).
+      // Respect loading indicators — Base44 pages load data asynchronously.
 
+      var prayerBlankHits = 0;
       function monitorPrayerRoutes() {
         var path = window.location.pathname.toLowerCase();
+        var hash = (window.location.hash || '').toLowerCase();
         var isPrayerRoute = path.indexOf('/prayer') !== -1 ||
                             path.indexOf('/request') !== -1 ||
                             path.indexOf('/builder') !== -1 ||
-                            path.indexOf('/wall') !== -1;
-        if (!isPrayerRoute) return;
+                            path.indexOf('/wall') !== -1 ||
+                            hash.indexOf('/prayer') !== -1 ||
+                            hash.indexOf('/request') !== -1 ||
+                            hash.indexOf('/builder') !== -1 ||
+                            hash.indexOf('/wall') !== -1;
+        if (!isPrayerRoute) { prayerBlankHits = 0; return; }
 
         var root = document.getElementById('root');
         if (!root) return;
         if (root.querySelector('.aa-error-fallback')) return;
 
-        // Check for meaningful content beyond just nav
+        // Skip if loading indicators are present
+        if (root.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="skeleton"], [class*="spinner"]')) {
+          prayerBlankHits = 0;
+          return;
+        }
+
         var main = root.querySelector('main, [class*="container"], [class*="content"]');
         if (!main) main = root;
         var mainText = (main.innerText || '').trim();
         var nav = root.querySelector('nav.fixed.bottom-0');
-        // If we're on a prayer route and there's almost no content (just nav labels),
-        // the page likely failed to load
+
         if (nav && mainText.length < 40) {
+          prayerBlankHits++;
+          // Require 3 consecutive blank checks (9+ seconds of blank) before showing error
+          if (prayerBlankHits < 3) return;
           var fallback = document.createElement('div');
           fallback.className = 'aa-error-fallback';
           fallback.innerHTML =
@@ -1121,6 +1143,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             '<button class="aa-btn aa-btn-primary" onclick="window.location.reload()">Retry</button>' +
             '<button class="aa-btn aa-btn-secondary" onclick="window.history.back()">Go Back</button>';
           main.appendChild(fallback);
+        } else {
+          prayerBlankHits = 0;
         }
       }
 
@@ -1205,17 +1229,23 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
       // ── 5. MISSING BACK BUTTON FIX ──
 
-      function fixMissingBackButtons() {
+      function needsBackButton() {
         var path = window.location.pathname.toLowerCase();
-        var needsBack = path === '/journal' ||
-                        path === '/more' ||
-                        path.indexOf('/journal/') === 0 ||
-                        path.indexOf('/more/') === 0 ||
-                        path.indexOf('/prayer') === 0 ||
-                        path.indexOf('/request') === 0 ||
-                        path.indexOf('/builder') === 0 ||
-                        path.indexOf('/wall') === 0;
-        if (!needsBack) return;
+        var hash = (window.location.hash || '').toLowerCase();
+        return path === '/journal' || path === '/more' ||
+               path.indexOf('/journal/') === 0 || path.indexOf('/more/') === 0 ||
+               path.indexOf('/prayer') === 0 || path.indexOf('/request') === 0 ||
+               path.indexOf('/builder') === 0 || path.indexOf('/wall') === 0 ||
+               hash.indexOf('/prayer') !== -1 || hash.indexOf('/request') !== -1 ||
+               hash.indexOf('/builder') !== -1 || hash.indexOf('/wall') !== -1 ||
+               hash.indexOf('/journal') !== -1 || hash.indexOf('/more') !== -1;
+      }
+
+      function fixMissingBackButtons() {
+        if (!needsBackButton()) return;
+
+        // Already injected a fixed back button?
+        if (document.getElementById('aa-fixed-back')) return;
 
         var root = document.getElementById('root');
         if (!root) return;
@@ -1231,19 +1261,17 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         });
         if (hasVisibleBack) return;
 
-        var header = root.querySelector('header') ||
-                     root.querySelector('.pt-8') ||
-                     root.querySelector('[class*="sticky"][class*="top"]');
-        if (!header) return;
-        if (header.querySelector('.aa-injected-back')) return;
-
+        // Insert as fixed-position button on body (not inside header)
+        // so it's always visible below the safe area
         var backBtn = document.createElement('button');
+        backBtn.id = 'aa-fixed-back';
         backBtn.className = 'aa-injected-back aa-back-topleft';
         backBtn.setAttribute('aria-label', 'Back');
         backBtn.style.cssText =
-          'background:none;border:none;color:inherit;font-size:15px;font-weight:500;' +
-          'padding:8px 12px;cursor:pointer;display:flex;align-items:center;gap:4px;' +
-          'min-height:44px;min-width:44px;-webkit-tap-highlight-color:transparent;';
+          'background:rgba(255,255,255,0.92);border:none;color:#1a1a1a;font-size:15px;font-weight:500;' +
+          'padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:4px;' +
+          'min-height:44px;min-width:44px;-webkit-tap-highlight-color:transparent;' +
+          'border-radius:20px;box-shadow:0 1px 4px rgba(0,0,0,0.12);';
         backBtn.innerHTML =
           '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
           'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
@@ -1254,24 +1282,20 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           window.history.back();
         });
 
-        var target = header.querySelector('.max-w-2xl') ||
-                     header.querySelector('.max-w-lg') ||
-                     header.querySelector('div') ||
-                     header;
-        target.insertBefore(backBtn, target.firstChild);
+        document.body.appendChild(backBtn);
       }
 
       // ── 6. CLEANUP STALE PATCHES ──
 
       function cleanupStalePatches() {
+        if (!needsBackButton()) {
+          // Remove fixed back button when not needed
+          var fixedBack = document.getElementById('aa-fixed-back');
+          if (fixedBack) fixedBack.remove();
+        }
         var injected = document.querySelectorAll('.aa-injected-back');
         injected.forEach(function(el) {
-          var path = window.location.pathname.toLowerCase();
-          var shouldHave = path === '/journal' || path === '/more' ||
-                           path.indexOf('/journal/') === 0 || path.indexOf('/more/') === 0 ||
-                           path.indexOf('/prayer') === 0 || path.indexOf('/request') === 0 ||
-                           path.indexOf('/builder') === 0 || path.indexOf('/wall') === 0;
-          if (!shouldHave) {
+          if (!needsBackButton()) {
             el.remove();
           }
         });
@@ -1534,6 +1558,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       var blankCheckCount = 0;
       function scheduleBlankChecks() {
         blankCheckCount = 0;
+        blankConsecutiveHits = 0;
+        prayerBlankHits = 0;
         var interval = setInterval(function() {
           blankCheckCount++;
           detectBlankScreen();
@@ -1545,6 +1571,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       // SPA navigation hooks
       window.addEventListener('popstate', function() {
         resetGoogleNotice();
+        setTimeout(runAllPatches, 300);
+        scheduleBlankChecks();
+      });
+
+      window.addEventListener('hashchange', function() {
         setTimeout(runAllPatches, 300);
         scheduleBlankChecks();
       });

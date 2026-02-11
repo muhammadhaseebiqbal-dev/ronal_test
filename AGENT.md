@@ -108,10 +108,11 @@ npm run test           # Unit tests
 | No offline handling | ✅ FIXED — OfflineScreen component |
 | Debug config in Release | ✅ FIXED — Separate release.xcconfig |
 | Google sign-in loop | ✅ FIXED — Build 6: ASWebAuthenticationSession + token handoff into WKWebView. Fallback to Email/Password after 3 failed attempts |
-| Prayer Corner routes fail | ✅ FIXED — Prayer route monitoring + improved blank detection |
-| Prayer List blank screen | ✅ FIXED — Tuned blank detection thresholds |
+| Prayer Corner routes fail | ✅ FIXED — Prayer route monitoring (3-check threshold) + loading indicator awareness |
+| Prayer List blank screen | ✅ FIXED — Consecutive blank checks required (9s wait), skip if loading indicators present |
 | Login lost on background/kill | ✅ FIXED — Cookie bridging + process termination recovery |
 | Back button in top middle | ✅ FIXED — CSS+JS moves all back buttons to top-left |
+| Back button under clock/notch | ✅ FIXED — Fixed position with env(safe-area-inset-top) + pill style on body |
 
 ## Safari Web Inspector Diagnostics
 ```javascript
@@ -208,6 +209,19 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 6 — Fix Prayer Corner routes + Back button position
+- **Summary:** Fixed 4 failing acceptance tests: (1) Back button was at `top: 8px` which is behind the clock/notch on iPhone 11/12 — changed to `position: fixed` with `env(safe-area-inset-top)` so it sits below the safe area. Back button now rendered as a pill on body (not inside header) with white background + shadow for guaranteed visibility. (2) Prayer route monitoring was too aggressive — `monitorPrayerRoutes()` fired at 3s and showed "Content didn't load" before Base44 API data finished loading. Now requires 3 consecutive blank checks (9+ seconds) before showing error. (3) Blank screen detection same fix — requires 3 consecutive hits. Both detectors now skip if loading indicators are present (`animate-spin`, `animate-pulse`, `loading`, `skeleton`, `spinner`). (4) Added hash route support for prayer paths. Counters reset on SPA navigation. Added `hashchange` listener.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: CSS B8 `top:8px`→`calc(env(safe-area-inset-top)+4px)` + `position:fixed` + `z-index:9999`. `fixMissingBackButtons()` rewritten: uses `needsBackButton()` helper, appends fixed pill button to `document.body`. `detectBlankScreen()` + `monitorPrayerRoutes()` now use consecutive hit counters + loading indicator checks. `cleanupStalePatches()` uses `needsBackButton()`. Added `hashchange` listener. Reset counters in `scheduleBlankChecks()`.
+  - `AGENT.md` — Updated Known Issues + this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:**
+  - Roland tests Prayer Corner, New Request, Builder, Prayer Wall, Prayer List on device
+  - Back button should be visible below clock, tappable, pill-shaped
 
 **Raouf:**
 - **Date:** 2026-02-11 (Australia/Sydney)

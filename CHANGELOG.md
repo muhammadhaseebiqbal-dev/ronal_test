@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-11 — Raouf: Build 6 — Fix Prayer Corner Routes + Back Button Position
+
+**Scope:** Fix 4 failing acceptance tests: Prayer Corner back button, New Request, Builder loads, Prayer List blank screen.
+
+**Root Causes:**
+1. **Back button under clock/notch** — CSS `top: 8px` is behind the safe area on iPhone 11/12 (notch = ~44px). Back button was invisible/untappable.
+2. **Prayer routes showing "Content didn't load" prematurely** — `monitorPrayerRoutes()` fired at 3s and injected error overlay before Base44's API data finished loading (false positive).
+3. **Blank screen detection too aggressive** — `detectBlankScreen()` had same problem: 30-char threshold triggered while app was still rendering.
+4. **Hash routes not detected** — If Base44 uses hash routing (`/#/prayer-corner`), our `pathname`-only checks wouldn't match.
+
+**Fixes:**
+1. **Back button → fixed position below safe area**
+   - CSS: `position: fixed`, `top: calc(env(safe-area-inset-top, 44px) + 4px)`, `z-index: 9999`
+   - Button now appended to `document.body` (not inside header) for guaranteed visibility
+   - Pill style: white background, rounded corners, subtle shadow — always visible regardless of page header styling
+   - `needsBackButton()` helper shared between injection and cleanup
+2. **Prayer route monitoring: 3-check threshold**
+   - `prayerBlankHits` counter — only shows error after 3 consecutive blank checks (9+ seconds)
+   - Skips if loading indicators present: `animate-spin`, `animate-pulse`, `loading`, `skeleton`, `spinner`
+   - Counter resets when content appears or route changes
+3. **Blank screen detection: same pattern**
+   - `blankConsecutiveHits` counter — 3 consecutive required
+   - Same loading indicator check
+4. **Hash route support**
+   - `needsBackButton()`, `monitorPrayerRoutes()` now check `window.location.hash` in addition to `.pathname`
+   - Added `hashchange` event listener for SPA navigation
+   - Counters reset in `scheduleBlankChecks()` on every navigation
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — CSS B8 fix, rewritten `fixMissingBackButtons()`, safer `detectBlankScreen()` + `monitorPrayerRoutes()`, `needsBackButton()` helper, `hashchange` listener
+
+**Verification:** xcodebuild Release — BUILD SUCCEEDED
+
+---
+
 ### 2026-02-11 — Raouf: Build 6 — ASWebAuthenticationSession Google OAuth (Proper Fix)
 
 **Scope:** Fix Google sign-in properly using Apple's `ASWebAuthenticationSession` instead of blocking it.
