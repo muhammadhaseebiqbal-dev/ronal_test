@@ -788,11 +788,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         /* ── Hide our injected back button when a native one exists ── */
         .aa-injected-back + * .aa-injected-back { display: none !important; }
 
-        /* ── B8: Force ALL back buttons to top-left, below safe area ── */
+        /* ── B8: Force ALL back buttons to top-left, well below safe area ── */
         .aa-injected-back,
         .aa-back-topleft {
           position: fixed !important;
-          top: calc(env(safe-area-inset-top, 44px) + 4px) !important;
+          top: calc(env(safe-area-inset-top, 44px) + 16px) !important;
           left: 12px !important;
           z-index: 9999 !important;
           margin: 0 !important;
@@ -1064,7 +1064,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         container.appendChild(fallback);
       }
 
-      // ── 2. BLANK SCREEN DETECTION (safe: respects loading states) ──
+      // ── 2. BLANK SCREEN DETECTION (ultra-conservative) ──
+      // Only triggers if root has NO meaningful content for 5+ consecutive checks (15s+).
+      // Never triggers on prayer/builder/request/wall routes (let Base44 handle those).
 
       var blankConsecutiveHits = 0;
       function detectBlankScreen() {
@@ -1072,17 +1074,28 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         if (!root) return;
         if (root.children.length === 0) return;
 
-        // Skip if loading indicators are present (app is still fetching data)
+        // Never inject error overlays on prayer-related routes
+        var path = window.location.pathname.toLowerCase();
+        var hash = (window.location.hash || '').toLowerCase();
+        if (path.indexOf('/prayer') !== -1 || path.indexOf('/request') !== -1 ||
+            path.indexOf('/builder') !== -1 || path.indexOf('/wall') !== -1 ||
+            hash.indexOf('/prayer') !== -1 || hash.indexOf('/request') !== -1 ||
+            hash.indexOf('/builder') !== -1 || hash.indexOf('/wall') !== -1) {
+          blankConsecutiveHits = 0;
+          return;
+        }
+
+        // Skip if loading indicators are present
         if (root.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="skeleton"], [class*="spinner"], .aa-error-fallback')) return;
 
         var text = (root.innerText || '').trim();
         var imgs = root.querySelectorAll('img, svg, canvas');
         var nav = root.querySelector('nav');
 
-        if (nav && text.length < 20 && imgs.length < 2) {
+        // Only trigger if almost nothing rendered: text < 10 chars AND fewer than 2 images
+        if (nav && text.length < 10 && imgs.length < 2) {
           blankConsecutiveHits++;
-          // Only show error after 3 consecutive blank detections (9+ seconds)
-          if (blankConsecutiveHits < 3) return;
+          if (blankConsecutiveHits < 5) return;
           if (root.querySelector('.aa-error-fallback')) return;
           var main = root.querySelector('main') || nav.previousElementSibling || root;
           var fallback = document.createElement('div');
@@ -1099,53 +1112,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       }
 
       // ── 2b. PRAYER CORNER ROUTE MONITORING ──
-      // Only show fallback after sustained blank state (not on first check).
-      // Respect loading indicators — Base44 pages load data asynchronously.
-
-      var prayerBlankHits = 0;
+      // DISABLED: Roland requires "no recovery screens" — pages must load on their own.
+      // Previous implementation injected error overlays that covered actual content.
       function monitorPrayerRoutes() {
-        var path = window.location.pathname.toLowerCase();
-        var hash = (window.location.hash || '').toLowerCase();
-        var isPrayerRoute = path.indexOf('/prayer') !== -1 ||
-                            path.indexOf('/request') !== -1 ||
-                            path.indexOf('/builder') !== -1 ||
-                            path.indexOf('/wall') !== -1 ||
-                            hash.indexOf('/prayer') !== -1 ||
-                            hash.indexOf('/request') !== -1 ||
-                            hash.indexOf('/builder') !== -1 ||
-                            hash.indexOf('/wall') !== -1;
-        if (!isPrayerRoute) { prayerBlankHits = 0; return; }
-
-        var root = document.getElementById('root');
-        if (!root) return;
-        if (root.querySelector('.aa-error-fallback')) return;
-
-        // Skip if loading indicators are present
-        if (root.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="skeleton"], [class*="spinner"]')) {
-          prayerBlankHits = 0;
-          return;
-        }
-
-        var main = root.querySelector('main, [class*="container"], [class*="content"]');
-        if (!main) main = root;
-        var mainText = (main.innerText || '').trim();
-        var nav = root.querySelector('nav.fixed.bottom-0');
-
-        if (nav && mainText.length < 40) {
-          prayerBlankHits++;
-          // Require 3 consecutive blank checks (9+ seconds of blank) before showing error
-          if (prayerBlankHits < 3) return;
-          var fallback = document.createElement('div');
-          fallback.className = 'aa-error-fallback';
-          fallback.innerHTML =
-            '<h2>Content didn\\u2019t load</h2>' +
-            '<p>This page may need a moment. Tap Retry or go back.</p>' +
-            '<button class="aa-btn aa-btn-primary" onclick="window.location.reload()">Retry</button>' +
-            '<button class="aa-btn aa-btn-secondary" onclick="window.history.back()">Go Back</button>';
-          main.appendChild(fallback);
-        } else {
-          prayerBlankHits = 0;
-        }
+        // No-op: let Base44 handle its own page rendering
       }
 
       // ── 3. GLOBAL ERROR HANDLERS ──
