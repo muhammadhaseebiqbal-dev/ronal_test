@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### iPhone Stage One — Acceptance Criteria (Roland, 2026-11-02)
+
+| # | Criterion | Status |
+|---|-----------|--------|
+| 1 | Email/password login persists after background and kill/reopen | ✅ FIXED (Build 4+) |
+| 2 | Prayer Corner back navigation works | ✅ FIXED (Build 6) |
+| 3 | New Request loads | ✅ FIXED (Build 6) |
+| 4 | Builder loads | ✅ FIXED (Build 6) |
+| 5 | Prayer Wall loads and is not squashed, back navigation works | ✅ FIXED (Build 6) |
+| 6 | Prayer List does not white-screen | ✅ FIXED (Build 6) |
+| 7 | **Log out button** in More/Settings that fully signs the user out, clears stored auth state, and returns to Login screen (so a different account can log in) | ⬜ TODO — must be included in next build |
+
+---
+
 ### 2026-02-11 — Raouf: Build 6 — SelectTrigger runtime recovery for Prayer Request/Builder
 
 **Scope:** Fix Prayer Corner Request/Builder route failures caused by `SelectTrigger must be used within Select`.
