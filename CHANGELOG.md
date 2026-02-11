@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-12 — Raouf: Build 6 — UI polish, SelectTrigger fix, Prayer Wall responsive
+
+**Scope:** Fix all 5 remaining Roland acceptance items for Build 6.
+
+**What changed:**
+1. **"or" divider fully hidden** — Broad sweep: hides all `or`/`— or —`/`- or -` text elements, plus class-based `divider`/`separator` elements on login pages. Also checks parent siblings and collapses empty parent containers.
+2. **SelectTrigger crash fix** — `SelectTrigger must be used within Select` React error now auto-retries (up to 2 reloads) instead of leaving a blank page. On 3rd failure, shows minimal "Tap to Reload" + "Go Back" buttons. Debounced 3s to prevent loops.
+3. **Back button lowered** — Offset increased from `safe-area-inset-top + 16px` to `safe-area-inset-top + 52px` (~96px from screen top on iPhone 11/12). Well below notch, clock, and any app header bar.
+4. **Prayer Wall responsive CSS** — Grid forced to 1-column on mobile (`grid-template-columns: 1fr`), 2-column on ≥640px. `overflow-x: hidden` prevents horizontal scroll/squash. `break-word` on all grid children.
+5. **Main content padding** — `<main>` gets `padding-top` matching safe area + header, preventing content from being hidden behind fixed back button.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — All 5 fixes (CSS + JS)
+- `AGENT.md` — Updated Known Issues table with new fixes
+- `CHANGELOG.md` — This entry
+
+**Verification:** xcodebuild Release — BUILD SUCCEEDED. Build number unchanged: 6.
+
 ### 2026-02-11 — Raouf: Build 6 — Email/Password Only (Google Hidden)
 
 **Scope:** Roland confirmed no more Base44 subscription. Ship iOS with Email/Password only.

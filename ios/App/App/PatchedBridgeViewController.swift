@@ -505,11 +505,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         /* ── Hide our injected back button when a native one exists ── */
         .aa-injected-back + * .aa-injected-back { display: none !important; }
 
-        /* ── B8: Force ALL back buttons to top-left, well below safe area ── */
+        /* ── B8: Force ALL back buttons to top-left, well below safe area + header ── */
         .aa-injected-back,
         .aa-back-topleft {
           position: fixed !important;
-          top: calc(env(safe-area-inset-top, 44px) + 16px) !important;
+          top: calc(env(safe-area-inset-top, 44px) + 52px) !important;
           left: 12px !important;
           z-index: 9999 !important;
           margin: 0 !important;
@@ -522,7 +522,43 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           position: relative !important;
         }
 
-        /* ── B9: (Reserved — Google notice removed, Email/Password only) ── */
+        /* ── B9: Prayer Wall responsiveness ── */
+        /* Prevent squished grid/cards on smaller iPhone screens */
+        [class*="prayer-wall"] .grid,
+        [class*="prayer_wall"] .grid,
+        [class*="PrayerWall"] .grid,
+        main .grid {
+          grid-template-columns: 1fr !important;
+          gap: 12px !important;
+        }
+        @media (min-width: 640px) {
+          [class*="prayer-wall"] .grid,
+          [class*="prayer_wall"] .grid,
+          [class*="PrayerWall"] .grid,
+          main .grid {
+            grid-template-columns: repeat(2, 1fr) !important;
+          }
+        }
+        /* Ensure cards/items in prayer wall are not squashed */
+        [class*="prayer-wall"] .grid > *,
+        [class*="prayer_wall"] .grid > *,
+        main .grid > div {
+          min-width: 0 !important;
+          overflow-wrap: break-word !important;
+          word-break: break-word !important;
+        }
+        /* Fix prayer wall scrollable content */
+        [class*="prayer-wall"],
+        [class*="prayer_wall"],
+        [class*="PrayerWall"] {
+          overflow-x: hidden !important;
+          max-width: 100vw !important;
+          box-sizing: border-box !important;
+        }
+        /* Ensure prayer pages have proper padding for fixed back button */
+        main {
+          padding-top: max(calc(env(safe-area-inset-top, 44px) + 8px), 52px) !important;
+        }
 
         /* ── B10: Diagnostics overlay ── */
         .aa-diag-overlay {
@@ -609,20 +645,63 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           el.setAttribute('data-aa-google-hidden', 'true');
           el.style.display = 'none';
 
-          // Also hide any "or" dividers near the Google button
+          // Hide any "or" dividers near the Google button (check siblings + parent)
           var prev = el.previousElementSibling;
           var next = el.nextElementSibling;
-          if (prev) {
-            var prevText = (prev.textContent || '').trim().toLowerCase();
-            if (prevText === 'or' || prevText === '— or —' || prevText === '- or -' || prevText === 'or continue with') {
-              prev.style.display = 'none';
+          var parent = el.parentElement;
+          [prev, next].forEach(function(sib) {
+            if (!sib) return;
+            var sibText = (sib.textContent || '').trim().toLowerCase();
+            if (sibText === 'or' || sibText === '— or —' || sibText === '- or -' ||
+                sibText === 'or continue with' || /^-+\\s*or\\s*-+$/.test(sibText) ||
+                /^—+\\s*or\\s*—+$/.test(sibText)) {
+              sib.style.display = 'none';
+              sib.setAttribute('data-aa-or-hidden', 'true');
+            }
+          });
+          // Also check the parent's siblings (if Google is wrapped in a container)
+          if (parent) {
+            var parentPrev = parent.previousElementSibling;
+            var parentNext = parent.nextElementSibling;
+            [parentPrev, parentNext].forEach(function(sib) {
+              if (!sib) return;
+              var sibText = (sib.textContent || '').trim().toLowerCase();
+              if (sibText === 'or' || sibText === '— or —' || sibText === '- or -' ||
+                  /^-+\\s*or\\s*-+$/.test(sibText) || /^—+\\s*or\\s*—+$/.test(sibText)) {
+                sib.style.display = 'none';
+                sib.setAttribute('data-aa-or-hidden', 'true');
+              }
+            });
+            // Hide parent if it only contained the Google button
+            var visibleChildren = 0;
+            for (var i = 0; i < parent.children.length; i++) {
+              if (parent.children[i].style.display !== 'none') visibleChildren++;
+            }
+            if (visibleChildren === 0 && parent.children.length > 0) {
+              parent.style.display = 'none';
             }
           }
-          if (next) {
-            var nextText = (next.textContent || '').trim().toLowerCase();
-            if (nextText === 'or' || nextText === '— or —' || nextText === '- or -' || nextText === 'or continue with') {
-              next.style.display = 'none';
-            }
+        });
+
+        // Broad sweep: hide any standalone "or" divider elements on login pages
+        // that sit between (now-hidden) Google buttons and email forms.
+        // Matches: divs/spans with class containing 'divider', 'separator', 'or-divider',
+        // or elements whose only text content is "or" (with optional dashes/em-dashes).
+        var allEls = root.querySelectorAll('div, span, p, hr');
+        allEls.forEach(function(el) {
+          if (el.getAttribute('data-aa-or-hidden')) return;
+          if (el.style.display === 'none') return;
+          var t = (el.textContent || '').trim().toLowerCase();
+          var cls = (el.className || '').toLowerCase();
+          // Text-only "or" dividers
+          var isOrText = (t === 'or' || t === '— or —' || t === '- or -' ||
+                         /^-{1,3}\\s*or\\s*-{1,3}$/.test(t) ||
+                         /^—{1,3}\\s*or\\s*—{1,3}$/.test(t));
+          // CSS class-based dividers near hidden Google buttons
+          var isDividerClass = cls.indexOf('divider') !== -1 || cls.indexOf('separator') !== -1;
+          if (isOrText || (isDividerClass && t.indexOf('or') !== -1 && t.length < 20)) {
+            el.style.display = 'none';
+            el.setAttribute('data-aa-or-hidden', 'true');
           }
         });
       }
@@ -715,10 +794,59 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
       // ── 3. GLOBAL ERROR HANDLERS ──
 
+      // Track SelectTrigger crash recovery
+      var selectTriggerRetryCount = 0;
+      var lastSelectTriggerRetryTime = 0;
+
+      function handleSelectTriggerCrash() {
+        // This React context error crashes the entire component tree.
+        // Strategy: find the crashed container and inject a clean reload.
+        var now = Date.now();
+        if (now - lastSelectTriggerRetryTime < 3000) return; // debounce
+        lastSelectTriggerRetryTime = now;
+        selectTriggerRetryCount++;
+
+        var root = document.getElementById('root');
+        if (!root) return;
+
+        // If root is now empty/broken from React crash, show a reload prompt
+        var rootText = (root.innerText || '').trim();
+        if (rootText.length < 30 || root.childElementCount < 2) {
+          // React tree has crashed — auto-retry once, then show manual retry
+          if (selectTriggerRetryCount <= 2) {
+            // Auto-retry: reload the current route
+            setTimeout(function() {
+              window.location.reload();
+            }, 500);
+          } else {
+            // Show a minimal retry UI (NOT a "recovery screen" — just a button)
+            if (!root.querySelector('.aa-select-fix')) {
+              var fix = document.createElement('div');
+              fix.className = 'aa-select-fix';
+              fix.style.cssText = 'text-align:center;padding:60px 20px;';
+              fix.innerHTML =
+                '<p style="color:#666;margin-bottom:16px;">This page needs a moment to load.</p>' +
+                '<button onclick="selectTriggerRetryCount=0;window.location.reload()" ' +
+                'style="background:#c9a96e;color:#fff;border:none;padding:12px 24px;' +
+                'border-radius:8px;font-size:16px;cursor:pointer;">Tap to Reload</button>' +
+                '<br><button onclick="window.history.back()" ' +
+                'style="background:transparent;color:#c9a96e;border:1px solid #c9a96e;' +
+                'padding:10px 20px;border-radius:8px;font-size:14px;cursor:pointer;margin-top:12px;">Go Back</button>';
+              root.appendChild(fix);
+            }
+          }
+        }
+      }
+
       window.addEventListener('error', function(event) {
         var msg = (event.error && event.error.message) || event.message || '';
-        if (msg.indexOf('must be used within') !== -1 ||
-            msg.indexOf('Cannot read properties of null') !== -1 ||
+        if (msg.indexOf('must be used within') !== -1) {
+          event.preventDefault();
+          event.stopImmediatePropagation && event.stopImmediatePropagation();
+          setTimeout(handleSelectTriggerCrash, 300);
+          return;
+        }
+        if (msg.indexOf('Cannot read properties of null') !== -1 ||
             msg.indexOf('Cannot read properties of undefined') !== -1) {
           event.preventDefault();
           setTimeout(detectAndFixErrorScreen, 500);

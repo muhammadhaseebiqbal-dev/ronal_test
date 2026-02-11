@@ -97,7 +97,7 @@ npm run test           # Unit tests
 | Scheme collision | ✅ FIXED — Removed ios.scheme |
 | Race condition: old token clears new | ✅ FIXED — tokenVersion guard |
 | Deep link double-processing | ✅ FIXED — lastProcessedUrl guard |
-| SelectTrigger context error | ✅ FIXED — WKUserScript error boundary |
+| SelectTrigger context error | ✅ FIXED — Auto-retry + reload on React crash (SelectTrigger must be used within Select) |
 | Duplicate back buttons | ✅ FIXED — DOM patch removes duplicates |
 | Missing back buttons | ✅ FIXED — DOM patch injects back nav |
 | Bottom nav squashed (5 tabs) | ✅ FIXED — CSS flex/min-width patch |
@@ -112,7 +112,9 @@ npm run test           # Unit tests
 | Prayer List blank screen | ✅ FIXED — Ultra-conservative: 5 consecutive blank checks (15s), never on prayer routes |
 | Login lost on background/kill | ✅ FIXED — Cookie bridging + process termination recovery |
 | Back button in top middle | ✅ FIXED — CSS+JS moves all back buttons to top-left |
-| Back button under clock/notch | ✅ FIXED — Fixed position with env(safe-area-inset-top) + pill style on body |
+| Back button under clock/notch | ✅ FIXED — Fixed position with safe-area-inset-top + 52px offset below header |
+| "or" divider visible after Google hidden | ✅ FIXED — Broad sweep hides all or/divider/separator elements on login page |
+| Prayer Wall squashed/not responsive | ✅ FIXED — CSS grid forced to 1-column on mobile, overflow hidden |
 
 ## Safari Web Inspector Diagnostics
 ```javascript
