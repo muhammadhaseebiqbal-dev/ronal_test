@@ -142,6 +142,31 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 
 ## Last Change Log
 
+**2026-02-11 — Raouf: Build 6 — Lint scope fix for generated iOS artifacts**
+- Fixed `npm run lint` failure caused by ESLint scanning generated Capacitor web assets under `ios/**/public/**`
+- Updated ESLint flat config ignore list to exclude generated build output and report artifacts (`ios/**/public/**`, `coverage/`, `test-results/`, `*.xcresult/**`)
+- Lint now targets source files instead of compiled/minified bundles
+
+**2026-02-11 — Raouf: Build 6 — SelectTrigger unhandled rejection recovery fix**
+- Updated `unhandledrejection` handling for `SelectTrigger must be used within Select` to trigger `handleSelectTriggerCrash()` directly (auto-reload path) instead of generic error-screen enhancer
+- Improves recovery for Prayer List white-screen scenarios caused by React context crashes
+- Keeps prayer routes free from "failed to load" overlay UI
+
+**2026-02-11 — Raouf: Build 6 — Prayer flow silent self-heal (no overlay UI)**
+- Added prayer-route-only blank/failure monitor with **silent one-time reload** per route key (`pathname + hash`)
+- No recovery screen is injected on prayer routes; this preserves Roland's "no failed-to-load overlay" requirement
+- Targets Prayer Corner, New Request, Builder, Prayer Wall, Prayer List route failures without introducing loop risk
+- Added `hasLoadingIndicators()` helper to avoid false positives while skeleton/spinner content is still rendering
+- Restored `prayerBlankHits` lifecycle reset now that prayer monitor is active again
+
+**2026-02-11 — Raouf: Build 6 — Back Button De-dup + Prayer Route Guard**
+- Fixed duplicate stacked back buttons by prioritizing a single visible native back button and removing stale injected fixed back buttons whenever native back exists
+- Fixed regression where injected back button could persist across routes due early-return logic in `fixMissingBackButtons()`
+- Added shared back-button detection helpers to consistently identify visible native back controls
+- Added prayer flow route guard for error screen enhancer to prevent "failed to load" recovery overlay on Prayer Corner, New Request, Builder, and Prayer Wall routes
+- Removed stale `prayerBlankHits` reset from `scheduleBlankChecks()` to avoid strict-mode runtime error
+- Verification pending on iPhone stage-one checklist
+
 **2026-02-11 — Raouf: Build 6 — Email/Password Only (Google Hidden)**
 - Roland confirmed: no more Base44 subscription, ship with Email/Password only for iOS
 - Google sign-in buttons completely hidden via `display: none` (no loops, no account picker, no native auth)
@@ -211,6 +236,54 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 6 — Fix ESLint false failures on generated files
+- **Summary:** Resolved lint blocker where `npm run lint` analyzed compiled/minified files in `ios/App/App/public/assets/index-*.js` and reported hundreds of irrelevant rule violations. Updated `eslint.config.js` ignore patterns to exclude generated iOS web assets and output/report directories (`ios/**/public/**`, `coverage/`, `test-results/`, `*.xcresult/**`). This keeps lint focused on maintainable source files.
+- **Files Changed:**
+  - `eslint.config.js` — MODIFIED: expanded flat-config `ignores` list
+  - `AGENT.md` — Updated Last Change Log + this Update Log entry
+  - `CHANGELOG.md` — New unreleased entry
+- **Verification:** pending (next: rerun `npm run lint`)
+- **Follow-ups:**
+  - Keep generated artifact paths out of lint scope when build pipeline paths change
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 6 — SelectTrigger crash path aligned for unhandled Promise rejection
+- **Summary:** Patched `window.unhandledrejection` handler so `must be used within` errors now invoke `handleSelectTriggerCrash()` (debounced auto-reload + retry UI path) rather than generic `detectAndFixErrorScreen()`. This ensures the same crash recovery behavior for both `error` and `unhandledrejection` events and improves Prayer List white-screen resilience.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: `unhandledrejection` callback uses `handleSelectTriggerCrash`
+  - `AGENT.md` — Updated Last Change Log + this Update Log entry
+  - `CHANGELOG.md` — New unreleased entry
+- **Verification:** pending (next: rerun build/test)
+- **Follow-ups:**
+  - Validate Prayer List screen no longer stalls on SelectTrigger crash paths
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 6 — Prayer routes white-screen/failure self-heal (overlay-free)
+- **Summary:** Implemented targeted prayer-route monitor that never injects fallback UI but performs one silent reload when a prayer route remains genuinely blank or shows "failed to load" for 5 consecutive checks (15s). This directly targets Prayer List white-screen and Prayer Corner sub-route dead states while respecting the requirement to avoid recovery screens on New Request/Builder/Wall. Added `hasLoadingIndicators()` helper so monitor skips while loading indicators are present. Reload is loop-safe via sessionStorage key (`aa-prayer-reload:<pathname>|<hash>`), one reload per route.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: `monitorPrayerRoutes()` re-enabled as silent self-heal, added `prayerBlankHits`, `hasLoadingIndicators()`, and per-route one-time reload guard
+  - `AGENT.md` — Updated Last Change Log + this Update Log entry
+  - `CHANGELOG.md` — New unreleased entry
+- **Verification:** pending (run build/test next)
+- **Follow-ups:**
+  - Device-check Prayer Corner -> New Request/Builder/Prayer Wall and Prayer List on iPhone
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 6 — iPhone Stage One blockers (back-button duplicates + Prayer Corner overlays)
+- **Summary:** Patched injected iOS JS runtime to eliminate duplicate back buttons on routes that already render a native back button. Root cause was `fixMissingBackButtons()` returning early when `#aa-fixed-back` existed, leaving stale injected buttons stacked on top of native ones. New flow: detect visible native back buttons first, remove injected fixed button when native exists, keep only one canonical native back button (top-left-most), and hide remaining duplicates. Also blocked the "failed to load" enhancer from running on prayer flow routes (`/prayer`, `/request`, `/builder`, `/wall`, including hash routes), preventing unwanted recovery UI in Prayer Corner sub-pages. Removed a strict-mode runtime bug by dropping stale `prayerBlankHits` assignment.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: added `isPrayerFlowRoute()`, `isVisibleBackElement()`, `getVisibleNativeBackButtons()`; refactored `fixDuplicateBackButtons()`, `fixMissingBackButtons()`, `cleanupStalePatches()`; removed stale `prayerBlankHits` reset
+  - `AGENT.md` — Updated Last Change Log + this Update Log entry
+  - `CHANGELOG.md` — New unreleased entry
+- **Verification:** pending (next step: build/lint in repo)
+- **Follow-ups:**
+  - Rebuild iOS and validate on iPhone: Prayer Corner, New Request, Builder, Prayer Wall, Prayer List
 
 **Raouf:**
 - **Date:** 2026-02-11 (Australia/Sydney)

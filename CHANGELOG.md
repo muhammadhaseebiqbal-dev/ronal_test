@@ -4,6 +4,93 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-11 — Raouf: Build 6 — ESLint scope fix for generated artifacts
+
+**Scope:** Make `npm run lint` pass by excluding compiled output from lint scope.
+
+**What changed:**
+1. **Ignored generated iOS web assets**
+   - Added `ios/**/public/**` to ESLint ignore list.
+   - Prevents ESLint from scanning bundled/minified files in `ios/App/App/public/assets/`.
+2. **Ignored report/build output folders**
+   - Added `coverage/`, `test-results/`, and `*.xcresult/**` ignore patterns.
+3. **Result**
+   - Lint focuses on project source files and avoids false-positive floods from generated code.
+
+**Files Changed:**
+- `eslint.config.js` — expanded `ignores` patterns
+- `AGENT.md` — updated logs
+- `CHANGELOG.md` — this entry
+
+**Verification:** Pending `npm run lint`.
+
+### 2026-02-11 — Raouf: Build 6 — SelectTrigger unhandled rejection recovery alignment
+
+**Scope:** Improve Prayer List white-screen recovery consistency for React context crashes.
+
+**What changed:**
+1. **Unified SelectTrigger crash handling**
+   - `window.unhandledrejection` now routes `"must be used within"` errors to `handleSelectTriggerCrash()`.
+   - Previously this path used `detectAndFixErrorScreen()`, which did not run the dedicated crash reload flow.
+2. **Behavioral impact**
+   - Same debounce/auto-retry logic now applies for both `window.error` and Promise rejection paths.
+   - Reduces stuck blank-state cases in prayer-list paths when the Select context crash is emitted as an unhandled rejection.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — `unhandledrejection` handler updated
+- `AGENT.md` — updated logs
+- `CHANGELOG.md` — this entry
+
+**Verification:** Pending device validation.
+
+### 2026-02-11 — Raouf: Build 6 — Prayer route self-heal without recovery overlays
+
+**Scope:** Fix Prayer List white-screen and Prayer Corner sub-route dead states while keeping prayer UI free of fallback overlays.
+
+**What changed:**
+1. **Prayer route monitor restored as non-UI self-heal**
+   - Re-enabled `monitorPrayerRoutes()` for prayer flows only.
+   - Detects persistent blank/failure states (`text < 12` with minimal visual elements, or `"failed to load"` present).
+   - Uses 5 consecutive checks (15s) before action to avoid racing normal async loads.
+2. **No recovery screen injection on prayer routes**
+   - Monitor performs a silent reload only, never injects fallback cards/buttons.
+   - Maintains requirement: New Request/Builder/Wall should not show synthetic `"failed to load"` recovery UI.
+3. **Loop protection**
+   - Added one-time-per-route reload guard in `sessionStorage`: `aa-prayer-reload:<pathname>|<hash>`.
+4. **False-positive reduction**
+   - Added `hasLoadingIndicators()` helper and skip logic for spinner/skeleton/loading states.
+5. **Counter lifecycle**
+   - Restored `prayerBlankHits` reset in `scheduleBlankChecks()` to keep per-navigation behavior deterministic.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — prayer monitor logic + loading helper + guarded reload
+- `AGENT.md` — updated logs
+- `CHANGELOG.md` — this entry
+
+**Verification:** Pending device validation.
+
+### 2026-02-11 — Raouf: Build 6 — iPhone Stage One blocker patch
+
+**Scope:** Fix duplicate back buttons and prayer-route recovery overlay regressions on iPhone.
+
+**What changed:**
+1. **Back button de-duplication hardened**
+   - Added native back detection helpers and now keep only one visible native back control.
+   - Fixed stale injected button behavior: if a native back button exists, `#aa-fixed-back` is removed immediately.
+   - Prevented stacked "two back buttons on top of each other" across prayer/journal/more flows.
+2. **Prayer flow recovery overlay suppression**
+   - Added route guard `isPrayerFlowRoute()` to skip `"failed to load"` enhancer on `/prayer`, `/request`, `/builder`, `/wall` (including hash routes).
+   - Prevents the Prayer Corner -> New Request flow from being replaced by a synthetic recovery screen.
+3. **Runtime stability fix**
+   - Removed stale `prayerBlankHits = 0` assignment from `scheduleBlankChecks()` after prayer-route monitor was disabled; avoids strict-mode runtime exceptions in injected script.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — back-button logic refactor + prayer route guard + strict-mode fix
+- `AGENT.md` — update log/last change log refreshed
+- `CHANGELOG.md` — this entry
+
+**Verification:** Pending device validation against Stage One checklist.
+
 ### 2026-02-12 — Raouf: Build 6 — Zero npm vulnerabilities
 
 **Scope:** Eliminate all 4 npm audit vulnerabilities (3 moderate, 1 critical).

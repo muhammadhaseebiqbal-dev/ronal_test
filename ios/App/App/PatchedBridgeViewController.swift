@@ -708,7 +708,17 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
       // ── 1. ERROR SCREEN DETECTION ──
 
+      function isPrayerFlowRoute() {
+        var path = window.location.pathname.toLowerCase();
+        var hash = (window.location.hash || '').toLowerCase();
+        return path.indexOf('/prayer') !== -1 || path.indexOf('/request') !== -1 ||
+               path.indexOf('/builder') !== -1 || path.indexOf('/wall') !== -1 ||
+               hash.indexOf('/prayer') !== -1 || hash.indexOf('/request') !== -1 ||
+               hash.indexOf('/builder') !== -1 || hash.indexOf('/wall') !== -1;
+      }
+
       function detectAndFixErrorScreen() {
+        if (isPrayerFlowRoute()) return;
         var root = document.getElementById('root');
         if (!root) return;
         var text = root.innerText || '';
@@ -743,24 +753,28 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       // Never triggers on prayer/builder/request/wall routes (let Base44 handle those).
 
       var blankConsecutiveHits = 0;
+      var prayerBlankHits = 0;
+
+      function hasLoadingIndicators(root) {
+        return !!root.querySelector(
+          '[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], ' +
+          '[class*="skeleton"], [class*="spinner"], .aa-error-fallback'
+        );
+      }
+
       function detectBlankScreen() {
         var root = document.getElementById('root');
         if (!root) return;
         if (root.children.length === 0) return;
 
         // Never inject error overlays on prayer-related routes
-        var path = window.location.pathname.toLowerCase();
-        var hash = (window.location.hash || '').toLowerCase();
-        if (path.indexOf('/prayer') !== -1 || path.indexOf('/request') !== -1 ||
-            path.indexOf('/builder') !== -1 || path.indexOf('/wall') !== -1 ||
-            hash.indexOf('/prayer') !== -1 || hash.indexOf('/request') !== -1 ||
-            hash.indexOf('/builder') !== -1 || hash.indexOf('/wall') !== -1) {
+        if (isPrayerFlowRoute()) {
           blankConsecutiveHits = 0;
           return;
         }
 
         // Skip if loading indicators are present
-        if (root.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="skeleton"], [class*="spinner"], .aa-error-fallback')) return;
+        if (hasLoadingIndicators(root)) return;
 
         var text = (root.innerText || '').trim();
         var imgs = root.querySelectorAll('img, svg, canvas');
@@ -786,10 +800,36 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       }
 
       // ── 2b. PRAYER CORNER ROUTE MONITORING ──
-      // DISABLED: Roland requires "no recovery screens" — pages must load on their own.
-      // Previous implementation injected error overlays that covered actual content.
+      // No recovery overlays on prayer routes; only a silent one-time reload if route is truly blank.
       function monitorPrayerRoutes() {
-        // No-op: let Base44 handle its own page rendering
+        if (!isPrayerFlowRoute()) {
+          prayerBlankHits = 0;
+          return;
+        }
+
+        var root = document.getElementById('root');
+        if (!root || root.children.length === 0) return;
+        if (hasLoadingIndicators(root)) return;
+
+        var text = (root.innerText || '').trim().toLowerCase();
+        var visualElements = root.querySelectorAll('img, svg, canvas, button, a').length;
+        var looksBlank = text.length < 12 && visualElements < 2;
+        var hasFailureText = text.indexOf('failed to load') !== -1;
+
+        if (!looksBlank && !hasFailureText) {
+          prayerBlankHits = 0;
+          return;
+        }
+
+        prayerBlankHits++;
+        if (prayerBlankHits < 5) return; // 15s grace period
+
+        // One silent self-heal reload per route key to avoid loops.
+        var routeKey = (window.location.pathname || '') + '|' + (window.location.hash || '');
+        var reloadKey = 'aa-prayer-reload:' + routeKey;
+        if (sessionStorage.getItem(reloadKey) === '1') return;
+        sessionStorage.setItem(reloadKey, '1');
+        window.location.reload();
       }
 
       // ── 3. GLOBAL ERROR HANDLERS ──
@@ -857,66 +897,55 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         var msg = (event.reason && event.reason.message) || String(event.reason || '');
         if (msg.indexOf('must be used within') !== -1) {
           event.preventDefault();
-          setTimeout(detectAndFixErrorScreen, 500);
+          setTimeout(handleSelectTriggerCrash, 300);
         }
       });
 
       // ── 4. DUPLICATE BACK BUTTON FIX ──
 
+      function isVisibleBackElement(el) {
+        if (!el) return false;
+        if (el.id === 'aa-fixed-back') return false;
+        if (el.classList && el.classList.contains('aa-injected-back')) return false;
+        if (el.closest('.aa-error-fallback')) return false;
+        if (el.closest('nav.fixed.bottom-0')) return false;
+        if (el.style.display === 'none') return false;
+        if (el.offsetParent === null) return false;
+        var text = (el.textContent || '').trim();
+        var aria = (el.getAttribute('aria-label') || '').trim();
+        return /^(\\u2190\\s*)?Back$/i.test(text) || /^\\u2039\\s*Back$/i.test(text) || /^back$/i.test(aria);
+      }
+
+      function getVisibleNativeBackButtons() {
+        var root = document.getElementById('root');
+        if (!root) return [];
+        var buttons = [];
+        root.querySelectorAll('button, a').forEach(function(el) {
+          if (isVisibleBackElement(el)) buttons.push(el);
+        });
+        return buttons;
+      }
+
       function fixDuplicateBackButtons() {
-        var containers = document.querySelectorAll(
-          'header, .pt-8, .sticky.top-0, [class*="sticky"][class*="top"]'
-        );
-        containers.forEach(function(container) {
-          var backEls = [];
-          var els = container.querySelectorAll('button, a');
-          els.forEach(function(el) {
-            if (el.closest('.aa-error-fallback')) return;
-            if (el.closest('nav.fixed.bottom-0')) return;
-            var text = (el.textContent || '').trim();
-            if (/^(\\u2190\\s*)?Back$/i.test(text) || /^\\u2039\\s*Back$/i.test(text)) {
-              backEls.push(el);
-            }
-          });
-          var firstVisible = null;
-          backEls.forEach(function(el) {
-            if (el.style.display === 'none' || el.offsetParent === null) return;
-            if (!firstVisible) {
-              firstVisible = el;
-              if (!el.classList.contains('aa-back-topleft')) {
-                el.classList.add('aa-back-topleft');
-              }
-            } else {
-              el.style.display = 'none';
-              el.setAttribute('data-aa-hidden', 'duplicate');
-            }
-          });
+        var allBackBtns = getVisibleNativeBackButtons();
+        if (allBackBtns.length === 0) return;
+
+        // Keep a single native back button (closest to top-left) and hide the rest.
+        allBackBtns.sort(function(a, b) {
+          var ra = a.getBoundingClientRect();
+          var rb = b.getBoundingClientRect();
+          if (Math.abs(ra.top - rb.top) > 2) return ra.top - rb.top;
+          return ra.left - rb.left;
         });
 
-        var root = document.getElementById('root');
-        if (!root) return;
-        var allBackBtns = [];
-        root.querySelectorAll('button, a').forEach(function(el) {
-          if (el.closest('.aa-error-fallback')) return;
-          if (el.closest('nav.fixed.bottom-0')) return;
-          var text = (el.textContent || '').trim();
-          if (/^(\\u2190\\s*)?Back$/i.test(text)) {
-            allBackBtns.push(el);
-            if (!el.classList.contains('aa-back-topleft') && el.style.display !== 'none') {
-              el.classList.add('aa-back-topleft');
-            }
-          }
-        });
+        var primary = allBackBtns[0];
+        primary.classList.add('aa-back-topleft');
+        primary.removeAttribute('data-aa-hidden');
+        primary.style.display = '';
+
         for (var i = 1; i < allBackBtns.length; i++) {
-          if (allBackBtns[i].style.display === 'none') continue;
-          var prev = allBackBtns[i - 1];
-          if (prev.style.display === 'none') continue;
-          var r1 = prev.getBoundingClientRect();
-          var r2 = allBackBtns[i].getBoundingClientRect();
-          if (Math.abs(r1.top - r2.top) < 200) {
-            allBackBtns[i].style.display = 'none';
-            allBackBtns[i].setAttribute('data-aa-hidden', 'proximity-duplicate');
-          }
+          allBackBtns[i].style.display = 'none';
+          allBackBtns[i].setAttribute('data-aa-hidden', 'duplicate');
         }
       }
 
@@ -935,24 +964,25 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       }
 
       function fixMissingBackButtons() {
-        if (!needsBackButton()) return;
-
-        // Already injected a fixed back button?
-        if (document.getElementById('aa-fixed-back')) return;
+        if (!needsBackButton()) {
+          var staleBack = document.getElementById('aa-fixed-back');
+          if (staleBack) staleBack.remove();
+          return;
+        }
 
         var root = document.getElementById('root');
         if (!root) return;
-        var hasVisibleBack = false;
-        root.querySelectorAll('button, a').forEach(function(el) {
-          if (el.closest('nav.fixed.bottom-0')) return;
-          if (el.closest('.aa-error-fallback')) return;
-          if (el.style.display === 'none') return;
-          var text = (el.textContent || '').trim();
-          if (/^(\\u2190\\s*)?Back$/i.test(text)) {
-            hasVisibleBack = true;
-          }
-        });
-        if (hasVisibleBack) return;
+
+        var nativeBackButtons = getVisibleNativeBackButtons();
+        var fixedBack = document.getElementById('aa-fixed-back');
+
+        // Prefer native button when available to avoid duplicate stacked buttons.
+        if (nativeBackButtons.length > 0) {
+          if (fixedBack) fixedBack.remove();
+          return;
+        }
+
+        if (fixedBack) return;
 
         // Insert as fixed-position button on body (not inside header)
         // so it's always visible below the safe area
@@ -981,10 +1011,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       // ── 6. CLEANUP STALE PATCHES ──
 
       function cleanupStalePatches() {
-        if (!needsBackButton()) {
-          // Remove fixed back button when not needed
-          var fixedBack = document.getElementById('aa-fixed-back');
-          if (fixedBack) fixedBack.remove();
+        // Remove fixed button when route doesn't need it OR native button exists.
+        var fixedBack = document.getElementById('aa-fixed-back');
+        if (fixedBack && (!needsBackButton() || getVisibleNativeBackButtons().length > 0)) {
+          fixedBack.remove();
         }
         var injected = document.querySelectorAll('.aa-injected-back');
         injected.forEach(function(el) {
