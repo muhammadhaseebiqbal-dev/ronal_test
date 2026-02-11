@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-11 — Raouf: Build 6 — Email/Password Only (Google Hidden)
+
+**Scope:** Roland confirmed no more Base44 subscription. Ship iOS with Email/Password only.
+
+**What changed:**
+1. **Google sign-in completely hidden** — buttons set to `display: none` via injected JS. Adjacent "or" dividers also hidden. Zero chance of loops or account picker.
+2. **Removed all ASWebAuthenticationSession code** (~200 lines of Swift):
+   - `import AuthenticationServices` removed
+   - `ASWebAuthenticationPresentationContextProviding` conformance removed
+   - `startGoogleOAuth()`, `handleGoogleAuthCallback()`, `injectTokenIntoWebView()`, `fallbackCookieSync()`, `checkPostOAuthState()`, `notifyJSGoogleResult()` — all deleted
+   - `aaGoogleAuth` WKScriptMessageHandler registration removed
+   - `authSession`, `googleAuthAttempts`, `lastGoogleAuthTime` properties removed
+3. **JS simplified** — `interceptGoogleAuth()` now just finds Google buttons and hides them. No click handlers, no native bridge, no counters.
+4. **CSS cleanup** — `.aa-google-notice` styles removed (no notice needed when button is invisible)
+5. **SPA hooks** — `resetGoogleNotice()` calls removed from popstate/pushState handlers
+6. **Diagnostics** — Google OAuth section replaced with "Email/Password only (Google hidden on iOS)"
+
+**What's preserved (unchanged):**
+- Email/Password persistence (same-origin localStorage + Capacitor Preferences)
+- Back button: fixed position below safe area, pill style
+- Prayer route handling: no error overlay injection
+- Diagnostics overlay: 5-tap trigger, copy to clipboard
+- All cookie bridging + process termination recovery
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — Major simplification: removed Google OAuth, simplified intercept to hide-only
+
+**Verification:** xcodebuild Release — BUILD SUCCEEDED
+
+---
+
 ### 2026-02-11 — Raouf: Build 6 — Fix Prayer Corner Routes + Back Button Position
 
 **Scope:** Fix 4 failing acceptance tests: Prayer Corner back button, New Request, Builder loads, Prayer List blank screen.

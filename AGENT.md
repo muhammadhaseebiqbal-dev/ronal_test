@@ -107,9 +107,9 @@ npm run test           # Unit tests
 | armv7 architecture | ✅ FIXED — arm64 only |
 | No offline handling | ✅ FIXED — OfflineScreen component |
 | Debug config in Release | ✅ FIXED — Separate release.xcconfig |
-| Google sign-in loop | ✅ FIXED — Build 6: ASWebAuthenticationSession + token handoff into WKWebView. Fallback to Email/Password after 3 failed attempts |
-| Prayer Corner routes fail | ✅ FIXED — Prayer route monitoring (3-check threshold) + loading indicator awareness |
-| Prayer List blank screen | ✅ FIXED — Consecutive blank checks required (9s wait), skip if loading indicators present |
+| Google sign-in loop | ✅ FIXED — Build 6: Google buttons completely hidden on iOS. Email/Password only per Roland's decision |
+| Prayer Corner routes fail | ✅ FIXED — Removed error overlay injection. Let Base44 handle its own rendering |
+| Prayer List blank screen | ✅ FIXED — Ultra-conservative: 5 consecutive blank checks (15s), never on prayer routes |
 | Login lost on background/kill | ✅ FIXED — Cookie bridging + process termination recovery |
 | Back button in top middle | ✅ FIXED — CSS+JS moves all back buttons to top-left |
 | Back button under clock/notch | ✅ FIXED — Fixed position with env(safe-area-inset-top) + pill style on body |
@@ -140,18 +140,18 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 
 ## Last Change Log
 
-**2026-02-11 — Raouf: Build 6 — ASWebAuthenticationSession Google OAuth (Proper Fix)**
-- Google OAuth now uses `ASWebAuthenticationSession` (Apple's recommended native OAuth tool)
-- Flow: intercept Google click → launch native auth session → extract token from callback → inject into WKWebView localStorage → navigate home
-- Cookie sync fallback: if no token in callback, syncs cookies from HTTPCookieStorage → WKWebView and reloads
-- Loop prevention: 3s debounce, max 3 attempts before fallback notice, `aaGoogleAuthPending` flag prevents concurrent sessions
-- Graceful degradation: after 3+ failed attempts, shows Email/Password fallback notice (same warm beige styling)
-- No SFSafariViewController (separate storage), no infinite loops
-- Registered `aaGoogleAuth` WKScriptMessageHandler for JS→native communication
-- Added `ASWebAuthenticationPresentationContextProviding` conformance
-- Diagnostics updated: shows Google auth method + pending state
+**2026-02-11 — Raouf: Build 6 — Email/Password Only (Google Hidden)**
+- Roland confirmed: no more Base44 subscription, ship with Email/Password only for iOS
+- Google sign-in buttons completely hidden via `display: none` (no loops, no account picker, no native auth)
+- Removed all ASWebAuthenticationSession code (~200 lines of Swift)
+- Removed `import AuthenticationServices`, `ASWebAuthenticationPresentationContextProviding`, `aaGoogleAuth` handler
+- Also hides "or" dividers adjacent to Google buttons
+- Email/Password persistence unchanged (same-origin localStorage + Capacitor Preferences backup)
+- Back button: fixed position below safe area with `env(safe-area-inset-top) + 16px`
+- Prayer routes: no error overlay injection (removed `monitorPrayerRoutes`, blank detection skips prayer routes)
+- Diagnostics: shows "Email/Password only (Google hidden on iOS)"
 - Build number: 6 (unchanged)
-- Verification: xcodebuild Release ✅ BUILD SUCCEEDED, 0 warnings
+- Verification: xcodebuild Release ✅ BUILD SUCCEEDED
 
 **2026-02-11 — Raouf: Build 6 — Fix Diagnostics "unknown" Values**
 - Fixed: Device model, iOS version, app version/build, DataStore showed "unknown" due to race condition
@@ -225,7 +225,20 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 
 **Raouf:**
 - **Date:** 2026-02-11 (Australia/Sydney)
-- **Scope:** Build 6 — ASWebAuthenticationSession Google OAuth (Proper Fix)
+- **Scope:** Build 6 — Email/Password Only (Google Hidden per Roland)
+- **Summary:** Roland confirmed he's not paying Base44 anymore, so Google sign-in is completely removed from iOS. Deleted ~200 lines of ASWebAuthenticationSession Swift code (startGoogleOAuth, handleGoogleAuthCallback, injectTokenIntoWebView, fallbackCookieSync, checkPostOAuthState, notifyJSGoogleResult). Removed `import AuthenticationServices`, `ASWebAuthenticationPresentationContextProviding` conformance, `aaGoogleAuth` message handler. JS intercept now simply hides Google buttons via `display: none` + hides adjacent "or" dividers. No loops possible — button is invisible. Email/Password unchanged. Diagnostics updated.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Removed all Google OAuth Swift code. Simplified JS Google intercept to hide-only. Removed `.aa-google-notice` CSS. Removed `resetGoogleNotice()` from SPA hooks. Updated diagnostics to show "Email/Password only".
+  - `AGENT.md` — Updated Known Issues, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:**
+  - Roland tests on iPhone: Google button should be invisible, Email/Password works
+  - Sign in with Apple: future phase, requires Apple Developer setup from Roland
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 6 — ASWebAuthenticationSession Google OAuth (Proper Fix) [SUPERSEDED]
 - **Summary:** Replaced the "block Google" approach with proper native OAuth. Google sign-in now launches `ASWebAuthenticationSession` (Apple's recommended iOS auth tool). On callback: extracts token from URL params → injects into WKWebView localStorage → navigates home. If no token in callback, falls back to cookie sync from HTTPCookieStorage → WKWebView. Includes 3s debounce, max 3 attempts before Email/Password fallback notice, and `aaGoogleAuthPending` flag to prevent concurrent sessions. Uses `abideandanchor` custom URL scheme (already registered in Info.plist) as callbackURLScheme. `prefersEphemeralWebBrowserSession = false` ensures cookies are shared with Safari cookie jar for maximum compatibility.
 - **Files Changed:**
   - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added `AuthenticationServices` import, `ASWebAuthenticationPresentationContextProviding` conformance, `aaGoogleAuth` message handler, `startGoogleOAuth()`, `handleGoogleAuthCallback()`, `injectTokenIntoWebView()`, `fallbackCookieSync()`, `checkPostOAuthState()`, `notifyJSGoogleResult()`. Rewrote Google intercept JS from "block" to "launch native OAuth". Updated diagnostics.
