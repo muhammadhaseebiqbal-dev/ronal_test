@@ -121,9 +121,10 @@ window.diagnoseTokenStorage()    // Check token persistence
 
 ## In-App Diagnostics (No Xcode Required — Build 6+)
 - **Trigger:** Tap any header/title element **5 times quickly** OR navigate to `/#/aa-diagnostics`
-- **Shows:** Device model, iOS version, app version+build, origin, data store type, auth key presence (boolean), Google attempt count, last 5 navigation URLs
+- **Shows:** Device model (hardware ID), iOS version, app version+build, origin, data store type (persistent/nonPersistent), auth key presence + value lengths (no values), localStorage total key count, Google attempt count, last 5 navigation URLs
 - **"Copy Diagnostics" button** copies plaintext to clipboard — paste in chat/email to Roland
 - No secrets or token values are ever included
+- Native data injected via `WKUserScript` at `.atDocumentStart` (guarantees availability on every page load)
 
 ## Native Diagnostics (Xcode Console)
 Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
@@ -137,6 +138,15 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Cookie names (never values) for `abideandanchor.app` domain
 
 ## Last Change Log
+
+**2026-02-11 — Raouf: Build 6 — Fix Diagnostics "unknown" Values**
+- Fixed: Device model, iOS version, app version/build, DataStore showed "unknown" due to race condition
+- Root cause: `evaluateJavaScript` ran asynchronously after page load, so `window.__aaNativeDiag` wasn't set when diagnostics JS read it
+- Fix: Inject native data as `WKUserScript` at `.atDocumentStart` — runs before all other JS on every page load
+- Added: Token value lengths (e.g. `base44_access_token: true (len=312)`) — no values exposed
+- Added: `localStorage total keys: N` count for store health verification
+- Extracted `buildNativeDiagJS()` helper — eliminates duplication between WKUserScript and evaluateJavaScript paths
+- Verification: xcodebuild Release ✅ BUILD SUCCEEDED, 0 warnings
 
 **2026-02-11 — Raouf: Build 6 (Revised) — Google Loop Fix (No Safari) + Diagnostics Overlay**
 - Removed SFSafariViewController Google OAuth (tokens don't persist back to WKWebView)

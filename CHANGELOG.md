@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-11 — Raouf: Build 6 — Fix Diagnostics "unknown" Values + Add Token Length/Key Count
+
+**Scope:** Fix diagnostics overlay showing "unknown" for device/iOS/build/DataStore; add localStorage key count and token lengths.
+**Root Cause:** `injectNativeDiagnostics()` used `evaluateJavaScript` which runs asynchronously after page load — by the time it executes, the page's JS context is already initialized but the diagnostics overlay reads `window.__aaNativeDiag` before the async call completes.
+**Fix:** Inject `window.__aaNativeDiag` as a `WKUserScript` at `.atDocumentStart` (runs before any other JS). This guarantees the native data object is set before the diagnostics collector runs. The `evaluateJavaScript` call is retained as a backup for foreground resume.
+**Enhancements:**
+- Diagnostics now show token value **lengths** (not values) for each auth key: e.g. `base44_access_token: true (len=312)`
+- Added `localStorage total keys: N` count
+- Added `CapacitorStorage.aa_token` length
+- Extracted `buildNativeDiagJS()` helper to eliminate code duplication between WKUserScript and evaluateJavaScript paths
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — new `buildNativeDiagJS()`, WKUserScript injection at `.atDocumentStart`, enhanced `collectDiagnostics()` JS
+- `AGENT.md` — updated diagnostics section
+- `CHANGELOG.md` — this entry
+
+**Verification:** xcodebuild Release — BUILD SUCCEEDED, 0 warnings
+
+---
+
 ### 2026-02-11 — Raouf: Build 6 (Revised) — Google Loop Fix (No Safari) + Diagnostics Overlay
 
 **Scope:** Fix Google sign-in infinite loop by blocking it entirely (no SFSafariViewController), add in-app diagnostics overlay, update Sign in with Apple docs

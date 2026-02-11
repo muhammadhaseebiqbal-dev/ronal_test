@@ -50,49 +50,15 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
     // MARK: – G) Native diagnostics injection
 
-    /// Injects device/build info into JS so the diagnostics overlay can show it
-    /// without requiring Xcode. Runs once at cold boot.
+    /// Re-injects device/build info into JS after foreground resume.
+    /// The WKUserScript at .atDocumentStart handles cold boot; this handles resume.
     private func injectNativeDiagnostics() {
         guard let webView = self.webView else { return }
 
-        let device = UIDevice.current
-        let model = device.model                           // "iPhone"
-        let systemVersion = device.systemVersion           // "17.4.1"
-        let deviceName = device.name                       // User's device name
-
-        // Read hardware model (e.g. "iPhone13,2" for iPhone 12)
-        var systemInfo = utsname()
-        uname(&systemInfo)
-        let machineStr = withUnsafePointer(to: &systemInfo.machine) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
-                String(cString: $0)
-            }
-        }
-
-        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
-
-        let dataStore = webView.configuration.websiteDataStore
-        let storeType = dataStore.isPersistent ? "persistent" : "nonPersistent"
-
-        let js = """
-        window.__aaNativeDiag = {
-          deviceModel: '\(machineStr)',
-          deviceType: '\(model)',
-          iOSVersion: '\(systemVersion)',
-          deviceName: '\(deviceName.replacingOccurrences(of: "'", with: "\\'"))',
-          appVersion: '\(appVersion)',
-          buildNumber: '\(buildNumber)',
-          dataStoreType: '\(storeType)'
-        };
-        """
-
+        let js = buildNativeDiagJS()
         webView.evaluateJavaScript(js) { _, error in
             if let error = error {
                 os_log(.error, log: Self.log, "[DIAG:nativeInject] failed: %{public}@", error.localizedDescription)
-            } else {
-                os_log(.info, log: Self.log, "[DIAG:nativeInject] device=%{public}@ iOS=%{public}@ build=%{public}@ store=%{public}@",
-                       machineStr, systemVersion, buildNumber, storeType)
             }
         }
     }
@@ -388,6 +354,15 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Register native message handler for diagnostics clipboard copy
         controller.add(self, name: "aaCopyDiagnostics")
 
+        // Inject native diagnostics data at DOCUMENT START so it's available
+        // before any other scripts run (fixes "unknown" race condition)
+        let nativeDiagScript = WKUserScript(
+            source: buildNativeDiagJS(),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        controller.addUserScript(nativeDiagScript)
+
         let cssScript = WKUserScript(
             source: Self.cssInjection,
             injectionTime: .atDocumentEnd,
@@ -401,6 +376,47 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             forMainFrameOnly: true
         )
         controller.addUserScript(jsScript)
+    }
+
+    /// Builds the JS string that sets window.__aaNativeDiag with device/build info.
+    /// Used both as a WKUserScript (document start) and via evaluateJavaScript (resume).
+    private func buildNativeDiagJS() -> String {
+        let device = UIDevice.current
+        let systemVersion = device.systemVersion
+        let model = device.model
+
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        let machineStr = withUnsafePointer(to: &systemInfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                String(cString: $0)
+            }
+        }
+
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+
+        let storeType: String
+        if let webView = self.webView {
+            storeType = webView.configuration.websiteDataStore.isPersistent ? "persistent" : "nonPersistent"
+        } else {
+            storeType = "unknown"
+        }
+
+        let deviceName = device.name.replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: "\\", with: "\\\\")
+
+        return """
+        window.__aaNativeDiag = {
+          deviceModel: '\(machineStr)',
+          deviceType: '\(model)',
+          iOSVersion: '\(systemVersion)',
+          deviceName: '\(deviceName)',
+          appVersion: '\(appVersion)',
+          buildNumber: '\(buildNumber)',
+          dataStoreType: '\(storeType)'
+        };
+        """
     }
 
     // MARK: – CSS Patch
@@ -981,14 +997,25 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         var native = window.__aaNativeDiag || {};
         var tokenKeys = ['base44_access_token', 'base44_refresh_token', 'base44_user', 'access_token', 'refresh_token'];
         var authPresence = {};
+        var tokenLengths = {};
         tokenKeys.forEach(function(k) {
-          try { authPresence[k] = localStorage.getItem(k) !== null; } catch(e) { authPresence[k] = 'error'; }
+          try {
+            var val = localStorage.getItem(k);
+            authPresence[k] = val !== null;
+            if (val !== null) tokenLengths[k] = val.length;
+          } catch(e) { authPresence[k] = 'error'; }
         });
 
         var capPrefPresent = 'unknown';
+        var capPrefLength = 0;
         try {
-          capPrefPresent = localStorage.getItem('CapacitorStorage.aa_token') !== null;
+          var capVal = localStorage.getItem('CapacitorStorage.aa_token');
+          capPrefPresent = capVal !== null;
+          if (capVal !== null) capPrefLength = capVal.length;
         } catch(e) {}
+
+        var lsKeyCount = 0;
+        try { lsKeyCount = localStorage.length; } catch(e) {}
 
         var googleAttempts = 0;
         try { googleAttempts = parseInt(sessionStorage.getItem('aa_google_attempts') || '0', 10); } catch(e) {}
@@ -1008,12 +1035,15 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           'Path: ' + window.location.pathname,
           'DataStore: ' + (native.dataStoreType || 'unknown'),
           '',
-          '-- Auth Markers (presence only) --'
+          '-- Auth Markers (presence + length, no values) --'
         ];
         Object.keys(authPresence).forEach(function(k) {
-          lines.push('  ' + k + ': ' + authPresence[k]);
+          var line = '  ' + k + ': ' + authPresence[k];
+          if (tokenLengths[k]) line += ' (len=' + tokenLengths[k] + ')';
+          lines.push(line);
         });
-        lines.push('  CapacitorStorage.aa_token: ' + capPrefPresent);
+        lines.push('  CapacitorStorage.aa_token: ' + capPrefPresent + (capPrefLength ? ' (len=' + capPrefLength + ')' : ''));
+        lines.push('  localStorage total keys: ' + lsKeyCount);
         lines.push('');
         lines.push('-- Google --');
         lines.push('  Attempts this session: ' + googleAttempts);
