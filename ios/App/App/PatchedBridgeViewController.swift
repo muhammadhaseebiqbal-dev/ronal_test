@@ -838,13 +838,94 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       var selectTriggerRetryCount = 0;
       var lastSelectTriggerRetryTime = 0;
 
+      function isSelectCrashRoute() {
+        var path = window.location.pathname.toLowerCase();
+        var hash = (window.location.hash || '').toLowerCase();
+        return path.indexOf('/request') !== -1 || path.indexOf('/builder') !== -1 ||
+               hash.indexOf('/request') !== -1 || hash.indexOf('/builder') !== -1;
+      }
+
+      function forceHardRouteReload(tag) {
+        try {
+          var url = new URL(window.location.href);
+          url.searchParams.set('aa_fix', tag);
+          url.searchParams.set('aa_t', String(Date.now()));
+          window.location.replace(url.toString());
+        } catch (e) {
+          window.location.reload();
+        }
+      }
+
+      function clearCachesThenReload() {
+        var completed = false;
+        function done() {
+          if (completed) return;
+          completed = true;
+          forceHardRouteReload('select-cache-reset');
+        }
+
+        // Prevent hanging forever if any async cache API stalls
+        setTimeout(done, 1500);
+
+        try {
+          if (window.caches && caches.keys) {
+            caches.keys().then(function(keys) {
+              return Promise.all(keys.map(function(key) {
+                return caches.delete(key);
+              }));
+            }).then(function() {
+              done();
+            }).catch(function() {
+              done();
+            });
+          } else {
+            done();
+          }
+
+          if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+            navigator.serviceWorker.getRegistrations().then(function(regs) {
+              regs.forEach(function(reg) {
+                reg.unregister().catch(function() {});
+              });
+            }).catch(function() {});
+          }
+        } catch (e) {
+          done();
+        }
+      }
+
       function handleSelectTriggerCrash() {
         // This React context error crashes the entire component tree.
-        // Strategy: find the crashed container and inject a clean reload.
+        // Strategy: request/builder routes get hard reload + cache reset attempts.
         var now = Date.now();
         if (now - lastSelectTriggerRetryTime < 3000) return; // debounce
         lastSelectTriggerRetryTime = now;
         selectTriggerRetryCount++;
+
+        if (isSelectCrashRoute()) {
+          var routeKey = (window.location.pathname || '') + '|' + (window.location.hash || '');
+          var stepKey = 'aa-select-recover-step:' + routeKey;
+          var step = parseInt(sessionStorage.getItem(stepKey) || '0', 10);
+
+          if (step <= 0) {
+            sessionStorage.setItem(stepKey, '1');
+            forceHardRouteReload('select-reload-1');
+            return;
+          }
+
+          if (step === 1) {
+            sessionStorage.setItem(stepKey, '2');
+            clearCachesThenReload();
+            return;
+          }
+
+          // Last fallback for this specific route: one more hard refresh.
+          if (step === 2) {
+            sessionStorage.setItem(stepKey, '3');
+            forceHardRouteReload('select-reload-2');
+            return;
+          }
+        }
 
         var root = document.getElementById('root');
         if (!root) return;

@@ -142,6 +142,15 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 
 ## Last Change Log
 
+**2026-02-11 — Raouf: Build 6 — SelectTrigger real recovery for Prayer Request/Builder**
+- Replaced overlay-first handling with route-specific hard recovery for `SelectTrigger must be used within Select` on prayer `request`/`builder` routes
+- Added deterministic multi-step recovery flow per route key:
+  1) hard route reload with cache-busting query params
+  2) clear Cache Storage + unregister Service Workers, then hard reload
+  3) final hard reload attempt
+- Uses `sessionStorage` route-scoped step keys to prevent infinite reload loops
+- Goal: resolve actual runtime initialization failure instead of masking with fallback UI on these routes
+
 **2026-02-11 — Raouf: Build 6 — Lint scope fix for generated iOS artifacts**
 - Fixed `npm run lint` failure caused by ESLint scanning generated Capacitor web assets under `ios/**/public/**`
 - Updated ESLint flat config ignore list to exclude generated build output and report artifacts (`ios/**/public/**`, `coverage/`, `test-results/`, `*.xcresult/**`)
@@ -236,6 +245,18 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 6 — Prayer Request/Builder `SelectTrigger` crash real fix path
+- **Summary:** Implemented non-cosmetic recovery flow for the `SelectTrigger must be used within Select` crash on Prayer Request/Builder routes. Instead of only rendering fallback UI, runtime now performs route-scoped hard recovery attempts: first hard reload with cache-busting params, then cache/service-worker purge + hard reload, then one final hard reload. Recovery state is persisted per route in `sessionStorage` to avoid loops.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: added `isSelectCrashRoute()`, `forceHardRouteReload()`, `clearCachesThenReload()`, and route-scoped recovery steps inside `handleSelectTriggerCrash()`
+  - `AGENT.md` — Updated Last Change Log + this Update Log entry
+  - `CHANGELOG.md` — New unreleased entry
+- **Verification:** pending (next: run tests + iOS build)
+- **Follow-ups:**
+  - Re-test Prayer Corner → New Request and Prayer Corner → Builder on iPhone
 
 **Raouf:**
 - **Date:** 2026-02-11 (Australia/Sydney)

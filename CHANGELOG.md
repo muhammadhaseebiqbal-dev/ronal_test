@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-11 — Raouf: Build 6 — SelectTrigger runtime recovery for Prayer Request/Builder
+
+**Scope:** Fix Prayer Corner Request/Builder route failures caused by `SelectTrigger must be used within Select`.
+
+**What changed:**
+1. **Route-specific real recovery (not overlay masking)**
+   - Added `isSelectCrashRoute()` detection for `request`/`builder` routes.
+   - `handleSelectTriggerCrash()` now prioritizes deterministic route recovery instead of immediately falling back to UI overlays.
+2. **Three-step hard recovery path per route**
+   - Step 1: hard reload with cache-busting query params.
+   - Step 2: purge Cache Storage + unregister Service Workers, then hard reload.
+   - Step 3: final hard reload attempt.
+3. **Loop prevention**
+   - Added route-scoped `sessionStorage` step key (`aa-select-recover-step:<pathname>|<hash>`) so retries do not become infinite.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — SelectTrigger recovery flow upgraded
+- `AGENT.md` — updated logs
+- `CHANGELOG.md` — this entry
+
+**Verification:** Pending iPhone route validation + build/test run.
+
 ### 2026-02-11 — Raouf: Build 6 — ESLint scope fix for generated artifacts
 
 **Scope:** Make `npm run lint` pass by excluding compiled output from lint scope.
