@@ -11,24 +11,90 @@ import os.log
 ///   4) Prevents unnecessary reloads on app resume
 ///   5) Provides diagnostics logging (cookie counts, store type, auth markers)
 ///   6) Injects client-side CSS+JS patches for remote Base44 app issues (Build 3)
+///   7) Blocks Google OAuth inline with graceful fallback to Email/Password (Build 6)
+///   8) In-app diagnostics overlay triggered by 5-tap on version label (Build 6)
 ///
 /// Architecture: The WKWebView loads https://abideandanchor.app (remote Base44 platform).
 /// We cannot modify the remote source code, so we inject JS+CSS via WKUserScript to
 /// patch DOM/CSS issues at runtime.
-class PatchedBridgeViewController: CAPBridgeViewController {
+///
+/// NOTE (Build 6): SFSafariViewController for Google OAuth was REMOVED because Safari has
+/// a separate localStorage/cookie store — tokens obtained there do NOT persist in WKWebView.
+/// Google sign-in is now gracefully blocked with a clear message to use Email/Password.
+class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandler {
 
     private static let log = OSLog(subsystem: "com.abideandanchor.app", category: "WebView")
     private let serverDomain = "abideandanchor.app"
     private var hasPerformedInitialLoad = false
     private var isRecoveringFromTermination = false
 
+    // MARK: – F) Script message handler (diagnostics copy)
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "aaCopyDiagnostics" {
+            guard let text = message.body as? String else { return }
+            UIPasteboard.general.string = text
+            os_log(.info, log: Self.log, "[DIAG:copy] Diagnostics copied to clipboard (%d chars)", text.count)
+        }
+    }
+
     // MARK: – Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
         injectPatches()
+        injectNativeDiagnostics()
         setupLifecycleObservers()
         logDiagnostics(event: "coldBoot")
+    }
+
+    // MARK: – G) Native diagnostics injection
+
+    /// Injects device/build info into JS so the diagnostics overlay can show it
+    /// without requiring Xcode. Runs once at cold boot.
+    private func injectNativeDiagnostics() {
+        guard let webView = self.webView else { return }
+
+        let device = UIDevice.current
+        let model = device.model                           // "iPhone"
+        let systemVersion = device.systemVersion           // "17.4.1"
+        let deviceName = device.name                       // User's device name
+
+        // Read hardware model (e.g. "iPhone13,2" for iPhone 12)
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        let machineStr = withUnsafePointer(to: &systemInfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                String(cString: $0)
+            }
+        }
+
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+
+        let dataStore = webView.configuration.websiteDataStore
+        let storeType = dataStore.isPersistent ? "persistent" : "nonPersistent"
+
+        let js = """
+        window.__aaNativeDiag = {
+          deviceModel: '\(machineStr)',
+          deviceType: '\(model)',
+          iOSVersion: '\(systemVersion)',
+          deviceName: '\(deviceName.replacingOccurrences(of: "'", with: "\\'"))',
+          appVersion: '\(appVersion)',
+          buildNumber: '\(buildNumber)',
+          dataStoreType: '\(storeType)'
+        };
+        """
+
+        webView.evaluateJavaScript(js) { _, error in
+            if let error = error {
+                os_log(.error, log: Self.log, "[DIAG:nativeInject] failed: %{public}@", error.localizedDescription)
+            } else {
+                os_log(.info, log: Self.log, "[DIAG:nativeInject] device=%{public}@ iOS=%{public}@ build=%{public}@ store=%{public}@",
+                       machineStr, systemVersion, buildNumber, storeType)
+            }
+        }
     }
 
     deinit {
@@ -44,9 +110,9 @@ class PatchedBridgeViewController: CAPBridgeViewController {
 
         // CRITICAL: Ensure data store is persistent (default), never ephemeral
         if config.websiteDataStore.isPersistent {
-            os_log(.info, log: Self.log, "✅ Data store: persistent (default)")
+            os_log(.info, log: Self.log, "[DIAG:webViewCreated] dataStore=persistent")
         } else {
-            os_log(.error, log: Self.log, "⚠️ Data store was non-persistent — forcing default()")
+            os_log(.error, log: Self.log, "[DIAG:webViewCreated] dataStore=nonPersistent — forcing default()")
             config.websiteDataStore = WKWebsiteDataStore.default()
         }
 
@@ -56,7 +122,7 @@ class PatchedBridgeViewController: CAPBridgeViewController {
     // MARK: – B) Cookie bridging
 
     /// Syncs ALL cookies from HTTPCookieStorage.shared into WKHTTPCookieStore.
-    /// This bridges cookies set by SFSafariViewController (OAuth) into the WebView.
+    /// This bridges cookies for the WebView on cold boot and after process termination.
     /// Must run BEFORE loading server.url on cold boot and after process termination.
     private func syncCookiesToWebView(completion: (() -> Void)? = nil) {
         guard let webView = self.webView else {
@@ -134,8 +200,9 @@ class PatchedBridgeViewController: CAPBridgeViewController {
     }
 
     @objc private func handleWillEnterForeground() {
-        os_log(.info, log: Self.log, "willEnterForeground")
+        os_log(.info, log: Self.log, "[DIAG:willEnterForeground]")
         logDiagnostics(event: "willEnterForeground")
+        injectNativeDiagnostics() // refresh native data in JS after resume
 
         guard let webView = self.webView else {
             os_log(.error, log: Self.log, "willEnterForeground: webView is nil — cannot recover")
@@ -244,9 +311,19 @@ class PatchedBridgeViewController: CAPBridgeViewController {
         let storeType = dataStore.isPersistent ? "persistent" : "nonPersistent"
         let currentURL = webView.url?.absoluteString ?? "none"
 
+        // Device + build info
+        let device = UIDevice.current
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        let machine = withUnsafePointer(to: &systemInfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+        }
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+
         os_log(.info, log: Self.log,
-               "[DIAG:%{public}@] webView=YES storeType=%{public}@ url=%{public}@",
-               event, storeType, currentURL)
+               "[DIAG:%{public}@] device=%{public}@ iOS=%{public}@ app=%{public}@(%{public}@) store=%{public}@ url=%{public}@",
+               event, machine, device.systemVersion, appVersion, buildNumber, storeType, currentURL)
 
         // Log cookie names for the domain (never values)
         let httpCookies = HTTPCookieStorage.shared.cookies?.filter {
@@ -267,23 +344,24 @@ class PatchedBridgeViewController: CAPBridgeViewController {
                    "[DIAG:%{public}@] WKCookieStore: count=%d names=[%{public}@]",
                    event, domainCookies.count, wkCookieNames)
 
-            // Check for auth markers (presence only, never log values)
+            // Auth markers (presence only, never log values)
             let hasAuthCookie = domainCookies.contains { name in
                 let n = name.name.lowercased()
                 return n.contains("token") || n.contains("session") || n.contains("auth") || n.contains("sid")
             }
             os_log(.info, log: Self.log,
-                   "[DIAG:%{public}@] authMarkerInCookies=%{public}@",
+                   "[DIAG:authMarkers] event=%{public}@ cookieAuth=%{public}@",
                    event, hasAuthCookie ? "YES" : "NO")
         }
 
-        // Also check localStorage for auth tokens via JS (presence only)
+        // Check localStorage for auth tokens via JS (presence only)
         webView.evaluateJavaScript("""
             (function() {
                 try {
-                    var keys = ['base44_access_token', 'token', 'base44_auth_token'];
+                    var keys = ['base44_access_token', 'base44_refresh_token', 'token', 'base44_auth_token', 'access_token', 'refresh_token'];
                     var found = keys.filter(function(k) { return !!localStorage.getItem(k); });
-                    return JSON.stringify({ authKeysPresent: found, count: found.length });
+                    var capToken = !!localStorage.getItem('CapacitorStorage.aa_token');
+                    return JSON.stringify({ authKeysPresent: found, count: found.length, capToken: capToken });
                 } catch(e) {
                     return JSON.stringify({ error: e.message });
                 }
@@ -291,12 +369,12 @@ class PatchedBridgeViewController: CAPBridgeViewController {
         """) { result, error in
             if let resultStr = result as? String {
                 os_log(.info, log: Self.log,
-                       "[DIAG:%{public}@] localStorage: %{public}@",
-                       event, resultStr)
+                       "[DIAG:authMarkers] localStorage: %{public}@",
+                       resultStr)
             } else if let error = error {
                 os_log(.info, log: Self.log,
-                       "[DIAG:%{public}@] localStorage check failed: %{public}@",
-                       event, error.localizedDescription)
+                       "[DIAG:authMarkers] localStorage check failed: %{public}@",
+                       error.localizedDescription)
             }
         }
     }
@@ -306,6 +384,9 @@ class PatchedBridgeViewController: CAPBridgeViewController {
     private func injectPatches() {
         guard let webView = self.webView else { return }
         let controller = webView.configuration.userContentController
+
+        // Register native message handler for diagnostics clipboard copy
+        controller.add(self, name: "aaCopyDiagnostics")
 
         let cssScript = WKUserScript(
             source: Self.cssInjection,
@@ -425,6 +506,51 @@ class PatchedBridgeViewController: CAPBridgeViewController {
         .pt-8 {
           position: relative !important;
         }
+
+        /* ── B9: Google sign-in notice (inline, non-blocking) ── */
+        .aa-google-notice {
+          background: #f8f4eb;
+          border: 1px solid #e0d5c0;
+          border-radius: 10px;
+          padding: 12px 16px;
+          margin: 8px 16px;
+          font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+          text-align: left;
+          font-size: 13px;
+          color: #5a4a2f;
+          line-height: 1.45;
+        }
+        .aa-google-notice strong {
+          color: #3d3017;
+        }
+
+        /* ── B10: Diagnostics overlay ── */
+        .aa-diag-overlay {
+          position: fixed;
+          top: 0; left: 0; right: 0; bottom: 0;
+          background: rgba(0,0,0,0.85);
+          z-index: 99999;
+          overflow-y: auto;
+          -webkit-overflow-scrolling: touch;
+          font-family: -apple-system, BlinkMacSystemFont, 'SF Mono', Menlo, monospace;
+          color: #e8e8e8;
+          padding: env(safe-area-inset-top, 20px) 16px env(safe-area-inset-bottom, 20px) 16px;
+        }
+        .aa-diag-overlay h2 {
+          font-size: 18px; font-weight: 700; margin: 0 0 12px 0; color: #c9a96e;
+        }
+        .aa-diag-overlay pre {
+          font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+          background: #1a1a2e; border-radius: 8px; padding: 12px; margin: 8px 0 16px 0;
+        }
+        .aa-diag-overlay .aa-diag-btn {
+          display: block; width: 100%; padding: 14px; margin: 6px 0;
+          border: none; border-radius: 10px; font-size: 16px; font-weight: 600;
+          cursor: pointer; -webkit-tap-highlight-color: transparent;
+          text-align: center;
+        }
+        .aa-diag-copy { background: #c9a96e; color: #0b1f2a; }
+        .aa-diag-close { background: #333; color: #e8e8e8; }
       `;
       document.head.appendChild(style);
     })();
@@ -438,17 +564,122 @@ class PatchedBridgeViewController: CAPBridgeViewController {
       if (window.__aaPatched) return;
       window.__aaPatched = true;
 
+      // ── 0. GOOGLE SIGN-IN: GRACEFUL BLOCK (Build 6) ──
+      // Google OAuth cannot work reliably inside WKWebView because:
+      // 1. Deep links from inside WebView don't trigger appUrlOpen
+      // 2. Google blocks embedded WebView sign-in on many flows
+      // 3. SFSafariViewController has separate storage — tokens don't persist back
+      // Solution: Block Google sign-in immediately with clear inline message.
+
+      var aaGoogleNoticeShown = false;
+
+      function interceptGoogleAuth() {
+        var root = document.getElementById('root');
+        if (!root) return;
+
+        var path = window.location.pathname.toLowerCase();
+        // Only intercept on login/auth pages
+        if (path.indexOf('/login') === -1 && path.indexOf('/auth') === -1 &&
+            path !== '/' && path.indexOf('/signup') === -1) return;
+
+        var elements = root.querySelectorAll('button, a, [role="button"]');
+        elements.forEach(function(el) {
+          if (el.getAttribute('data-aa-google-blocked')) return;
+          var text = (el.textContent || '').trim().toLowerCase();
+          var ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+          var className = (el.className || '').toLowerCase();
+          var imgAlt = '';
+          var img = el.querySelector('img');
+          if (img) imgAlt = (img.getAttribute('alt') || '').toLowerCase();
+
+          var isGoogle = text.indexOf('google') !== -1 ||
+                         ariaLabel.indexOf('google') !== -1 ||
+                         className.indexOf('google') !== -1 ||
+                         imgAlt.indexOf('google') !== -1;
+          if (!isGoogle) {
+            var svgs = el.querySelectorAll('svg');
+            svgs.forEach(function(svg) {
+              if ((svg.getAttribute('aria-label') || '').toLowerCase().indexOf('google') !== -1) {
+                isGoogle = true;
+              }
+            });
+          }
+
+          if (!isGoogle) return;
+
+          el.setAttribute('data-aa-google-blocked', 'true');
+          el.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+
+            // Track attempts in sessionStorage (survives SPA nav, clears on tab close)
+            var count = parseInt(sessionStorage.getItem('aa_google_attempts') || '0', 10) + 1;
+            sessionStorage.setItem('aa_google_attempts', String(count));
+
+            console.log('[DIAG:googleIntercept] attempt=' + count);
+            showGoogleNotice();
+          }, true);
+        });
+      }
+
+      function showGoogleNotice() {
+        if (aaGoogleNoticeShown) return;
+        aaGoogleNoticeShown = true;
+
+        var root = document.getElementById('root');
+        if (!root) return;
+
+        // Remove any stale notices
+        var existing = document.querySelector('.aa-google-notice');
+        if (existing) existing.remove();
+
+        var notice = document.createElement('div');
+        notice.className = 'aa-google-notice';
+        notice.innerHTML =
+          '<strong>Google sign-in</strong> is temporarily unavailable in the iOS app. ' +
+          'Please use <strong>Email & Password</strong> below \\u2014 it\\u2019s fast and reliable.' +
+          '<br><small style="opacity:0.65;margin-top:4px;display:block;">' +
+          'We\\u2019re working on a robust Google flow for a future update.</small>';
+
+        // Insert above the Google button if possible
+        var googleBtn = root.querySelector('[data-aa-google-blocked]');
+        if (googleBtn && googleBtn.parentElement) {
+          googleBtn.parentElement.insertBefore(notice, googleBtn);
+        } else {
+          var form = root.querySelector('form') || root.querySelector('[class*="login"]') ||
+                     root.querySelector('[class*="auth"]');
+          if (form && form.parentElement) {
+            form.parentElement.insertBefore(notice, form);
+          } else {
+            root.insertBefore(notice, root.firstChild);
+          }
+        }
+
+        // Dim the Google button so it's clear it's disabled
+        root.querySelectorAll('[data-aa-google-blocked]').forEach(function(el) {
+          el.style.opacity = '0.35';
+          el.style.pointerEvents = 'none';
+        });
+      }
+
+      function resetGoogleNotice() {
+        aaGoogleNoticeShown = false;
+        var notice = document.querySelector('.aa-google-notice');
+        if (notice) notice.remove();
+        document.querySelectorAll('[data-aa-google-blocked]').forEach(function(el) {
+          el.style.opacity = '';
+          el.style.pointerEvents = '';
+          el.removeAttribute('data-aa-google-blocked');
+        });
+      }
+
       // ── 1. ERROR SCREEN DETECTION ──
-      // The remote Base44 app has a React ErrorBoundary that renders:
-      //   "Abide and Anchor failed to load"
-      //   "Please refresh the page. If this persists, contact support."
-      // We detect this screen and replace it with better recovery options.
 
       function detectAndFixErrorScreen() {
         var root = document.getElementById('root');
         if (!root) return;
         var text = root.innerText || '';
-        // Detect the known error screen
         if (text.indexOf('failed to load') !== -1 ||
             text.indexOf('Failed to load') !== -1) {
           enhanceErrorScreen(root);
@@ -456,7 +687,6 @@ class PatchedBridgeViewController: CAPBridgeViewController {
       }
 
       function enhanceErrorScreen(root) {
-        // Find and replace the error screen's reload button
         var buttons = root.querySelectorAll('button');
         var reloadBtn = null;
         buttons.forEach(function(btn) {
@@ -465,7 +695,6 @@ class PatchedBridgeViewController: CAPBridgeViewController {
             reloadBtn = btn;
           }
         });
-        // Add recovery buttons if not already present
         if (root.querySelector('.aa-error-fallback')) return;
         var container = reloadBtn ? reloadBtn.parentElement : root;
         var fallback = document.createElement('div');
@@ -477,21 +706,18 @@ class PatchedBridgeViewController: CAPBridgeViewController {
         container.appendChild(fallback);
       }
 
-      // ── 2. BLANK SCREEN DETECTION ──
-      // Prayer List and other pages can render to a blank white screen.
-      // Periodically check if #root is empty and show recovery.
+      // ── 2. BLANK SCREEN DETECTION (improved for Prayer List) ──
 
       function detectBlankScreen() {
         var root = document.getElementById('root');
         if (!root) return;
-        // Don't check while the app is still loading
         if (root.children.length === 0) return;
-        // Check for truly blank content (no visible text, no images)
         var text = (root.innerText || '').trim();
         var imgs = root.querySelectorAll('img, svg, canvas');
         var nav = root.querySelector('nav');
         // If there's a nav bar but no page content, the page failed to render
-        if (nav && text.length < 20 && imgs.length < 2) {
+        // Lowered threshold: text < 30 chars catches more blank states
+        if (nav && text.length < 30 && imgs.length < 3) {
           if (root.querySelector('.aa-error-fallback')) return;
           var main = root.querySelector('main') || nav.previousElementSibling || root;
           var fallback = document.createElement('div');
@@ -505,8 +731,42 @@ class PatchedBridgeViewController: CAPBridgeViewController {
         }
       }
 
+      // ── 2b. PRAYER CORNER ROUTE MONITORING ──
+      // Specifically monitor Prayer Corner sub-routes for failed loads.
+      // These pages sometimes silently fail without triggering a JS error.
+
+      function monitorPrayerRoutes() {
+        var path = window.location.pathname.toLowerCase();
+        var isPrayerRoute = path.indexOf('/prayer') !== -1 ||
+                            path.indexOf('/request') !== -1 ||
+                            path.indexOf('/builder') !== -1 ||
+                            path.indexOf('/wall') !== -1;
+        if (!isPrayerRoute) return;
+
+        var root = document.getElementById('root');
+        if (!root) return;
+        if (root.querySelector('.aa-error-fallback')) return;
+
+        // Check for meaningful content beyond just nav
+        var main = root.querySelector('main, [class*="container"], [class*="content"]');
+        if (!main) main = root;
+        var mainText = (main.innerText || '').trim();
+        var nav = root.querySelector('nav.fixed.bottom-0');
+        // If we're on a prayer route and there's almost no content (just nav labels),
+        // the page likely failed to load
+        if (nav && mainText.length < 40) {
+          var fallback = document.createElement('div');
+          fallback.className = 'aa-error-fallback';
+          fallback.innerHTML =
+            '<h2>Content didn\\u2019t load</h2>' +
+            '<p>This page may need a moment. Tap Retry or go back.</p>' +
+            '<button class="aa-btn aa-btn-primary" onclick="window.location.reload()">Retry</button>' +
+            '<button class="aa-btn aa-btn-secondary" onclick="window.history.back()">Go Back</button>';
+          main.appendChild(fallback);
+        }
+      }
+
       // ── 3. GLOBAL ERROR HANDLERS ──
-      // Catch non-React uncaught errors and unhandled rejections.
 
       window.addEventListener('error', function(event) {
         var msg = (event.error && event.error.message) || event.message || '';
@@ -527,12 +787,8 @@ class PatchedBridgeViewController: CAPBridgeViewController {
       });
 
       // ── 4. DUPLICATE BACK BUTTON FIX ──
-      // Issue B5: Prayer Corner / About Abide show "Back" twice.
-      // The Layout component renders a back button AND the page component
-      // renders its own. We hide duplicates.
 
       function fixDuplicateBackButtons() {
-        // Scan all containers that could hold back buttons
         var containers = document.querySelectorAll(
           'header, .pt-8, .sticky.top-0, [class*="sticky"][class*="top"]'
         );
@@ -547,13 +803,11 @@ class PatchedBridgeViewController: CAPBridgeViewController {
               backEls.push(el);
             }
           });
-          // Keep first visible, hide rest
           var firstVisible = null;
           backEls.forEach(function(el) {
             if (el.style.display === 'none' || el.offsetParent === null) return;
             if (!firstVisible) {
               firstVisible = el;
-              // Move surviving back button to top-left
               if (!el.classList.contains('aa-back-topleft')) {
                 el.classList.add('aa-back-topleft');
               }
@@ -564,7 +818,6 @@ class PatchedBridgeViewController: CAPBridgeViewController {
           });
         });
 
-        // Also scan globally for adjacent back buttons
         var root = document.getElementById('root');
         if (!root) return;
         var allBackBtns = [];
@@ -574,13 +827,11 @@ class PatchedBridgeViewController: CAPBridgeViewController {
           var text = (el.textContent || '').trim();
           if (/^(\\u2190\\s*)?Back$/i.test(text)) {
             allBackBtns.push(el);
-            // Move ALL back buttons to top-left
             if (!el.classList.contains('aa-back-topleft') && el.style.display !== 'none') {
               el.classList.add('aa-back-topleft');
             }
           }
         });
-        // Group by proximity — if two back buttons are within 200px vertically, hide the second
         for (var i = 1; i < allBackBtns.length; i++) {
           if (allBackBtns[i].style.display === 'none') continue;
           var prev = allBackBtns[i - 1];
@@ -595,19 +846,19 @@ class PatchedBridgeViewController: CAPBridgeViewController {
       }
 
       // ── 5. MISSING BACK BUTTON FIX ──
-      // Issue B6: Captain's Log (Journal) and More have no back button.
-      // Inject one into the page header when missing.
 
       function fixMissingBackButtons() {
         var path = window.location.pathname.toLowerCase();
-        // Only target specific routes that need back buttons
         var needsBack = path === '/journal' ||
                         path === '/more' ||
                         path.indexOf('/journal/') === 0 ||
-                        path.indexOf('/more/') === 0;
+                        path.indexOf('/more/') === 0 ||
+                        path.indexOf('/prayer') === 0 ||
+                        path.indexOf('/request') === 0 ||
+                        path.indexOf('/builder') === 0 ||
+                        path.indexOf('/wall') === 0;
         if (!needsBack) return;
 
-        // Check if a back button already exists (visible)
         var root = document.getElementById('root');
         if (!root) return;
         var hasVisibleBack = false;
@@ -622,7 +873,6 @@ class PatchedBridgeViewController: CAPBridgeViewController {
         });
         if (hasVisibleBack) return;
 
-        // Find the page header to attach to
         var header = root.querySelector('header') ||
                      root.querySelector('.pt-8') ||
                      root.querySelector('[class*="sticky"][class*="top"]');
@@ -646,7 +896,6 @@ class PatchedBridgeViewController: CAPBridgeViewController {
           window.history.back();
         });
 
-        // Insert at the beginning of the header's first child container
         var target = header.querySelector('.max-w-2xl') ||
                      header.querySelector('.max-w-lg') ||
                      header.querySelector('div') ||
@@ -655,24 +904,23 @@ class PatchedBridgeViewController: CAPBridgeViewController {
       }
 
       // ── 6. CLEANUP STALE PATCHES ──
-      // Remove injected elements when navigating away
 
       function cleanupStalePatches() {
         var injected = document.querySelectorAll('.aa-injected-back');
         injected.forEach(function(el) {
           var path = window.location.pathname.toLowerCase();
           var shouldHave = path === '/journal' || path === '/more' ||
-                           path.indexOf('/journal/') === 0 || path.indexOf('/more/') === 0;
+                           path.indexOf('/journal/') === 0 || path.indexOf('/more/') === 0 ||
+                           path.indexOf('/prayer') === 0 || path.indexOf('/request') === 0 ||
+                           path.indexOf('/builder') === 0 || path.indexOf('/wall') === 0;
           if (!shouldHave) {
             el.remove();
           }
         });
-        // Re-show any hidden-duplicate buttons (they may be correct on new page)
         document.querySelectorAll('[data-aa-hidden]').forEach(function(el) {
           el.style.display = '';
           el.removeAttribute('data-aa-hidden');
         });
-        // Re-apply top-left positioning on visible back buttons after cleanup
         document.querySelectorAll('button, a').forEach(function(el) {
           if (el.closest('.aa-error-fallback')) return;
           if (el.closest('nav.fixed.bottom-0')) return;
@@ -683,7 +931,6 @@ class PatchedBridgeViewController: CAPBridgeViewController {
             }
           }
         });
-        // Remove stale error fallbacks
         var root = document.getElementById('root');
         if (root) {
           var text = (root.innerText || '').trim();
@@ -694,6 +941,185 @@ class PatchedBridgeViewController: CAPBridgeViewController {
           }
         }
       }
+
+      // ── 6b. DIAGNOSTICS OVERLAY (Build 6) ──
+      // Triggered by 5-tap on version label OR /#/aa-diagnostics route.
+      // Shows device info, auth markers, Google attempt counter, last nav URLs.
+      // "Copy diagnostics" sends plaintext to native clipboard via WKScriptMessageHandler.
+
+      var aaNavHistory = [];
+
+      // Track navigation URLs (origin + path only, strip query/hash for privacy)
+      (function trackNav() {
+        function recordUrl() {
+          try {
+            var entry = window.location.origin + window.location.pathname;
+            if (aaNavHistory.length === 0 || aaNavHistory[aaNavHistory.length - 1] !== entry) {
+              aaNavHistory.push(entry);
+              if (aaNavHistory.length > 5) aaNavHistory.shift();
+            }
+          } catch(e) {}
+        }
+        recordUrl();
+        window.addEventListener('popstate', recordUrl);
+        // pushState/replaceState are already monkey-patched above, so add tracking there
+        var _origPush2 = history.pushState;
+        history.pushState = function() {
+          var r = _origPush2.apply(this, arguments);
+          recordUrl();
+          return r;
+        };
+        var _origReplace2 = history.replaceState;
+        history.replaceState = function() {
+          var r = _origReplace2.apply(this, arguments);
+          recordUrl();
+          return r;
+        };
+      })();
+
+      function collectDiagnostics() {
+        var native = window.__aaNativeDiag || {};
+        var tokenKeys = ['base44_access_token', 'base44_refresh_token', 'base44_user', 'access_token', 'refresh_token'];
+        var authPresence = {};
+        tokenKeys.forEach(function(k) {
+          try { authPresence[k] = localStorage.getItem(k) !== null; } catch(e) { authPresence[k] = 'error'; }
+        });
+
+        var capPrefPresent = 'unknown';
+        try {
+          capPrefPresent = localStorage.getItem('CapacitorStorage.aa_token') !== null;
+        } catch(e) {}
+
+        var googleAttempts = 0;
+        try { googleAttempts = parseInt(sessionStorage.getItem('aa_google_attempts') || '0', 10); } catch(e) {}
+
+        var lines = [
+          '=== Abide & Anchor Diagnostics ===',
+          'Timestamp: ' + new Date().toISOString(),
+          '',
+          '-- Device --',
+          'Model: ' + (native.deviceModel || 'unknown'),
+          'Type: ' + (native.deviceType || 'unknown'),
+          'iOS: ' + (native.iOSVersion || 'unknown'),
+          '',
+          '-- App --',
+          'Version: ' + (native.appVersion || '?') + ' (' + (native.buildNumber || '?') + ')',
+          'Origin: ' + window.location.origin,
+          'Path: ' + window.location.pathname,
+          'DataStore: ' + (native.dataStoreType || 'unknown'),
+          '',
+          '-- Auth Markers (presence only) --'
+        ];
+        Object.keys(authPresence).forEach(function(k) {
+          lines.push('  ' + k + ': ' + authPresence[k]);
+        });
+        lines.push('  CapacitorStorage.aa_token: ' + capPrefPresent);
+        lines.push('');
+        lines.push('-- Google --');
+        lines.push('  Attempts this session: ' + googleAttempts);
+        lines.push('');
+        lines.push('-- Recent Navigation (last ' + aaNavHistory.length + ') --');
+        aaNavHistory.forEach(function(url, i) {
+          lines.push('  ' + (i + 1) + '. ' + url);
+        });
+        lines.push('');
+        lines.push('=== End ===');
+        return lines.join('\\n');
+      }
+
+      function showDiagnosticsOverlay() {
+        // Remove existing
+        var existing = document.querySelector('.aa-diag-overlay');
+        if (existing) { existing.remove(); return; } // toggle off
+
+        var overlay = document.createElement('div');
+        overlay.className = 'aa-diag-overlay';
+
+        var text = collectDiagnostics();
+
+        overlay.innerHTML =
+          '<h2>\\ud83d\\udd27 Diagnostics</h2>' +
+          '<pre id="aa-diag-text">' + text.replace(/</g, '&lt;') + '</pre>' +
+          '<button class="aa-diag-btn aa-diag-copy" id="aa-diag-copy-btn">\\ud83d\\udccb Copy Diagnostics</button>' +
+          '<button class="aa-diag-btn aa-diag-close" id="aa-diag-close-btn">Close</button>';
+
+        document.body.appendChild(overlay);
+
+        document.getElementById('aa-diag-copy-btn').addEventListener('click', function() {
+          var diagText = collectDiagnostics(); // re-collect fresh
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaCopyDiagnostics) {
+            window.webkit.messageHandlers.aaCopyDiagnostics.postMessage(diagText);
+            this.textContent = '\\u2705 Copied!';
+          } else {
+            // Fallback: Clipboard API
+            navigator.clipboard.writeText(diagText).then(function() {
+              document.getElementById('aa-diag-copy-btn').textContent = '\\u2705 Copied!';
+            }).catch(function() {
+              document.getElementById('aa-diag-copy-btn').textContent = '\\u274c Copy failed';
+            });
+          }
+          var btn = this;
+          setTimeout(function() { btn.textContent = '\\ud83d\\udccb Copy Diagnostics'; }, 2000);
+        });
+
+        document.getElementById('aa-diag-close-btn').addEventListener('click', function() {
+          overlay.remove();
+        });
+      }
+
+      // 5-tap trigger: look for version text or app name elements
+      (function setupDiagTrigger() {
+        var tapCount = 0;
+        var tapTimer = null;
+
+        function handleTap() {
+          tapCount++;
+          if (tapTimer) clearTimeout(tapTimer);
+          tapTimer = setTimeout(function() { tapCount = 0; }, 2000);
+          if (tapCount >= 5) {
+            tapCount = 0;
+            showDiagnosticsOverlay();
+          }
+        }
+
+        // Attach to any element with version text, or the nav bar title area
+        function attachTrigger() {
+          // Look for version labels, app title, or header elements
+          var targets = document.querySelectorAll(
+            '[class*="version"], [class*="Version"], h1, h2, .text-xs, nav .font-bold, ' +
+            '[class*="app-name"], [class*="logo"], header'
+          );
+          targets.forEach(function(el) {
+            if (el.getAttribute('data-aa-diag-trigger')) return;
+            el.setAttribute('data-aa-diag-trigger', 'true');
+            el.addEventListener('click', handleTap);
+          });
+        }
+
+        // Also support /#/aa-diagnostics route
+        function checkDiagRoute() {
+          if (window.location.hash === '#/aa-diagnostics' ||
+              window.location.pathname === '/aa-diagnostics') {
+            showDiagnosticsOverlay();
+          }
+        }
+
+        // Re-attach on DOM changes
+        var diagObserver = new MutationObserver(function() { attachTrigger(); });
+        function startDiagObserver() {
+          var root = document.getElementById('root');
+          if (root) {
+            diagObserver.observe(root, { childList: true, subtree: true });
+            attachTrigger();
+          } else {
+            setTimeout(startDiagObserver, 500);
+          }
+        }
+
+        startDiagObserver();
+        checkDiagRoute();
+        window.addEventListener('hashchange', checkDiagRoute);
+      })();
 
       // ── 7. ORCHESTRATOR ──
 
@@ -706,6 +1132,7 @@ class PatchedBridgeViewController: CAPBridgeViewController {
           fixDuplicateBackButtons();
           fixMissingBackButtons();
           detectAndFixErrorScreen();
+          interceptGoogleAuth();
         }, 250);
       }
 
@@ -729,19 +1156,21 @@ class PatchedBridgeViewController: CAPBridgeViewController {
         }
       }
 
-      // Periodic blank-screen check (every 3s for first 30s after navigation)
+      // Periodic checks (blank screen + prayer routes) — every 3s for first 30s
       var blankCheckCount = 0;
       function scheduleBlankChecks() {
         blankCheckCount = 0;
         var interval = setInterval(function() {
           blankCheckCount++;
           detectBlankScreen();
+          monitorPrayerRoutes();
           if (blankCheckCount >= 10) clearInterval(interval);
         }, 3000);
       }
 
-      // SPA navigation hooks (single patch for pushState/replaceState/popstate)
+      // SPA navigation hooks
       window.addEventListener('popstate', function() {
+        resetGoogleNotice();
         setTimeout(runAllPatches, 300);
         scheduleBlankChecks();
       });
@@ -750,6 +1179,7 @@ class PatchedBridgeViewController: CAPBridgeViewController {
       var origReplace = history.replaceState;
       history.pushState = function() {
         var result = origPush.apply(this, arguments);
+        resetGoogleNotice();
         setTimeout(runAllPatches, 300);
         scheduleBlankChecks();
         return result;

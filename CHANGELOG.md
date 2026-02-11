@@ -4,6 +4,94 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-11 — Raouf: Build 6 (Revised) — Google Loop Fix (No Safari) + Diagnostics Overlay
+
+**Scope:** Fix Google sign-in infinite loop by blocking it entirely (no SFSafariViewController), add in-app diagnostics overlay, update Sign in with Apple docs
+**Summary:** The initial Build 6 used SFSafariViewController for Google OAuth — this was fundamentally broken because Safari has a separate localStorage/cookie store and tokens obtained there never persist back into WKWebView. This revised Build 6 removes SFSafariViewController entirely and blocks Google sign-in immediately on first click with a clear, non-error-looking inline notice guiding users to Email/Password. Also adds a comprehensive in-app diagnostics overlay (no Xcode required) and enhanced os_log markers.
+
+**Root Cause Analysis (Why SFSafariViewController Failed):**
+1. WKWebView and SFSafariViewController have **completely separate** localStorage and cookie stores
+2. Even if Google auth succeeds in Safari, the token lands in Safari's storage — NOT in WKWebView's localStorage
+3. The deep link `abideandanchor://auth-callback?token=...` depends on Base44 knowing to redirect there, but Base44's Google OAuth redirects back to `https://abideandanchor.app` (not the custom scheme)
+4. Result: user completes Google auth in Safari → Safari lands on app page logged in → WKWebView is still unauthenticated → loop
+
+**Fix Strategy — Immediate Block + Clear Message:**
+1. **Removed** SFSafariViewController import, `aaOpenInBrowser` message handler, and all Safari-based OAuth logic
+2. **Replaced** with immediate inline notice on **first** click of any Google sign-in button
+3. Notice text: "Google sign-in is temporarily unavailable in the iOS app. Please use Email & Password below — it's fast and reliable."
+4. Google buttons are dimmed (opacity 0.35, pointer-events none) — no loop possible
+5. Counter tracked in `sessionStorage` (`aa_google_attempts`) — logs `[DIAG:googleIntercept]`
+6. Notice is non-blocking, non-error-looking (warm beige, not yellow warning), and does NOT resemble a recovery/error screen
+7. Email/Password buttons remain fully accessible and unaffected
+
+**Diagnostics Overlay (NEW):**
+- **Trigger:** 5-tap on any header/version/title element, OR navigate to `/#/aa-diagnostics`
+- **Data shown:** Device model (hardware), iOS version, app version+build, window.location.origin, data store type (persistent/nonPersistent), auth key presence (boolean only — no token values), Google attempt counter, last 5 navigation URLs (origin+path only, query stripped)
+- **"Copy Diagnostics" button:** Copies plaintext to clipboard via native `WKScriptMessageHandler` (`aaCopyDiagnostics`) — Roland can paste in chat/email
+- **os_log markers added:** `[DIAG:coldBoot]`, `[DIAG:willEnterForeground]`, `[DIAG:webViewCreated]`, `[DIAG:googleIntercept]`, `[DIAG:authMarkers]`, `[DIAG:copy]`
+- **Native data injection:** Device model, iOS version, build number, data store type are injected into JS from Swift at cold boot and foreground resume
+
+**Sign in with Apple — Setup Checklist for Roland (UPDATED — No Private Key Sharing):**
+1. **Apple Developer Account** → Certificates, Identifiers & Profiles → App IDs → `com.abideandanchor.app` → Enable "Sign In with Apple" capability
+2. **Service ID** — Create a Service ID for web-based Sign in with Apple (Base44 needs this for OAuth flow)
+3. **Return URLs** — Configure the Return URL to point to Base44's OAuth callback endpoint
+4. **Private Key** — Generate a Sign in with Apple private key in Apple Developer. **KEEP IT SECURE — do NOT share the .p8 file.** Roland retains the key and configures it server-side.
+5. **Share with Raouf (safe to share):** Service ID, Key ID, Team ID only. Never the private key file.
+6. If server-side token validation is needed, use a secure channel (e.g., encrypted transfer) and rotate the key after integration.
+Note: Sign in with Apple will be implemented after the above is set up.
+
+**Login Persistence Confirmation:**
+Email/password persistence remains PASS. No changes to auth flow, token storage, or cookie bridging.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — **MODIFIED** — Removed SFSafariViewController, rewrote Google intercept, added diagnostics overlay + native data injection, enhanced os_log
+- `ios/App/App.xcodeproj/project.pbxproj` — Build number remains 6
+
+**Verification:**
+- `xcodebuild Release CODE_SIGNING_REQUIRED=NO` — ✅ BUILD SUCCEEDED
+- 0 Swift compiler warnings on PatchedBridgeViewController
+
+---
+
+### 2026-02-11 — Raouf: Build 6 (Initial, SFSafariViewController approach) — SUPERSEDED by revised Build 6 above
+
+**Scope:** Fix all Build 6 acceptance criteria from Roland — Google sign-in loop, Prayer Corner routes, Prayer List blank screen
+**Summary:** Two-layer fix for Google sign-in loop (native SFSafariViewController intercept + JS graceful fallback) plus improved route monitoring for Prayer Corner sub-pages.
+
+**Root Cause Analysis (Google Sign-In Loop):**
+1. The app loads `https://abideandanchor.app` in WKWebView. When user taps "Continue with Google" on Base44's login page, Google OAuth happens INSIDE the WebView.
+2. Deep links from inside the WebView do NOT trigger `appUrlOpen` (AGENT.md Rule 9), so after Google auth completes, the Base44 platform cannot redirect back to `abideandanchor://auth-callback?token=...` successfully.
+3. The WebView falls back to the login page → user tries again → infinite loop with no error message.
+
+**Fix Strategy — Two Layers:**
+1. **Layer 1 (Native):** Register `WKScriptMessageHandler` (`aaOpenInBrowser`) in `PatchedBridgeViewController`. JS injection intercepts Google sign-in button clicks, posts message to native handler, which opens `https://abideandanchor.app/login?from_url=abideandanchor://auth-callback` in `SFSafariViewController`. Google OAuth in Safari works correctly, and the deep link fires on completion.
+2. **Layer 2 (Graceful Fallback):** If Google auth still fails (e.g., SFSafariViewController dismissed without completing), or on 2nd attempt within 60s, JS injects a visible banner: "Google Sign-In isn't available in the app yet. Please use Email & Password to sign in." The Google button is visually disabled (opacity 0.4, pointer-events none).
+
+**Fixes Applied:**
+1. **Google OAuth intercept (JS)** — Detects Google sign-in buttons by text/aria-label/class/img-alt, overrides click handlers with `stopImmediatePropagation`, posts message to native layer
+2. **SFSafariViewController handler (Swift)** — `WKScriptMessageHandler` conformance, presents `SFSafariViewController` with login URL including `from_url` callback
+3. **Google fallback banner (JS+CSS)** — Yellow warning banner with clear "use Email & Password" message
+4. **Prayer route monitoring (JS)** — New `monitorPrayerRoutes()` function specifically watches prayer/request/builder/wall routes for failed loads
+5. **Extended back button injection** — `fixMissingBackButtons()` now covers prayer/request/builder/wall routes
+6. **Improved blank screen detection** — Raised text threshold from 20→30 chars and image threshold from 2→3 for fewer false negatives
+7. **Google fallback reset on navigation** — `resetGoogleFallback()` clears banner and re-enables buttons when user navigates away from login
+8. **Bumped build number** — 5 → 6
+
+**Sign in with Apple — (SUPERSEDED — See revised Build 6 above for updated checklist)**
+
+**Login Persistence Confirmation:**
+Email/password persistence remains PASS. No changes were made to auth flow, token storage, or cookie bridging.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — **MODIFIED** — Google OAuth handler, JS patches, CSS
+- `ios/App/App.xcodeproj/project.pbxproj` — Build 5 → 6
+
+**Verification:**
+- `xcodebuild Release CODE_SIGNING_REQUIRED=NO` — ✅ BUILD SUCCEEDED
+- No Swift compiler warnings on PatchedBridgeViewController
+
+---
+
 ### 2026-02-10 — Raouf: Build 5 — Back Button Top-Left Fix
 
 **Scope:** Move back buttons from top-middle to top-left on all pages
