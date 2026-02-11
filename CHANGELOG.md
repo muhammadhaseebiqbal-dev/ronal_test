@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-12 — Raouf: Build 6 — Zero npm vulnerabilities
+
+**Scope:** Eliminate all 4 npm audit vulnerabilities (3 moderate, 1 critical).
+
+**What changed:**
+1. **Removed `react-quill`** — Not imported anywhere in source code. Was the root cause of all 4 vulnerabilities via its transitive dependency chain: `react-quill@0.0.2` → `quilljs` → `lodash <=4.17.20` (critical: prototype pollution + command injection) and `react-quill@2.x` → `quill <=1.3.7` (moderate: XSS).
+2. **Result: `found 0 vulnerabilities`** — Clean audit.
+
+**Files Changed:**
+- `package.json` — Removed `react-quill` dependency
+- `package-lock.json` — Regenerated (clean)
+
+**Verification:**
+- `npm audit` → `found 0 vulnerabilities` ✅
+- `npm run build` → success ✅
+
 ### 2026-02-12 — Raouf: Build 6 — UI polish, SelectTrigger fix, Prayer Wall responsive
 
 **Scope:** Fix all 5 remaining Roland acceptance items for Build 6.
