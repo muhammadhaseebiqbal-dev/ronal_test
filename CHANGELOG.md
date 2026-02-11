@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-11 — Raouf: Build 6 — ASWebAuthenticationSession Google OAuth (Proper Fix)
+
+**Scope:** Fix Google sign-in properly using Apple's `ASWebAuthenticationSession` instead of blocking it.
+**Summary:** Replaced the "block Google on first click" approach with native OAuth. Google sign-in now intercepts the click in JS, sends the login URL to native Swift via `WKScriptMessageHandler` (`aaGoogleAuth`), which launches `ASWebAuthenticationSession`. The auth flow happens in Apple's secure browser (shares cookies with Safari). On callback, native code extracts the token from the URL (if present) and injects it into WKWebView's localStorage, then navigates home. If no token is in the callback URL, falls back to syncing cookies from HTTPCookieStorage → WKHTTPCookieStore and reloading the WebView.
+
+**Why ASWebAuthenticationSession:**
+1. Apple's recommended tool for OAuth in iOS apps (replaces SFSafariViewController for auth)
+2. Provides a deterministic completion handler (no guessing if auth completed)
+3. `prefersEphemeralWebBrowserSession = false` shares cookies with Safari cookie jar
+4. User sees a clear system prompt before the browser opens (no surprise navigation)
+5. No loop: completion handler fires exactly once (success, cancel, or error)
+
+**Implementation Details:**
+1. **JS intercept** — Google sign-in buttons detected and handled (capture phase) but NOT blocked. Instead, sends login URL to native via `aaGoogleAuth` message handler.
+2. **Native launcher** — `startGoogleOAuth(loginURL:)` creates `ASWebAuthenticationSession` with `abideandanchor` callbackURLScheme. Session ref stored to prevent duplicates. 3s debounce between attempts.
+3. **Token extraction** — `handleGoogleAuthCallback()` parses callback URL for `token`, `access_token`, `auth_token`, `code` params (query + fragment).
+4. **Token injection** — If token found: `localStorage.setItem('base44_access_token', token)` + navigate to `/`. Auth state persists.
+5. **Code exchange** — If `code` param found: redirects WebView to `https://abideandanchor.app/auth/callback?code=...` for server-side exchange.
+6. **Cookie fallback** — If no token/code: syncs cookies from HTTPCookieStorage → WKWebView, reloads, checks auth state after 2s.
+7. **Loop prevention** — After 3+ failed attempts, shows warm beige fallback notice guiding to Email/Password.
+8. **JS callback** — `window.__aaGoogleAuthResult(success, error)` updates UI after native completes.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — Added AuthenticationServices import, ASWebAuthenticationPresentationContextProviding, aaGoogleAuth handler, startGoogleOAuth, handleGoogleAuthCallback, injectTokenIntoWebView, fallbackCookieSync, checkPostOAuthState, notifyJSGoogleResult. Rewrote JS Google intercept from block → native OAuth. Updated diagnostics.
+- `AGENT.md` — Updated Known Issues, Last Change Log, Update Log
+- `CHANGELOG.md` — This entry
+
+**Verification:** xcodebuild Release — BUILD SUCCEEDED, 0 warnings
+
+---
+
 ### 2026-02-11 — Raouf: Build 6 — Fix Diagnostics "unknown" Values + Add Token Length/Key Count
 
 **Scope:** Fix diagnostics overlay showing "unknown" for device/iOS/build/DataStore; add localStorage key count and token lengths.

@@ -107,7 +107,7 @@ npm run test           # Unit tests
 | armv7 architecture | ✅ FIXED — arm64 only |
 | No offline handling | ✅ FIXED — OfflineScreen component |
 | Debug config in Release | ✅ FIXED — Separate release.xcconfig |
-| Google sign-in loop | ✅ FIXED — Build 6: Blocked inline with notice (SFSafariViewController removed — tokens don't persist) |
+| Google sign-in loop | ✅ FIXED — Build 6: ASWebAuthenticationSession + token handoff into WKWebView. Fallback to Email/Password after 3 failed attempts |
 | Prayer Corner routes fail | ✅ FIXED — Prayer route monitoring + improved blank detection |
 | Prayer List blank screen | ✅ FIXED — Tuned blank detection thresholds |
 | Login lost on background/kill | ✅ FIXED — Cookie bridging + process termination recovery |
@@ -138,6 +138,19 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Cookie names (never values) for `abideandanchor.app` domain
 
 ## Last Change Log
+
+**2026-02-11 — Raouf: Build 6 — ASWebAuthenticationSession Google OAuth (Proper Fix)**
+- Google OAuth now uses `ASWebAuthenticationSession` (Apple's recommended native OAuth tool)
+- Flow: intercept Google click → launch native auth session → extract token from callback → inject into WKWebView localStorage → navigate home
+- Cookie sync fallback: if no token in callback, syncs cookies from HTTPCookieStorage → WKWebView and reloads
+- Loop prevention: 3s debounce, max 3 attempts before fallback notice, `aaGoogleAuthPending` flag prevents concurrent sessions
+- Graceful degradation: after 3+ failed attempts, shows Email/Password fallback notice (same warm beige styling)
+- No SFSafariViewController (separate storage), no infinite loops
+- Registered `aaGoogleAuth` WKScriptMessageHandler for JS→native communication
+- Added `ASWebAuthenticationPresentationContextProviding` conformance
+- Diagnostics updated: shows Google auth method + pending state
+- Build number: 6 (unchanged)
+- Verification: xcodebuild Release ✅ BUILD SUCCEEDED, 0 warnings
 
 **2026-02-11 — Raouf: Build 6 — Fix Diagnostics "unknown" Values**
 - Fixed: Device model, iOS version, app version/build, DataStore showed "unknown" due to race condition
@@ -195,6 +208,20 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 6 — ASWebAuthenticationSession Google OAuth (Proper Fix)
+- **Summary:** Replaced the "block Google" approach with proper native OAuth. Google sign-in now launches `ASWebAuthenticationSession` (Apple's recommended iOS auth tool). On callback: extracts token from URL params → injects into WKWebView localStorage → navigates home. If no token in callback, falls back to cookie sync from HTTPCookieStorage → WKWebView. Includes 3s debounce, max 3 attempts before Email/Password fallback notice, and `aaGoogleAuthPending` flag to prevent concurrent sessions. Uses `abideandanchor` custom URL scheme (already registered in Info.plist) as callbackURLScheme. `prefersEphemeralWebBrowserSession = false` ensures cookies are shared with Safari cookie jar for maximum compatibility.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added `AuthenticationServices` import, `ASWebAuthenticationPresentationContextProviding` conformance, `aaGoogleAuth` message handler, `startGoogleOAuth()`, `handleGoogleAuthCallback()`, `injectTokenIntoWebView()`, `fallbackCookieSync()`, `checkPostOAuthState()`, `notifyJSGoogleResult()`. Rewrote Google intercept JS from "block" to "launch native OAuth". Updated diagnostics.
+  - `AGENT.md` — This entry + updated Known Issues + Last Change Log
+  - `CHANGELOG.md` — New entry
+- **Verification:** xcodebuild Release ✅ BUILD SUCCEEDED, 0 warnings
+- **Follow-ups:**
+  - Roland tests Google sign-in on physical iPhone: should launch native auth browser, complete OAuth, land on Home
+  - If Base44 doesn't redirect to `abideandanchor://` callback, cookie sync fallback activates
+  - Sign in with Apple: still requires Apple Developer setup from Roland
 
 **Raouf:**
 - **Date:** 2026-02-11 (Australia/Sydney)

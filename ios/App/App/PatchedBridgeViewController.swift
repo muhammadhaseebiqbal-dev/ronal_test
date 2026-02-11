@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import Capacitor
+import AuthenticationServices
 import os.log
 
 /// Custom CAPBridgeViewController that:
@@ -11,30 +12,43 @@ import os.log
 ///   4) Prevents unnecessary reloads on app resume
 ///   5) Provides diagnostics logging (cookie counts, store type, auth markers)
 ///   6) Injects client-side CSS+JS patches for remote Base44 app issues (Build 3)
-///   7) Blocks Google OAuth inline with graceful fallback to Email/Password (Build 6)
+///   7) Handles Google OAuth via ASWebAuthenticationSession with token handoff (Build 6)
 ///   8) In-app diagnostics overlay triggered by 5-tap on version label (Build 6)
 ///
 /// Architecture: The WKWebView loads https://abideandanchor.app (remote Base44 platform).
 /// We cannot modify the remote source code, so we inject JS+CSS via WKUserScript to
 /// patch DOM/CSS issues at runtime.
 ///
-/// NOTE (Build 6): SFSafariViewController for Google OAuth was REMOVED because Safari has
-/// a separate localStorage/cookie store — tokens obtained there do NOT persist in WKWebView.
-/// Google sign-in is now gracefully blocked with a clear message to use Email/Password.
-class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandler {
+/// NOTE (Build 6): Google OAuth uses ASWebAuthenticationSession → callback with token →
+/// inject into WKWebView localStorage. If auth fails gracefully, user is guided to
+/// Email/Password. No SFSafariViewController (separate storage). No infinite loops.
+class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandler, ASWebAuthenticationPresentationContextProviding {
 
     private static let log = OSLog(subsystem: "com.abideandanchor.app", category: "WebView")
     private let serverDomain = "abideandanchor.app"
     private var hasPerformedInitialLoad = false
     private var isRecoveringFromTermination = false
 
-    // MARK: – F) Script message handler (diagnostics copy)
+    // MARK: – Google OAuth via ASWebAuthenticationSession
+    private var authSession: ASWebAuthenticationSession?
+    private var googleAuthAttempts = 0
+    private var lastGoogleAuthTime: Date?
+
+    // ASWebAuthenticationPresentationContextProviding
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        return self.view.window ?? ASPresentationAnchor()
+    }
+
+    // MARK: – F) Script message handler (diagnostics copy + Google auth)
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if message.name == "aaCopyDiagnostics" {
             guard let text = message.body as? String else { return }
             UIPasteboard.general.string = text
             os_log(.info, log: Self.log, "[DIAG:copy] Diagnostics copied to clipboard (%d chars)", text.count)
+        } else if message.name == "aaGoogleAuth" {
+            guard let urlString = message.body as? String else { return }
+            startGoogleOAuth(loginURL: urlString)
         }
     }
 
@@ -61,6 +75,271 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 os_log(.error, log: Self.log, "[DIAG:nativeInject] failed: %{public}@", error.localizedDescription)
             }
         }
+    }
+
+    // MARK: – H) Google OAuth via ASWebAuthenticationSession
+
+    /// Launches Google OAuth in ASWebAuthenticationSession.
+    /// Uses `abideandanchor` custom URL scheme for callback.
+    /// On success: extracts token from callback URL → injects into WKWebView localStorage → navigates home.
+    /// On cancel: does nothing (user dismissed).
+    /// On repeated failure: tells JS to show fallback notice.
+    private func startGoogleOAuth(loginURL: String) {
+        // Prevent duplicate sessions
+        if authSession != nil {
+            os_log(.info, log: Self.log, "[DIAG:googleOAuth] session already active, ignoring")
+            return
+        }
+
+        // Debounce: prevent rapid re-taps (3s cooldown)
+        if let last = lastGoogleAuthTime, Date().timeIntervalSince(last) < 3.0 {
+            os_log(.info, log: Self.log, "[DIAG:googleOAuth] debounced (too rapid)")
+            return
+        }
+
+        googleAuthAttempts += 1
+        lastGoogleAuthTime = Date()
+        os_log(.info, log: Self.log, "[DIAG:googleOAuth] starting attempt=%d url=%{public}@",
+               googleAuthAttempts, loginURL)
+
+        // Build the auth URL — use the Base44 login page with Google trigger
+        // The login URL should be the Base44 login page that includes Google auth option
+        let authURLString: String
+        if loginURL.hasPrefix("http") {
+            authURLString = loginURL
+        } else {
+            // Default: use the main login page on the app domain
+            authURLString = "https://\(serverDomain)/login"
+        }
+
+        guard let authURL = URL(string: authURLString) else {
+            os_log(.error, log: Self.log, "[DIAG:googleOAuth] invalid URL: %{public}@", authURLString)
+            notifyJSGoogleResult(success: false, error: "Invalid URL")
+            return
+        }
+
+        // Use the registered custom URL scheme for callback
+        let callbackScheme = "abideandanchor"
+
+        let session = ASWebAuthenticationSession(
+            url: authURL,
+            callbackURLScheme: callbackScheme
+        ) { [weak self] callbackURL, error in
+            guard let self = self else { return }
+            self.authSession = nil
+
+            DispatchQueue.main.async {
+                if let error = error as? ASWebAuthenticationSessionError {
+                    switch error.code {
+                    case .canceledLogin:
+                        os_log(.info, log: Self.log, "[DIAG:googleOAuth] user cancelled")
+                        self.notifyJSGoogleResult(success: false, error: "cancelled")
+                    default:
+                        os_log(.error, log: Self.log, "[DIAG:googleOAuth] error: %{public}@", error.localizedDescription)
+                        self.notifyJSGoogleResult(success: false, error: error.localizedDescription)
+                    }
+                    return
+                }
+
+                guard let callbackURL = callbackURL else {
+                    os_log(.error, log: Self.log, "[DIAG:googleOAuth] no callback URL")
+                    self.notifyJSGoogleResult(success: false, error: "No callback URL")
+                    return
+                }
+
+                os_log(.info, log: Self.log, "[DIAG:googleOAuth] callback received: %{public}@",
+                       callbackURL.host ?? "unknown-host")
+
+                // Extract token from callback URL
+                self.handleGoogleAuthCallback(callbackURL)
+            }
+        }
+
+        session.presentationContextProvider = self
+        session.prefersEphemeralWebBrowserSession = false // share cookies with Safari cookie jar
+
+        authSession = session
+
+        if session.start() {
+            os_log(.info, log: Self.log, "[DIAG:googleOAuth] session started successfully")
+        } else {
+            os_log(.error, log: Self.log, "[DIAG:googleOAuth] session failed to start")
+            authSession = nil
+            notifyJSGoogleResult(success: false, error: "Failed to start auth session")
+        }
+    }
+
+    /// Handles the callback URL from ASWebAuthenticationSession.
+    /// Extracts token/code from URL params and injects into WKWebView.
+    private func handleGoogleAuthCallback(_ url: URL) {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            os_log(.error, log: Self.log, "[DIAG:googleOAuth] cannot parse callback URL")
+            fallbackCookieSync()
+            return
+        }
+
+        // Check for token in query params or fragment
+        let queryItems = components.queryItems ?? []
+        let fragmentItems: [URLQueryItem]
+        if let fragment = components.fragment, fragment.contains("=") {
+            var fragmentComponents = URLComponents()
+            fragmentComponents.query = fragment
+            fragmentItems = fragmentComponents.queryItems ?? []
+        } else {
+            fragmentItems = []
+        }
+
+        let allItems = queryItems + fragmentItems
+
+        // Look for token in callback params (Base44 may use various key names)
+        let tokenKeys = ["token", "access_token", "auth_token", "base44_token", "id_token"]
+        var foundToken: String?
+        for item in allItems {
+            if tokenKeys.contains(item.name.lowercased()), let value = item.value, !value.isEmpty {
+                foundToken = value
+                os_log(.info, log: Self.log, "[DIAG:googleOAuth] token found in callback (key=%{public}@, len=%d)",
+                       item.name, value.count)
+                break
+            }
+        }
+
+        // Check for auth code (server-side exchange)
+        let codeKeys = ["code", "auth_code"]
+        var foundCode: String?
+        for item in allItems {
+            if codeKeys.contains(item.name.lowercased()), let value = item.value, !value.isEmpty {
+                foundCode = value
+                os_log(.info, log: Self.log, "[DIAG:googleOAuth] code found in callback (len=%d)", value.count)
+                break
+            }
+        }
+
+        if let token = foundToken {
+            // Best case: we have a token — inject directly into WKWebView localStorage
+            injectTokenIntoWebView(token: token)
+        } else if foundCode != nil {
+            // We have a code but no token — the WebView needs to handle the exchange
+            // Navigate the WebView to the callback URL so Base44 can process it
+            os_log(.info, log: Self.log, "[DIAG:googleOAuth] redirecting WebView to callback for code exchange")
+            if let webView = self.webView {
+                // Reconstruct as HTTPS URL for the WebView
+                var httpsComponents = components
+                httpsComponents.scheme = "https"
+                httpsComponents.host = serverDomain
+                if httpsComponents.path.isEmpty { httpsComponents.path = "/auth/callback" }
+                if let httpsURL = httpsComponents.url {
+                    webView.load(URLRequest(url: httpsURL))
+                } else {
+                    fallbackCookieSync()
+                }
+            }
+        } else {
+            // No token or code in callback — try cookie sync approach
+            os_log(.info, log: Self.log, "[DIAG:googleOAuth] no token/code in callback — attempting cookie sync")
+            fallbackCookieSync()
+        }
+    }
+
+    /// Injects a token into WKWebView's localStorage and navigates to home.
+    private func injectTokenIntoWebView(token: String) {
+        guard let webView = self.webView else {
+            os_log(.error, log: Self.log, "[DIAG:googleOAuth] no webView for token injection")
+            return
+        }
+
+        // Escape the token for safe JS string insertion
+        let escapedToken = token
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: "\n", with: "\\n")
+
+        let js = """
+        (function() {
+            try {
+                localStorage.setItem('base44_access_token', '\(escapedToken)');
+                localStorage.setItem('access_token', '\(escapedToken)');
+                console.log('[AA:googleOAuth] token injected into localStorage');
+                window.location.href = 'https://\(serverDomain)/';
+            } catch(e) {
+                console.error('[AA:googleOAuth] injection failed:', e.message);
+            }
+        })();
+        """
+
+        webView.evaluateJavaScript(js) { [weak self] _, error in
+            if let error = error {
+                os_log(.error, log: Self.log, "[DIAG:googleOAuth] token injection failed: %{public}@",
+                       error.localizedDescription)
+                self?.notifyJSGoogleResult(success: false, error: "Token injection failed")
+            } else {
+                os_log(.info, log: Self.log, "[DIAG:googleOAuth] token injected — navigating home")
+                self?.googleAuthAttempts = 0 // reset on success
+                self?.notifyJSGoogleResult(success: true, error: nil)
+            }
+        }
+    }
+
+    /// Fallback: sync cookies from HTTPCookieStorage → WKWebView and reload.
+    /// This may work if Base44 sets auth cookies during the ASWebAuthenticationSession flow.
+    private func fallbackCookieSync() {
+        os_log(.info, log: Self.log, "[DIAG:googleOAuth] fallback: syncing cookies then reloading WebView")
+
+        syncCookiesToWebView { [weak self] in
+            guard let self = self, let webView = self.webView else { return }
+
+            if let url = URL(string: "https://\(self.serverDomain)/") {
+                webView.load(URLRequest(url: url))
+            }
+
+            // Check auth state after a short delay
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                self.checkPostOAuthState()
+            }
+        }
+    }
+
+    /// After OAuth cookie sync, check if we're actually logged in.
+    /// If not, show fallback notice via JS.
+    private func checkPostOAuthState() {
+        guard let webView = self.webView else { return }
+
+        webView.evaluateJavaScript("""
+            (function() {
+                var hasToken = !!localStorage.getItem('base44_access_token') ||
+                               !!localStorage.getItem('access_token');
+                return hasToken ? 'true' : 'false';
+            })()
+        """) { [weak self] result, _ in
+            guard let self = self else { return }
+            let hasToken = (result as? String) == "true"
+            if hasToken {
+                os_log(.info, log: Self.log, "[DIAG:googleOAuth] post-OAuth: auth token found ✅")
+                self.googleAuthAttempts = 0
+                self.notifyJSGoogleResult(success: true, error: nil)
+            } else {
+                os_log(.info, log: Self.log, "[DIAG:googleOAuth] post-OAuth: no auth token — attempt %d",
+                       self.googleAuthAttempts)
+                self.notifyJSGoogleResult(success: false, error: "Auth state not detected after sign-in")
+            }
+        }
+    }
+
+    /// Tells JS about the result of Google OAuth so it can update UI accordingly.
+    private func notifyJSGoogleResult(success: Bool, error: String?) {
+        guard let webView = self.webView else { return }
+
+        let escapedError = (error ?? "")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: "\n", with: " ")
+
+        let js: String
+        if success {
+            js = "window.__aaGoogleAuthResult && window.__aaGoogleAuthResult(true, null);"
+        } else {
+            js = "window.__aaGoogleAuthResult && window.__aaGoogleAuthResult(false, '\(escapedError)');"
+        }
+
+        webView.evaluateJavaScript(js) { _, _ in }
     }
 
     deinit {
@@ -354,6 +633,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Register native message handler for diagnostics clipboard copy
         controller.add(self, name: "aaCopyDiagnostics")
 
+        // Register native message handler for Google OAuth
+        controller.add(self, name: "aaGoogleAuth")
+
         // Inject native diagnostics data at DOCUMENT START so it's available
         // before any other scripts run (fixes "unknown" race condition)
         let nativeDiagScript = WKUserScript(
@@ -580,14 +862,46 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       if (window.__aaPatched) return;
       window.__aaPatched = true;
 
-      // ── 0. GOOGLE SIGN-IN: GRACEFUL BLOCK (Build 6) ──
-      // Google OAuth cannot work reliably inside WKWebView because:
-      // 1. Deep links from inside WebView don't trigger appUrlOpen
-      // 2. Google blocks embedded WebView sign-in on many flows
-      // 3. SFSafariViewController has separate storage — tokens don't persist back
-      // Solution: Block Google sign-in immediately with clear inline message.
+      // ── 0. GOOGLE SIGN-IN: NATIVE OAUTH VIA ASWebAuthenticationSession (Build 6) ──
+      // Google OAuth is launched in ASWebAuthenticationSession (native iOS auth browser).
+      // On success: native code injects token into WKWebView localStorage.
+      // On failure after 2+ attempts: fallback notice guides user to Email/Password.
+      // No SFSafariViewController (separate storage), no infinite loops.
 
       var aaGoogleNoticeShown = false;
+      var aaGoogleAuthPending = false;
+
+      // Callback from native after ASWebAuthenticationSession completes
+      window.__aaGoogleAuthResult = function(success, error) {
+        aaGoogleAuthPending = false;
+        var count = parseInt(sessionStorage.getItem('aa_google_attempts') || '0', 10);
+        if (success) {
+          console.log('[AA:googleAuth] success — resetting counter');
+          sessionStorage.setItem('aa_google_attempts', '0');
+          // Remove any existing notice
+          var notice = document.querySelector('.aa-google-notice');
+          if (notice) notice.remove();
+          aaGoogleNoticeShown = false;
+          // Re-enable Google buttons
+          document.querySelectorAll('[data-aa-google-handled]').forEach(function(el) {
+            el.style.opacity = '';
+            el.style.pointerEvents = '';
+          });
+        } else {
+          console.log('[AA:googleAuth] failed: ' + (error || 'unknown') + ' (attempt ' + count + ')');
+          if (error === 'cancelled') {
+            // User dismissed — don't show fallback unless repeated
+            if (count >= 2) {
+              showGoogleNotice();
+            }
+          } else {
+            // Non-cancel error — show fallback after 2 attempts
+            if (count >= 2) {
+              showGoogleNotice();
+            }
+          }
+        }
+      };
 
       function interceptGoogleAuth() {
         var root = document.getElementById('root');
@@ -600,7 +914,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
         var elements = root.querySelectorAll('button, a, [role="button"]');
         elements.forEach(function(el) {
-          if (el.getAttribute('data-aa-google-blocked')) return;
+          if (el.getAttribute('data-aa-google-handled')) return;
           var text = (el.textContent || '').trim().toLowerCase();
           var ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
           var className = (el.className || '').toLowerCase();
@@ -623,18 +937,45 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
           if (!isGoogle) return;
 
-          el.setAttribute('data-aa-google-blocked', 'true');
+          el.setAttribute('data-aa-google-handled', 'true');
           el.addEventListener('click', function(e) {
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation();
 
-            // Track attempts in sessionStorage (survives SPA nav, clears on tab close)
+            // Track attempts
             var count = parseInt(sessionStorage.getItem('aa_google_attempts') || '0', 10) + 1;
             sessionStorage.setItem('aa_google_attempts', String(count));
-
             console.log('[DIAG:googleIntercept] attempt=' + count);
-            showGoogleNotice();
+
+            // If already pending, ignore
+            if (aaGoogleAuthPending) {
+              console.log('[AA:googleAuth] auth already pending, ignoring tap');
+              return;
+            }
+
+            // After 3+ failed attempts, block and show notice
+            if (count > 3) {
+              showGoogleNotice();
+              return;
+            }
+
+            // Send to native to launch ASWebAuthenticationSession
+            aaGoogleAuthPending = true;
+            var loginUrl = window.location.origin + '/login';
+            try {
+              // Try to find the actual Google auth URL from the button
+              var href = el.getAttribute('href') || el.closest('a[href]')?.getAttribute('href');
+              if (href && href.indexOf('google') !== -1) loginUrl = href;
+            } catch(ex) {}
+
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaGoogleAuth) {
+              window.webkit.messageHandlers.aaGoogleAuth.postMessage(loginUrl);
+            } else {
+              // No native handler — show fallback
+              aaGoogleAuthPending = false;
+              showGoogleNotice();
+            }
           }, true);
         });
       }
@@ -659,7 +1000,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           'We\\u2019re working on a robust Google flow for a future update.</small>';
 
         // Insert above the Google button if possible
-        var googleBtn = root.querySelector('[data-aa-google-blocked]');
+        var googleBtn = root.querySelector('[data-aa-google-handled]');
         if (googleBtn && googleBtn.parentElement) {
           googleBtn.parentElement.insertBefore(notice, googleBtn);
         } else {
@@ -673,7 +1014,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
 
         // Dim the Google button so it's clear it's disabled
-        root.querySelectorAll('[data-aa-google-blocked]').forEach(function(el) {
+        root.querySelectorAll('[data-aa-google-handled]').forEach(function(el) {
           el.style.opacity = '0.35';
           el.style.pointerEvents = 'none';
         });
@@ -681,12 +1022,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
       function resetGoogleNotice() {
         aaGoogleNoticeShown = false;
+        aaGoogleAuthPending = false;
         var notice = document.querySelector('.aa-google-notice');
         if (notice) notice.remove();
-        document.querySelectorAll('[data-aa-google-blocked]').forEach(function(el) {
+        document.querySelectorAll('[data-aa-google-handled]').forEach(function(el) {
           el.style.opacity = '';
           el.style.pointerEvents = '';
-          el.removeAttribute('data-aa-google-blocked');
+          el.removeAttribute('data-aa-google-handled');
         });
       }
 
@@ -1045,8 +1387,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         lines.push('  CapacitorStorage.aa_token: ' + capPrefPresent + (capPrefLength ? ' (len=' + capPrefLength + ')' : ''));
         lines.push('  localStorage total keys: ' + lsKeyCount);
         lines.push('');
-        lines.push('-- Google --');
+        lines.push('-- Google OAuth --');
         lines.push('  Attempts this session: ' + googleAttempts);
+        lines.push('  Auth pending: ' + (typeof aaGoogleAuthPending !== 'undefined' ? aaGoogleAuthPending : 'n/a'));
+        lines.push('  Method: ASWebAuthenticationSession');
         lines.push('');
         lines.push('-- Recent Navigation (last ' + aaNavHistory.length + ') --');
         aaNavHistory.forEach(function(url, i) {
