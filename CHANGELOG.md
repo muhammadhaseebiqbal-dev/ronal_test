@@ -4,6 +4,137 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-11 — Raouf: Build 9 — Native Token Two-Way Sync (Swift ↔ localStorage)
+
+**Scope:** Fix critical gap where token exists in localStorage but NOT in native persistence (UserDefaults). The previous fix (tokenStorage.js + AuthContext.jsx) was DEAD CODE in production — the app loads the remote Base44 site, not our local bundle.
+
+**Root cause (architectural):** With `server.url: 'https://abideandanchor.app'`, the WKWebView loads the REMOTE site's JS bundle. Our local `src/lib/tokenStorage.js` and `src/context/AuthContext.jsx` are compiled into `dist/` but NEVER EXECUTED. They're dead code in production. The remote Base44 SDK stores tokens in localStorage only — nobody calls Capacitor Preferences because our code doesn't run. Token persistence must happen entirely in native Swift ↔ injected JS.
+
+**What changed:**
+
+1. **Native token sync in `PatchedBridgeViewController.swift`**
+   - **UP sync** (`syncTokenToUserDefaults()`): Evaluates JS to read localStorage tokens, saves to `UserDefaults.standard`. Called:
+     - After `capacitorDidLoad` + 3s and +10s delay (let React mount and set tokens)
+     - On foreground resume + 1s delay
+     - On background entry (last chance before app kill)
+   - **DOWN sync** (in `buildNativeDiagJS()` at `.atDocumentStart`): Reads token from UserDefaults, injects into localStorage if missing. Runs on every cold boot BEFORE React mounts.
+   - **Logout**: `performFullLogout()` now clears UserDefaults token.
+   - **Diagnostics**: Shows actual UserDefaults token status (not useless `CapacitorStorage.*` localStorage check).
+
+2. **New `__aaNativeDiag` fields:**
+   - `hasNativeToken`: boolean — whether UserDefaults has a stored token
+   - `nativeTokenLen`: number — length of stored token (never the token itself)
+   - `tokenRestored`: boolean — whether token was restored from UserDefaults to localStorage on this page load
+
+3. **Updated diagnostics overlay** — replaced misleading `CapacitorStorage.*` checks with:
+   ```
+   --- Native Persistence (UserDefaults) ---
+   UserDefaults token: true (len=165)
+   Token restored from UserDefaults: YES  (only shown if restoration occurred)
+   ```
+
+4. **Build number: 8 → 9** (Debug + Release)
+
+5. **Also kept `tokenStorage.js` / `AuthContext.jsx` changes** from earlier — harmless as fallback if app ever switches to local mode.
+
+**Expected diagnostics after fix:**
+```
+UserDefaults token: true (len=165)   (was: CapacitorStorage: false)
+Session Validation Status: valid     (was: no-token)
+```
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — Native two-way token sync (UP + DOWN), diagnostics update, logout cleanup
+- `ios/App/App.xcodeproj/project.pbxproj` — Build 8 → 9
+- `src/lib/tokenStorage.js` — Added `syncTokenLayers()` (dead code in prod, kept as fallback)
+- `src/context/AuthContext.jsx` — Two-way sync on boot (dead code in prod, kept as fallback)
+- `AGENT.md` — Updated Last Change Log, Known Issues
+- `CHANGELOG.md` — This entry
+
+**Verification:**
+- `npm run lint` → 0 errors ✅
+- `npm run test` → 42/42 passed ✅
+- `npm run build` → success ✅
+- `npx cap sync ios` → 3 plugins ✅
+- `xcodebuild Release` → BUILD SUCCEEDED ✅
+
+---
+
+### 2026-02-11 — Raouf: Build 8.1 — Apple Docs Fixes (WKProcessPool, Cookie Observer, Multi-Key Validation)
+
+**Scope:** Hotfix for session validation `no-token` bug (token exists under different key) + Apple developer docs hardening (WKProcessPool, WKHTTPCookieStoreObserver, iOS 26 batch cookie API).
+
+**Root cause:** `validateSession()` only checked `base44_access_token` key, but at `atDocumentEnd` time React hasn't yet copied the token there. The Base44 SDK stores it under `token` initially — which WAS present (len=165). The validation ran before React's token migration.
+
+**What changed:**
+1. **Multi-key session validation** — `validateSession()` and `computeTokenMeta()` now check 4 keys: `base44_access_token`, `token`, `access_token`, `base44_auth_token`. First key with `val.length > 20` wins. Fixes `no-token` false positive.
+2. **Shared WKProcessPool** (Apple developer docs recommendation) — Static singleton `WKProcessPool` prevents iOS 17.4+ localStorage random clearing bug. Applied via `config.processPool = Self.sharedProcessPool` in `webViewConfiguration`.
+3. **WKHTTPCookieStoreObserver** — Class now conforms to `WKHTTPCookieStoreObserver`. `cookiesDidChange(in:)` auto-persists domain cookies from WKHTTPCookieStore → HTTPCookieStorage.shared whenever cookies change. No more manual sync lag.
+4. **iOS 26 batch setCookies API** — `syncCookiesToWebView` uses `setCookies(_:completionHandler:)` on iOS 26+ for atomic cookie sync. Falls back to existing DispatchGroup loop on iOS 15–25.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — All 4 changes above
+- `AGENT.md` — Updated Last Change Log
+- `CHANGELOG.md` — This entry
+
+**Verification:**
+- `npm run lint` → 0 errors ✅
+- `npm run test` → 42/42 passed ✅
+- `npm run build` → success ✅
+- `npx cap sync ios` → 3 plugins ✅
+- `xcodebuild Release` → BUILD SUCCEEDED ✅
+
+---
+
+### 2026-02-11 — Raouf: Build 8 — Crash Resilience + Session Diagnostics + Token Validation
+
+**Scope:** Production-grade hardening of PatchedBridgeViewController injected JS — 5-part improvement covering crash resilience, diagnostics, session validation, and safety.
+
+**What changed:**
+1. **Part 1 — Crash Resilience**
+   - Added `window.__AA_LAST_ERROR` object: stores sanitized error message (max 300 chars), source (window.onerror / unhandledrejection / console.error), timestamp, and page URL.
+   - Long base64 strings (40+ chars) are auto-redacted from error messages to prevent token leakage.
+   - Added `console.error` interception: catches React error boundary logs, Minified React errors, and Invariant Violations. Routes them to appropriate handlers (handleSelectTriggerCrash or detectAndFixErrorScreen).
+   - Debounced at 1s to prevent console.error flood from triggering excessive handler calls.
+2. **Part 2 — Auth Session Diagnostics Upgrade**
+   - Enhanced `collectDiagnostics()` with new sections:
+     - **Network**: `navigator.onLine`, `navigator.connection.effectiveType`, downlink (Mbps), RTT (ms).
+     - **Session Validation**: Status from JWT check (valid/expired-cleared/token-no-user/no-token), token expiry time, time remaining (hours + minutes), isExpired flag.
+     - **Last Error**: Most recent error message, source, timestamp, and URL.
+   - All new fields visible in diagnostics overlay (5-tap trigger or `/#/aa-diagnostics`).
+   - Added `base44_auth_token` and `token` to auth key checks (was missing — this is the key used by tokenStorage.js).
+   - Fixed misleading `CapacitorStorage.aa_token` check: now checks both `CapacitorStorage.aa_token` and `CapacitorStorage.base44_auth_token`, with a note that Capacitor Preferences stores in iOS UserDefaults (not visible from JS).
+   - Token metadata (`__AA_TOKEN_META`) is now recomputed fresh each time diagnostics overlay is opened (not stale from page load).
+3. **Part 3 — Session Validation Fix**
+   - New `validateSession()` IIFE runs on page load before React mounts.
+   - Parses JWT from `base44_access_token` using base64url decode of payload section.
+   - If `exp` field is in the past: auto-clears all 9 auth localStorage keys → React will show login screen.
+   - If token exists but `base44_user` is missing: flags as `token-no-user` for diagnostics (lets React's `initializeAuth` handle rehydration).
+   - Stores `window.__AA_TOKEN_META` = `{ hasExp, expiresAt, ageSeconds, isExpired, tokenLength }` — never the token itself.
+   - Loop guard: `sessionStorage('aa-session-validated')` prevents re-validation on the same page load.
+   - **Fix (from device diagnostics)**: Original validation result is now preserved in `sessionStorage('aa-session-result')` and displayed on subsequent diagnostics checks, instead of being overwritten with unhelpful `already-checked`.
+4. **Part 4 — Safety**
+   - Verified: no raw tokens or PII in any injected JS logging path.
+   - `storeLastError()` strips base64 strings ≥40 chars via regex replacement.
+   - `__AA_TOKEN_META` contains only boolean/numeric/ISO-date metadata.
+   - `collectDiagnostics()` continues to show presence + length only for auth keys.
+5. **Build number bumped: 6 → 8** (both Debug and Release in project.pbxproj)
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — Error tracking, session validation with JWT parsing, enhanced diagnostics, fixed already-checked masking bug
+- `ios/App/App.xcodeproj/project.pbxproj` — Build 6 → 8
+- `AGENT.md` — Updated Last Change Log, Update Log
+- `CHANGELOG.md` — This entry
+
+**Verification:**
+- `npm run lint` → 0 errors ✅
+- `npm run test` → 42/42 passed ✅
+- `npm run build` → success ✅
+- `npx cap sync ios` → 3 plugins ✅
+- `xcodebuild Release` → BUILD SUCCEEDED, 0 warnings on PatchedBridgeViewController ✅
+
+---
+
 ### iPhone Stage One — Acceptance Criteria (Roland, 2026-11-02)
 
 | # | Criterion | Status |

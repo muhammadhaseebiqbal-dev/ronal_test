@@ -242,12 +242,62 @@ export const createTokenStorage = ({
         return report;
     };
 
+    /**
+     * Two-way sync: ensures token exists in BOTH localStorage and Capacitor Preferences.
+     * Fixes the gap where Base44 SDK sets token in localStorage but nobody copies it
+     * to Preferences (UserDefaults), leaving the native persistence layer empty.
+     *
+     * Call on app boot after token is resolved from any source.
+     *
+     * @param {string|null} token - The resolved token (from URL, Preferences, or localStorage).
+     * @returns {Promise<void>}
+     */
+    const syncTokenLayers = async (token) => {
+        if (!token) return;
+
+        const native = isNativeImpl();
+        if (!native) return; // Only needed on iOS
+
+        const ready = await waitForCapacitorReady();
+        if (!ready) return;
+
+        // Check if Preferences already has the token
+        try {
+            const { value: prefToken } = await PreferencesImpl.get({ key: TOKEN_KEY });
+
+            if (!prefToken && token) {
+                // localStorage has token but Preferences doesn't → sync UP to Preferences
+                log('[tokenStorage] syncTokenLayers: copying token to Preferences (was missing)');
+                await PreferencesImpl.set({ key: TOKEN_KEY, value: token });
+                log('[tokenStorage] syncTokenLayers: token synced to Preferences ✅');
+            } else if (prefToken && prefToken !== token) {
+                // Preferences has a different token → update Preferences with the fresher one
+                log('[tokenStorage] syncTokenLayers: updating Preferences with fresher token');
+                await PreferencesImpl.set({ key: TOKEN_KEY, value: token });
+            }
+        } catch (err) {
+            logError('[tokenStorage] syncTokenLayers failed:', err);
+        }
+
+        // Also ensure localStorage has the token under the canonical key
+        try {
+            const lsToken = storageImpl?.getItem(TOKEN_KEY);
+            if (!lsToken && token) {
+                log('[tokenStorage] syncTokenLayers: restoring token to localStorage');
+                storageImpl?.setItem(TOKEN_KEY, token);
+            }
+        } catch {
+            // Ignore localStorage errors
+        }
+    };
+
     return {
         saveToken,
         loadToken,
         clearToken,
         hasStoredToken,
-        diagnoseTokenStorage
+        diagnoseTokenStorage,
+        syncTokenLayers
     };
 };
 
@@ -258,6 +308,7 @@ export const loadToken = defaultStorage.loadToken;
 export const clearToken = defaultStorage.clearToken;
 export const hasStoredToken = defaultStorage.hasStoredToken;
 export const diagnoseTokenStorage = defaultStorage.diagnoseTokenStorage;
+export const syncTokenLayers = defaultStorage.syncTokenLayers;
 
 // Expose diagnostic function only in development
 if (typeof window !== 'undefined' && typeof import.meta !== 'undefined' && import.meta.env?.DEV) {

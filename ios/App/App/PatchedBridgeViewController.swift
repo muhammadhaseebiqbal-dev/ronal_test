@@ -20,12 +20,25 @@ import os.log
 ///
 /// NOTE (Build 6): Google sign-in is hidden on iOS. Roland confirmed Email/Password only.
 /// No Base44 subscription, so no Google OAuth flow needed.
-class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandler {
+class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandler, WKHTTPCookieStoreObserver {
 
     private static let log = OSLog(subsystem: "com.abideandanchor.app", category: "WebView")
     private let serverDomain = "abideandanchor.app"
     private var hasPerformedInitialLoad = false
     private var isRecoveringFromTermination = false
+
+    /// UserDefaults key for native token persistence.
+    /// This is the ONLY reliable persistence layer on iOS — localStorage can be
+    /// cleared by WebKit under storage pressure, but UserDefaults survives everything.
+    /// NOTE: src/lib/tokenStorage.js is DEAD CODE in production (remote URL mode).
+    /// The WKWebView loads https://abideandanchor.app which has its own JS bundle.
+    /// Token sync must happen entirely via native Swift ↔ injected JS.
+    private static let tokenDefaultsKey = "com.abideandanchor.authToken"
+
+    /// Shared WKProcessPool — Apple recommends reusing a single process pool
+    /// across all WKWebViews to prevent localStorage from being randomly cleared.
+    /// See: https://developer.apple.com/forums/thread/751820
+    private static let sharedProcessPool = WKProcessPool()
 
     // MARK: – F) Script message handler (diagnostics copy)
 
@@ -91,6 +104,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             }
         }
 
+        // Clear token from UserDefaults (native persistence layer)
+        clearTokenFromUserDefaults()
+
         logDiagnostics(event: "logout")
     }
 
@@ -138,7 +154,93 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             config.websiteDataStore = WKWebsiteDataStore.default()
         }
 
+        // Apple recommends sharing a single WKProcessPool across all WKWebViews
+        // to prevent localStorage from being randomly cleared (iOS 17.4+ issue).
+        // See: https://developer.apple.com/forums/thread/751820
+        config.processPool = Self.sharedProcessPool
+        os_log(.info, log: Self.log, "[DIAG:webViewCreated] processPool=shared")
+
+        // Register as cookie observer for automatic persistence
+        config.websiteDataStore.httpCookieStore.add(self)
+
         return config
+    }
+
+    // MARK: – WKHTTPCookieStoreObserver — auto-persist cookies on change
+
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        // When WKWebView cookies change, sync them to HTTPCookieStorage
+        // so they survive content process termination.
+        cookieStore.getAllCookies { cookies in
+            let domainCookies = cookies.filter { $0.domain.contains(self.serverDomain) }
+            for cookie in domainCookies {
+                HTTPCookieStorage.shared.setCookie(cookie)
+            }
+            if !domainCookies.isEmpty {
+                os_log(.info, log: Self.log, "[CookieObserver] auto-synced %d domain cookies to HTTPCookieStorage", domainCookies.count)
+            }
+        }
+    }
+
+    // MARK: – H) Native Token Persistence (Build 9 — two-way sync)
+    //
+    // ARCHITECTURE NOTE: In production, the WKWebView loads https://abideandanchor.app
+    // (remote Base44 platform). Our local src/lib/tokenStorage.js is DEAD CODE — it's
+    // compiled into dist/ but never served because server.url overrides it.
+    // The remote site's own JS manages tokens in localStorage only.
+    //
+    // Therefore, token persistence to UserDefaults MUST happen here in native Swift:
+    //   UP:   localStorage → UserDefaults (after page load, on foreground resume)
+    //   DOWN: UserDefaults → localStorage (on cold boot via WKUserScript at documentStart)
+
+    /// Reads auth token from localStorage (via JS evaluation) and saves to UserDefaults.
+    /// Called after page load and on foreground resume.
+    private func syncTokenToUserDefaults() {
+        guard let webView = self.webView else { return }
+
+        webView.evaluateJavaScript("""
+            (function() {
+                var keys = ['base44_access_token', 'token', 'access_token', 'base44_auth_token'];
+                for (var i = 0; i < keys.length; i++) {
+                    try {
+                        var val = localStorage.getItem(keys[i]);
+                        if (val && val.length > 20) return val;
+                    } catch(e) {}
+                }
+                return null;
+            })()
+        """) { [weak self] result, error in
+            guard let self = self else { return }
+
+            if let token = result as? String, !token.isEmpty {
+                let existing = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)
+                if existing != token {
+                    UserDefaults.standard.set(token, forKey: Self.tokenDefaultsKey)
+                    os_log(.info, log: Self.log, "[TokenSync:UP] Saved token to UserDefaults (len=%d)", token.count)
+                } else {
+                    os_log(.info, log: Self.log, "[TokenSync:UP] UserDefaults already has current token (len=%d)", token.count)
+                }
+            } else {
+                os_log(.info, log: Self.log, "[TokenSync:UP] No token found in localStorage")
+            }
+        }
+    }
+
+    /// Clears the token from UserDefaults (called during logout).
+    private func clearTokenFromUserDefaults() {
+        UserDefaults.standard.removeObject(forKey: Self.tokenDefaultsKey)
+        os_log(.info, log: Self.log, "[TokenSync] Cleared token from UserDefaults")
+    }
+
+    /// Checks if UserDefaults has a stored token.
+    private func hasTokenInUserDefaults() -> Bool {
+        let token = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)
+        return token != nil && !(token!.isEmpty)
+    }
+
+    /// Gets the stored token length (for diagnostics — never log the token itself).
+    private func tokenLengthInUserDefaults() -> Int {
+        return UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)?.count ?? 0
     }
 
     // MARK: – B) Cookie bridging
@@ -167,16 +269,25 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             return
         }
 
-        let group = DispatchGroup()
-        for cookie in domainCookies {
-            group.enter()
-            cookieStore.setCookie(cookie) {
-                group.leave()
+        // iOS 26+: Use batch setCookies API (Apple WWDC 2025)
+        // Fallback: Loop with DispatchGroup for iOS 15-25
+        if #available(iOS 26.0, *) {
+            cookieStore.setCookies(domainCookies) {
+                os_log(.info, log: Self.log, "syncCookies: batch done — %d cookies synced (iOS 26 API)", domainCookies.count)
+                completion?()
             }
-        }
-        group.notify(queue: .main) {
-            os_log(.info, log: Self.log, "syncCookies: done — %d cookies synced", domainCookies.count)
-            completion?()
+        } else {
+            let group = DispatchGroup()
+            for cookie in domainCookies {
+                group.enter()
+                cookieStore.setCookie(cookie) {
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) {
+                os_log(.info, log: Self.log, "syncCookies: done — %d cookies synced", domainCookies.count)
+                completion?()
+            }
         }
     }
 
@@ -192,6 +303,16 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
         hasPerformedInitialLoad = true
         logDiagnostics(event: "capacitorDidLoad")
+
+        // Token UP sync: localStorage → UserDefaults
+        // Delay to let the remote site's React app mount and set tokens in localStorage.
+        // Two stages: 3s (catch fast logins) and 10s (catch slow hydration).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            self?.syncTokenToUserDefaults()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
+            self?.syncTokenToUserDefaults()
+        }
     }
 
     // MARK: – D) Lifecycle observers — prevent harmful reloads on resume
@@ -226,6 +347,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         logDiagnostics(event: "willEnterForeground")
         injectNativeDiagnostics() // refresh native data in JS after resume
 
+        // Token UP sync on resume — catches tokens set during the session
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.syncTokenToUserDefaults()
+        }
+
         guard let webView = self.webView else {
             os_log(.error, log: Self.log, "willEnterForeground: webView is nil — cannot recover")
             return
@@ -253,6 +379,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         os_log(.info, log: Self.log, "didEnterBackground")
         // Flush cookies to HTTPCookieStorage so they survive process termination
         flushWebViewCookies()
+        // Token UP sync — last chance before app may be killed
+        syncTokenToUserDefaults()
     }
 
     /// Flushes cookies FROM WKWebView's cookie store TO HTTPCookieStorage.shared
@@ -435,7 +563,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         controller.addUserScript(jsScript)
     }
 
-    /// Builds the JS string that sets window.__aaNativeDiag with device/build info.
+    /// Builds the JS string that sets window.__aaNativeDiag with device/build info
+    /// AND restores token from UserDefaults to localStorage if needed.
     /// Used both as a WKUserScript (document start) and via evaluateJavaScript (resume).
     private func buildNativeDiagJS() -> String {
         let device = UIDevice.current
@@ -463,6 +592,16 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         let deviceName = device.name.replacingOccurrences(of: "'", with: "\\'")
             .replacingOccurrences(of: "\\", with: "\\\\")
 
+        // Token restoration: read from UserDefaults, inject into localStorage if missing.
+        // JWT tokens are base64url (A-Z, a-z, 0-9, -, _, .) — safe for JS string literal.
+        let hasNativeToken = hasTokenInUserDefaults()
+        let nativeTokenLen = tokenLengthInUserDefaults()
+        let savedToken = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey) ?? ""
+        // Escape for JS safety (JWTs shouldn't need this, but be defensive)
+        let escapedToken = savedToken
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+
         return """
         window.__aaNativeDiag = {
           deviceModel: '\(machineStr)',
@@ -471,8 +610,32 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           deviceName: '\(deviceName)',
           appVersion: '\(appVersion)',
           buildNumber: '\(buildNumber)',
-          dataStoreType: '\(storeType)'
+          dataStoreType: '\(storeType)',
+          hasNativeToken: \(hasNativeToken ? "true" : "false"),
+          nativeTokenLen: \(nativeTokenLen)
         };
+        // Build 9: Restore token from UserDefaults → localStorage on cold boot.
+        // This is the DOWN sync: native persistence → web persistence.
+        // Only restores if localStorage has NO auth token (cleared by WebKit, reinstall, etc.)
+        (function restoreTokenFromNative() {
+          if (!\(hasNativeToken ? "true" : "false")) return; // No token in UserDefaults
+          try {
+            var keys = ['base44_access_token', 'token', 'access_token', 'base44_auth_token'];
+            var anyPresent = false;
+            for (var i = 0; i < keys.length; i++) {
+              var val = localStorage.getItem(keys[i]);
+              if (val && val.length > 20) { anyPresent = true; break; }
+            }
+            if (!anyPresent) {
+              var nativeToken = '\(escapedToken)';
+              if (nativeToken.length > 20) {
+                localStorage.setItem('token', nativeToken);
+                localStorage.setItem('base44_auth_token', nativeToken);
+                window.__aaNativeDiag.tokenRestored = true;
+              }
+            }
+          } catch(e) {}
+        })();
         """
     }
 
@@ -1099,8 +1262,61 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
       }
 
+      // ── 3b. LAST ERROR TRACKING (Build 8) ──
+      // Stores the last error for diagnostics. Never stores raw tokens or PII.
+      window.__AA_LAST_ERROR = null;
+
+      function storeLastError(msg, source) {
+        try {
+          // Sanitize: strip anything that looks like a token (long base64 strings)
+          var safe = String(msg || '').substring(0, 300);
+          safe = safe.replace(/[A-Za-z0-9_-]{40,}/g, '[REDACTED]');
+          window.__AA_LAST_ERROR = {
+            message: safe,
+            source: source || 'unknown',
+            timestamp: new Date().toISOString(),
+            url: window.location.pathname + (window.location.hash || '')
+          };
+        } catch(e) {}
+      }
+
+      // ── 3c. CONSOLE.ERROR INTERCEPTION (Build 8) ──
+      // Catches React error boundary logs and other console.error calls.
+      var _origConsoleError = console.error;
+      var lastConsoleErrorTime = 0;
+      console.error = function() {
+        _origConsoleError.apply(console, arguments);
+        try {
+          var now = Date.now();
+          if (now - lastConsoleErrorTime < 1000) return; // debounce 1s
+          lastConsoleErrorTime = now;
+          var msg = '';
+          for (var i = 0; i < arguments.length; i++) {
+            var arg = arguments[i];
+            if (arg && arg.message) msg += arg.message + ' ';
+            else if (typeof arg === 'string') msg += arg + ' ';
+          }
+          if (msg.length > 0) {
+            storeLastError(msg.trim(), 'console.error');
+            // Detect React invariant violations via console.error
+            if (msg.indexOf('Minified React error') !== -1 ||
+                msg.indexOf('Invariant Violation') !== -1 ||
+                msg.indexOf('must be used within') !== -1) {
+              setTimeout(function() {
+                if (msg.indexOf('must be used within') !== -1) {
+                  handleSelectTriggerCrash();
+                } else {
+                  detectAndFixErrorScreen();
+                }
+              }, 500);
+            }
+          }
+        } catch(e) {}
+      };
+
       window.addEventListener('error', function(event) {
         var msg = (event.error && event.error.message) || event.message || '';
+        storeLastError(msg, 'window.onerror');
         if (msg.indexOf('must be used within') !== -1) {
           event.preventDefault();
           event.stopImmediatePropagation && event.stopImmediatePropagation();
@@ -1116,6 +1332,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
       window.addEventListener('unhandledrejection', function(event) {
         var msg = (event.reason && event.reason.message) || String(event.reason || '');
+        storeLastError(msg, 'unhandledrejection');
         if (msg.indexOf('must be used within') !== -1) {
           event.preventDefault();
           setTimeout(handleSelectTriggerCrash, 300);
@@ -1304,8 +1521,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       })();
 
       function collectDiagnostics() {
+        // Refresh token metadata each time diagnostics are collected
+        window.__AA_TOKEN_META = computeTokenMeta();
+
         var native = window.__aaNativeDiag || {};
-        var tokenKeys = ['base44_access_token', 'base44_refresh_token', 'base44_user', 'access_token', 'refresh_token'];
+        var tokenKeys = ['base44_access_token', 'base44_refresh_token', 'base44_auth_token', 'base44_user', 'access_token', 'refresh_token', 'token'];
         var authPresence = {};
         var tokenLengths = {};
         tokenKeys.forEach(function(k) {
@@ -1316,13 +1536,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           } catch(e) { authPresence[k] = 'error'; }
         });
 
-        var capPrefPresent = 'unknown';
-        var capPrefLength = 0;
-        try {
-          var capVal = localStorage.getItem('CapacitorStorage.aa_token');
-          capPrefPresent = capVal !== null;
-          if (capVal !== null) capPrefLength = capVal.length;
-        } catch(e) {}
+        // Native token persistence (UserDefaults) — injected by Swift at document start
+        var nativeDiag = window.__aaNativeDiag || {};
+        var nativeTokenPresent = nativeDiag.hasNativeToken || false;
+        var nativeTokenLen = nativeDiag.nativeTokenLen || 0;
+        var tokenRestoredFromNative = nativeDiag.tokenRestored || false;
 
         var lsKeyCount = 0;
         try { lsKeyCount = localStorage.length; } catch(e) {}
@@ -1349,8 +1567,52 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           if (tokenLengths[k]) line += ' (len=' + tokenLengths[k] + ')';
           lines.push(line);
         });
-        lines.push('  CapacitorStorage.aa_token: ' + capPrefPresent + (capPrefLength ? ' (len=' + capPrefLength + ')' : ''));
+        lines.push('  --- Native Persistence (UserDefaults) ---');
+        lines.push('  UserDefaults token: ' + (nativeTokenPresent ? 'true (len=' + nativeTokenLen + ')' : 'false'));
+        if (tokenRestoredFromNative) {
+          lines.push('  Token restored from UserDefaults: YES');
+        }
         lines.push('  localStorage total keys: ' + lsKeyCount);
+        lines.push('');
+        lines.push('-- Network --');
+        lines.push('  Online: ' + (typeof navigator.onLine !== 'undefined' ? navigator.onLine : 'unknown'));
+        try {
+          var conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+          if (conn) {
+            lines.push('  EffectiveType: ' + (conn.effectiveType || 'unknown'));
+            lines.push('  Downlink: ' + (conn.downlink !== undefined ? conn.downlink + ' Mbps' : 'unknown'));
+            lines.push('  RTT: ' + (conn.rtt !== undefined ? conn.rtt + 'ms' : 'unknown'));
+          } else {
+            lines.push('  Connection API: not available');
+          }
+        } catch(e) {
+          lines.push('  Connection: error reading');
+        }
+        lines.push('');
+        lines.push('-- Session Validation (Build 8) --');
+        lines.push('  Status: ' + (window.__AA_SESSION_STATUS || 'unknown'));
+        if (window.__AA_TOKEN_META) {
+          var tm = window.__AA_TOKEN_META;
+          lines.push('  Token has exp: ' + tm.hasExp);
+          if (tm.expiresAt) lines.push('  Expires: ' + tm.expiresAt);
+          if (tm.ageSeconds !== null) {
+            var hrs = Math.floor(tm.ageSeconds / 3600);
+            var mins = Math.floor((tm.ageSeconds % 3600) / 60);
+            lines.push('  Time remaining: ' + hrs + 'h ' + mins + 'm');
+          }
+          lines.push('  Expired: ' + tm.isExpired);
+        }
+        lines.push('');
+        lines.push('-- Last Error --');
+        if (window.__AA_LAST_ERROR) {
+          var le = window.__AA_LAST_ERROR;
+          lines.push('  Message: ' + (le.message || 'none'));
+          lines.push('  Source: ' + (le.source || 'unknown'));
+          lines.push('  Time: ' + (le.timestamp || 'unknown'));
+          lines.push('  URL: ' + (le.url || 'unknown'));
+        } else {
+          lines.push('  No errors captured');
+        }
         lines.push('');
         lines.push('-- Login --');
         lines.push('  Method: Email/Password only (Google hidden on iOS)');
@@ -1625,6 +1887,117 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           showLogoutConfirmation();
         });
       }
+
+      // ── 6d. SESSION VALIDATION (Build 8) ──
+      // Detects stale/expired tokens and clears them before the React app mounts.
+      // This prevents "logged in but broken" states where an expired JWT sits in localStorage.
+      // Loop guard: only runs once per page load via sessionStorage key.
+
+      window.__AA_SESSION_STATUS = 'unknown';
+      window.__AA_TOKEN_META = null;
+
+      // Parse JWT expiry (base64url decode payload). Reusable.
+      function parseJwtExp(jwt) {
+        try {
+          var parts = jwt.split('.');
+          if (parts.length !== 3) return null;
+          var payload = parts[1];
+          payload = payload.replace(/-/g, '+').replace(/_/g, '/');
+          while (payload.length % 4 !== 0) payload += '=';
+          var decoded = atob(payload);
+          var obj = JSON.parse(decoded);
+          return obj.exp ? Number(obj.exp) : null;
+        } catch(e) {
+          return null;
+        }
+      }
+
+      // Compute token metadata snapshot (called at validation + diagnostics time)
+      // Checks multiple token keys since Base44 may use different keys at different times
+      function computeTokenMeta() {
+        var token = null;
+        var tokenKeys = ['base44_access_token', 'token', 'access_token', 'base44_auth_token'];
+        for (var i = 0; i < tokenKeys.length; i++) {
+          try {
+            var val = localStorage.getItem(tokenKeys[i]);
+            if (val && val.length > 20) { token = val; break; }
+          } catch(e) {}
+        }
+        if (!token) return null;
+        var exp = parseJwtExp(token);
+        var now = Math.floor(Date.now() / 1000);
+        return {
+          hasExp: !!exp,
+          expiresAt: exp ? new Date(exp * 1000).toISOString() : null,
+          ageSeconds: exp ? (exp - now) : null,
+          isExpired: exp ? (exp < now) : false,
+          tokenLength: token.length
+        };
+      }
+
+      (function validateSession() {
+        var guardKey = 'aa-session-validated';
+        var alreadyRan = sessionStorage.getItem(guardKey) === '1';
+
+        // Always recompute token metadata (so diagnostics are always fresh)
+        window.__AA_TOKEN_META = computeTokenMeta();
+
+        if (alreadyRan) {
+          // Preserve the original validation result stored in sessionStorage
+          var prevResult = sessionStorage.getItem('aa-session-result') || 'already-checked';
+          window.__AA_SESSION_STATUS = prevResult;
+          return;
+        }
+        sessionStorage.setItem(guardKey, '1');
+
+        // Check multiple token keys — Base44 SDK may use different keys
+        var token = null;
+        var tokenSearchKeys = ['base44_access_token', 'token', 'access_token', 'base44_auth_token'];
+        for (var ti = 0; ti < tokenSearchKeys.length; ti++) {
+          try {
+            var tv = localStorage.getItem(tokenSearchKeys[ti]);
+            if (tv && tv.length > 20) { token = tv; break; }
+          } catch(e) {}
+        }
+        if (!token) {
+          window.__AA_SESSION_STATUS = 'no-token';
+          sessionStorage.setItem('aa-session-result', 'no-token');
+          return;
+        }
+
+        var exp = parseJwtExp(token);
+        var now = Math.floor(Date.now() / 1000);
+
+        if (exp && exp < now) {
+          // Token is expired — clear all auth keys so React shows login
+          window.__AA_SESSION_STATUS = 'expired-cleared';
+          sessionStorage.setItem('aa-session-result', 'expired-cleared');
+          var authKeys = [
+            'base44_access_token', 'base44_refresh_token', 'base44_auth_token',
+            'base44_user', 'access_token', 'refresh_token', 'token',
+            'CapacitorStorage.aa_token', 'CapacitorStorage.base44_auth_token'
+          ];
+          authKeys.forEach(function(key) {
+            try { localStorage.removeItem(key); } catch(e) {}
+          });
+          // Recompute after clearing
+          window.__AA_TOKEN_META = computeTokenMeta();
+          return;
+        }
+
+        // Token exists and not expired (or no exp field)
+        var hasUser = false;
+        try { hasUser = !!localStorage.getItem('base44_user'); } catch(e) {}
+
+        if (hasUser) {
+          window.__AA_SESSION_STATUS = 'valid';
+          sessionStorage.setItem('aa-session-result', 'valid');
+        } else {
+          // Token exists but user data missing — flag it, let React rehydrate
+          window.__AA_SESSION_STATUS = 'token-no-user';
+          sessionStorage.setItem('aa-session-result', 'token-no-user');
+        }
+      })();
 
       // ── 7. ORCHESTRATOR ──
 

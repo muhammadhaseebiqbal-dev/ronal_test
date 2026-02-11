@@ -116,6 +116,11 @@ npm run test           # Unit tests
 | "or" divider visible after Google hidden | ✅ FIXED — Broad sweep hides all or/divider/separator elements on login page |
 | Prayer Wall squashed/not responsive | ✅ FIXED — CSS grid forced to 1-column on mobile, overflow hidden |
 | No Log Out button | ✅ FIXED — Build 7: Injected on More/Settings page. Clears localStorage, cookies, WKWebView data, Capacitor Preferences. Navigates to Login. Confirmation dialog. |
+| Session validation `no-token` false positive | ✅ FIXED — Build 8.1: Now checks 4 token keys instead of just `base44_access_token`. Base44 SDK stores token under `token` key initially. |
+| localStorage random clearing (iOS 17.4+) | ✅ FIXED — Build 8.1: Shared static `WKProcessPool` per Apple developer docs recommendation. |
+| Cookie sync lag | ✅ FIXED — Build 8.1: `WKHTTPCookieStoreObserver` auto-persists cookies on any change. iOS 26 batch API for atomic sync. |
+| Token not in native persistence | ✅ FIXED — Build 9: Native Swift two-way sync. UP: `syncTokenToUserDefaults()` reads localStorage via JS eval, saves to UserDefaults (on load, resume, background). DOWN: `buildNativeDiagJS()` restores token from UserDefaults → localStorage at document start. Previous tokenStorage.js fix was dead code (remote URL mode). |
+| src/ JS is dead code in production | ⚠️ KNOWN — With `server.url` set, WKWebView loads remote site's JS. Local `dist/` bundle never executes. All runtime fixes must be in Swift or injected WKUserScript. |
 
 ## Safari Web Inspector Diagnostics
 ```javascript
@@ -156,6 +161,30 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 ---
 
 ## Last Change Log
+
+**2026-02-11 — Raouf: Build 9 — Native Token Two-Way Sync (Swift ↔ localStorage)**
+- **Critical discovery**: `src/lib/tokenStorage.js` and `src/context/AuthContext.jsx` are DEAD CODE in production. With `server.url` set, WKWebView loads the remote site's own JS — our local bundle never executes. Token persistence must be done entirely in native Swift.
+- **UP sync**: `syncTokenToUserDefaults()` in Swift evaluates JS to read localStorage tokens, saves to UserDefaults. Called after page load (+3s, +10s), foreground resume (+1s), and before background entry.
+- **DOWN sync**: `buildNativeDiagJS()` at `.atDocumentStart` reads token from UserDefaults, restores to localStorage if missing. Runs on every cold boot BEFORE React mounts.
+- **Diagnostics**: Replaced useless `CapacitorStorage.*` checks with actual `UserDefaults token: true/false (len=N)`.
+- **Logout**: `performFullLogout()` now clears UserDefaults token.
+- **Build number**: 8 → 9
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild ✅
+
+**2026-02-11 — Raouf: Build 8.1 — Apple Docs Fixes (WKProcessPool, Cookie Observer, Multi-Key Validation)**
+- **Root cause fix**: `validateSession()` only checked `base44_access_token`, but at `atDocumentEnd` time React hasn't set it yet. Base44 SDK uses `token` key initially. Now checks 4 keys: `base44_access_token`, `token`, `access_token`, `base44_auth_token`.
+- **Shared WKProcessPool** (Apple docs): Static singleton prevents iOS 17.4+ localStorage random clearing bug.
+- **WKHTTPCookieStoreObserver**: Auto-persists domain cookies WKHTTPCookieStore → HTTPCookieStorage.shared on any change.
+- **iOS 26 batch setCookies**: Uses `setCookies(_:completionHandler:)` on iOS 26+, falls back to DispatchGroup loop on iOS 15–25.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild ✅
+
+**2026-02-11 — Raouf: Build 8 — Crash Resilience + Session Diagnostics + Token Validation**
+- **Part 1 — Crash Resilience**: Added `window.__AA_LAST_ERROR` tracking (stores sanitized error message, source, timestamp, URL). Added `console.error` interception to catch React error boundary logs and Minified React errors. Long base64 strings (40+ chars) are auto-redacted from error messages.
+- **Part 2 — Diagnostics Upgrade**: Enhanced `collectDiagnostics()` with: JWT token expiry/age parsing (refreshed each time diagnostics open), `navigator.onLine` status, `navigator.connection.effectiveType` + downlink + RTT, session validation status, last captured error details. Added `base44_auth_token` + `token` to key checks. Fixed CapacitorStorage note (UserDefaults not visible from JS).
+- **Part 3 — Session Validation**: On page load, parses JWT `exp` field from `base44_access_token`. If expired: auto-clears all auth keys so React shows login. If token exists but no `base44_user`: flags as `token-no-user` for diagnostics. Stores token metadata (hasExp, expiresAt, ageSeconds, isExpired) — never the token itself. Loop guard via `sessionStorage`. **Fix**: Original validation result now preserved across page reloads (stored in `sessionStorage('aa-session-result')`) instead of being overwritten with `already-checked`. Token metadata recomputed fresh each time diagnostics are opened.
+- **Part 4 — Safety**: Verified no raw tokens or PII in any logging path. `storeLastError()` redacts long base64 strings. `__AA_TOKEN_META` stores only metadata. All diagnostics show presence + length only.
+- **Build number**: Bumped 6 → 8 (Debug + Release)
+- Verification: npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED 0 warnings
 
 **2026-02-11 — Raouf: Build 7 — Log Out button (Stage One #7)**
 - Added proper Log Out button on More/Settings page via injected JS+CSS in PatchedBridgeViewController
@@ -276,6 +305,19 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 8 — Crash Resilience + Session Diagnostics + Token Validation
+- **Summary:** 5-part hardening of PatchedBridgeViewController injected JS. (1) Added `window.__AA_LAST_ERROR` error tracking with sanitized messages + `console.error` interception for React boundary catches. (2) Enhanced diagnostics overlay with JWT token expiry/age, network status (online/effectiveType/downlink/RTT), session validation status, and last captured error. (3) Added JWT-based session validation on page load — auto-clears expired tokens, flags token-without-user states. (4) Safety audit confirmed: no raw tokens or PII in any path, long base64 strings auto-redacted. (5) Full build pipeline verified green.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added error tracking infrastructure (storeLastError, console.error interceptor), session validation with JWT parsing (validateSession IIFE), enhanced collectDiagnostics with network/session/error sections
+  - `AGENT.md` — Updated Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED 0 warnings
+- **Follow-ups:**
+  - Roland tests on iPhone: trigger diagnostics (5-tap) → verify new sections (Network, Session Validation, Last Error)
+  - Test expired token scenario: manually set expired JWT in localStorage → reopen app → should auto-clear and show login
 
 **Raouf:**
 - **Date:** 2026-02-11 (Australia/Sydney)

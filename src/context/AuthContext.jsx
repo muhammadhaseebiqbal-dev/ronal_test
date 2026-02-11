@@ -8,7 +8,7 @@ import {
     getTokenFromLocation,
     clearTokenFromLocation
 } from '@/lib/app-params';
-import { saveToken, loadToken, clearToken } from '@/lib/tokenStorage';
+import { saveToken, loadToken, clearToken, syncTokenLayers } from '@/lib/tokenStorage';
 import { initDeepLinkListener, getOAuthCallbackUrl, openOAuthLogin } from '@/lib/deepLinkHandler';
 import { log, error as logError } from '@/lib/logger';
 
@@ -66,6 +66,10 @@ export const AuthProvider = ({ children }) => {
         appParams.token = token;
         base44.setToken(token, !isCapacitorRuntime());
 
+        // Persist to both Preferences and localStorage
+        await saveToken(token);
+        await syncTokenLayers(token);
+
         await checkUserAuthWithToken(token);
     };
 
@@ -95,6 +99,19 @@ export const AuthProvider = ({ children }) => {
                 log('[auth] restoring token');
                 token = await loadToken();
                 log('[auth] token restored:', !!token);
+
+                // If Preferences was empty but localStorage has a token (Base44 SDK set it),
+                // use the localStorage token as the source of truth.
+                if (!token && t) {
+                    log('[auth] Preferences empty, using localStorage token');
+                    token = t;
+                }
+            }
+
+            // Two-way sync: ensure token is in BOTH localStorage and Preferences.
+            // Fixes the gap where Base44 SDK stores in localStorage only.
+            if (token && isCapacitorRuntime()) {
+                await syncTokenLayers(token);
             }
 
             setCurrentToken(token);
