@@ -14,7 +14,45 @@ All notable changes to this project will be documented in this file.
 | 4 | Builder loads | ✅ FIXED (Build 6) |
 | 5 | Prayer Wall loads and is not squashed, back navigation works | ✅ FIXED (Build 6) |
 | 6 | Prayer List does not white-screen | ✅ FIXED (Build 6) |
-| 7 | **Log out button** in More/Settings that fully signs the user out, clears stored auth state, and returns to Login screen (so a different account can log in) | ⬜ TODO — must be included in next build |
+| 7 | **Log out button** in More/Settings that fully signs the user out, clears stored auth state, and returns to Login screen (so a different account can log in) | ✅ FIXED (Build 7) |
+
+---
+
+### 2026-02-11 — Raouf: Build 7 — Log Out button (Stage One #7)
+
+**Scope:** Add a proper Log Out button in More/Settings that fully signs the user out, clears stored auth state, and returns to the Login screen so a different account can log in.
+
+**What changed:**
+1. **Log Out button injected on More/Settings page**
+   - Detects `/more`, `/settings`, `/profile`, `/account` routes (pathname + hash).
+   - Renders a styled button at the bottom of the page content with a door-arrow logout icon.
+   - Outlined red border style (`#dc2626`), system font, 48px min tap target.
+   - Auto-removes when navigating away from those routes.
+2. **Confirmation dialog**
+   - Tapping "Log Out" shows a centered modal with "Are you sure?" message.
+   - Two buttons: "Log Out" (red) and "Cancel" (gray). Dismisses on background tap.
+3. **Full auth state cleanup**
+   - **JS**: Clears all localStorage auth keys (`base44_access_token`, `base44_refresh_token`, `base44_auth_token`, `base44_user`, `access_token`, `refresh_token`, `token`, `CapacitorStorage.aa_token`, `CapacitorStorage.base44_auth_token`).
+   - **JS**: Clears sessionStorage recovery keys (`aa-*` / `aa_*` prefixes).
+   - **Native**: `aaLogout` WKScriptMessageHandler triggers `performFullLogout()` in Swift.
+   - **Native**: Deletes all cookies for `abideandanchor.app` from `HTTPCookieStorage.shared`.
+   - **Native**: Deletes all cookies for domain from `WKHTTPCookieStore`.
+   - **Native**: Removes all `WKWebsiteDataStore` records for the domain (localStorage, sessionStorage, IndexedDB, cookies, cache).
+   - **Native**: Navigates WebView to `https://abideandanchor.app/login`.
+4. **Wired into orchestrator**
+   - `injectLogoutButton()` runs on every DOM mutation cycle alongside other patch functions.
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — Added `aaLogout` handler, `performFullLogout()`, logout CSS+JS, orchestrator wiring
+- `AGENT.md` — Updated Known Issues, Stage One table, Last Change Log, Update Log
+- `CHANGELOG.md` — This entry
+
+**Verification:**
+- `npm run lint` → 0 errors ✅
+- `npm run test` → 42/42 passed ✅
+- `npm run build` → success ✅
+- `npx cap sync ios` → 3 plugins ✅
+- `xcodebuild Release` → BUILD SUCCEEDED, 0 warnings on PatchedBridgeViewController ✅
 
 ---
 

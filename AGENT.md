@@ -115,6 +115,7 @@ npm run test           # Unit tests
 | Back button under clock/notch | ✅ FIXED — Fixed position with safe-area-inset-top + 52px offset below header |
 | "or" divider visible after Google hidden | ✅ FIXED — Broad sweep hides all or/divider/separator elements on login page |
 | Prayer Wall squashed/not responsive | ✅ FIXED — CSS grid forced to 1-column on mobile, overflow hidden |
+| No Log Out button | ✅ FIXED — Build 7: Injected on More/Settings page. Clears localStorage, cookies, WKWebView data, Capacitor Preferences. Navigates to Login. Confirmation dialog. |
 
 ## Safari Web Inspector Diagnostics
 ```javascript
@@ -150,11 +151,27 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 | 4 | Builder loads | ✅ FIXED (Build 6) |
 | 5 | Prayer Wall loads and is not squashed, back navigation works | ✅ FIXED (Build 6) |
 | 6 | Prayer List does not white-screen | ✅ FIXED (Build 6) |
-| 7 | **Log out button** in More/Settings that fully signs the user out, clears stored auth state, and returns to Login screen (so a different account can log in) | ⬜ TODO |
+| 7 | **Log out button** in More/Settings that fully signs the user out, clears stored auth state, and returns to Login screen (so a different account can log in) | ✅ FIXED (Build 7) |
 
 ---
 
 ## Last Change Log
+
+**2026-02-11 — Raouf: Build 7 — Log Out button (Stage One #7)**
+- Added proper Log Out button on More/Settings page via injected JS+CSS in PatchedBridgeViewController
+- Button matches app aesthetic: outlined red border, system font, door-arrow icon, 48px min tap target
+- Confirmation dialog before logout ("Are you sure?") with Log Out / Cancel buttons
+- Full auth state cleanup on logout:
+  - JS: clears all localStorage auth keys (base44_access_token, base44_refresh_token, etc.)
+  - JS: clears sessionStorage recovery keys (aa-* prefixes)
+  - Native: clears HTTPCookieStorage cookies for domain
+  - Native: clears WKHTTPCookieStore cookies for domain
+  - Native: clears WKWebsiteDataStore records (localStorage, sessionStorage, IndexedDB, cache)
+  - Native: navigates WebView to /login
+- Added `aaLogout` WKScriptMessageHandler for JS→Native communication
+- Button auto-injects on /more, /settings, /profile, /account routes (pathname + hash)
+- Button auto-removes when navigating away from those routes
+- Verification: xcodebuild Release ✅ BUILD SUCCEEDED, 0 warnings
 
 **2026-02-11 — Raouf: Build 6 — SelectTrigger real recovery for Prayer Request/Builder**
 - Replaced overlay-first handling with route-specific hard recovery for `SelectTrigger must be used within Select` on prayer `request`/`builder` routes
@@ -259,6 +276,18 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-11 (Australia/Sydney)
+- **Scope:** Build 7 — Log Out button in More/Settings (Stage One acceptance #7)
+- **Summary:** Implemented a proper Log Out button that appears on the More/Settings page. The button is injected via JS in PatchedBridgeViewController and styled to match the app's aesthetic (outlined red, system font, logout icon). Tapping shows a confirmation dialog. On confirm, JS clears all localStorage/sessionStorage auth keys, then posts to native `aaLogout` handler which clears HTTPCookieStorage, WKHTTPCookieStore, and all WKWebsiteDataStore records for the domain, then navigates to /login. This allows a different account to log in.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added `aaLogout` message handler + `performFullLogout()` Swift method, CSS for logout button + confirmation dialog, JS `injectLogoutButton()` + `showLogoutConfirmation()` + `performLogout()` + `isMoreOrSettingsRoute()`, wired into orchestrator
+  - `AGENT.md` — Updated Known Issues, Stage One table, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED 0 warnings
+- **Follow-ups:**
+  - Roland tests on iPhone: navigate to More → tap Log Out → confirm → verify returns to Login → log in with different account
 
 **Raouf:**
 - **Date:** 2026-02-11 (Australia/Sydney)

@@ -35,6 +35,63 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             UIPasteboard.general.string = text
             os_log(.info, log: Self.log, "[DIAG:copy] Diagnostics copied to clipboard (%d chars)", text.count)
         }
+
+        if message.name == "aaLogout" {
+            os_log(.info, log: Self.log, "[LOGOUT] Native logout triggered — clearing all auth state")
+            performFullLogout()
+        }
+    }
+
+    // MARK: – Full Logout (clears all auth state so a different account can log in)
+
+    /// Clears cookies, WKWebView website data, and navigates to login screen.
+    /// Called from JS via aaLogout message handler.
+    private func performFullLogout() {
+        guard let webView = self.webView else {
+            os_log(.error, log: Self.log, "[LOGOUT] webView is nil — cannot logout")
+            return
+        }
+
+        // 1. Clear ALL cookies for our domain from HTTPCookieStorage
+        if let cookies = HTTPCookieStorage.shared.cookies {
+            let domainCookies = cookies.filter { $0.domain.contains(serverDomain) || $0.domain == ".\(serverDomain)" }
+            for cookie in domainCookies {
+                HTTPCookieStorage.shared.deleteCookie(cookie)
+            }
+            os_log(.info, log: Self.log, "[LOGOUT] Cleared %d cookies from HTTPCookieStorage", domainCookies.count)
+        }
+
+        // 2. Clear ALL cookies from WKHTTPCookieStore
+        let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+        cookieStore.getAllCookies { cookies in
+            let domainCookies = cookies.filter { $0.domain.contains(self.serverDomain) }
+            for cookie in domainCookies {
+                cookieStore.delete(cookie) {}
+            }
+            os_log(.info, log: Self.log, "[LOGOUT] Cleared %d cookies from WKHTTPCookieStore", domainCookies.count)
+        }
+
+        // 3. Clear WKWebView website data (localStorage, sessionStorage, cookies, cache)
+        let dataStore = webView.configuration.websiteDataStore
+
+        dataStore.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
+            let domainRecords = records.filter { record in
+                record.displayName.contains(self.serverDomain) || record.displayName.contains("abideandanchor")
+            }
+            dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: domainRecords) {
+                os_log(.info, log: Self.log, "[LOGOUT] Cleared %d WKWebsiteDataStore records", domainRecords.count)
+
+                // 4. Navigate to login page
+                DispatchQueue.main.async {
+                    if let loginURL = URL(string: "https://\(self.serverDomain)/login") {
+                        os_log(.info, log: Self.log, "[LOGOUT] Navigating to %{public}@", loginURL.absoluteString)
+                        webView.load(URLRequest(url: loginURL))
+                    }
+                }
+            }
+        }
+
+        logDiagnostics(event: "logout")
     }
 
     // MARK: – Lifecycle
@@ -350,8 +407,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         guard let webView = self.webView else { return }
         let controller = webView.configuration.userContentController
 
-        // Register native message handler for diagnostics clipboard copy
+        // Register native message handlers
         controller.add(self, name: "aaCopyDiagnostics")
+        controller.add(self, name: "aaLogout")
 
         // Inject native diagnostics data at DOCUMENT START so it's available
         // before any other scripts run (fixes "unknown" race condition)
@@ -558,6 +616,88 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         /* Ensure prayer pages have proper padding for fixed back button */
         main {
           padding-top: max(calc(env(safe-area-inset-top, 44px) + 8px), 52px) !important;
+        }
+
+        /* ── B11: Log Out button on More/Settings page ── */
+        #aa-logout-section {
+          margin: 24px 16px 40px 16px;
+          padding: 0;
+        }
+        #aa-logout-btn {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          width: 100%;
+          padding: 14px 20px;
+          background: transparent;
+          border: 1.5px solid #dc2626;
+          border-radius: 12px;
+          color: #dc2626;
+          font-size: 16px;
+          font-weight: 600;
+          font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+          cursor: pointer;
+          -webkit-tap-highlight-color: transparent;
+          transition: background 0.15s, color 0.15s;
+          min-height: 48px;
+          box-sizing: border-box;
+        }
+        #aa-logout-btn:active {
+          background: #dc2626;
+          color: #ffffff;
+        }
+        #aa-logout-confirm-overlay {
+          position: fixed;
+          top: 0; left: 0; right: 0; bottom: 0;
+          background: rgba(0,0,0,0.6);
+          z-index: 99998;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 24px;
+        }
+        #aa-logout-confirm-card {
+          background: #ffffff;
+          border-radius: 16px;
+          padding: 28px 24px;
+          max-width: 320px;
+          width: 100%;
+          text-align: center;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+          font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+        }
+        #aa-logout-confirm-card h3 {
+          margin: 0 0 8px 0;
+          font-size: 18px;
+          font-weight: 700;
+          color: #1e293b;
+        }
+        #aa-logout-confirm-card p {
+          margin: 0 0 20px 0;
+          font-size: 14px;
+          color: #64748b;
+          line-height: 1.5;
+        }
+        .aa-logout-confirm-btn {
+          display: block;
+          width: 100%;
+          padding: 13px;
+          border: none;
+          border-radius: 10px;
+          font-size: 16px;
+          font-weight: 600;
+          cursor: pointer;
+          -webkit-tap-highlight-color: transparent;
+          margin-bottom: 8px;
+        }
+        .aa-logout-confirm-yes {
+          background: #dc2626;
+          color: #ffffff;
+        }
+        .aa-logout-confirm-cancel {
+          background: #f1f5f9;
+          color: #334155;
         }
 
         /* ── B10: Diagnostics overlay ── */
@@ -1318,6 +1458,174 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         window.addEventListener('hashchange', checkDiagRoute);
       })();
 
+      // ── 6c. LOG OUT BUTTON (Build 7 — Stage One #7) ──
+      // Injects a "Log Out" button on the More / Settings page.
+      // Fully signs the user out: clears localStorage, cookies, Capacitor Preferences,
+      // WKWebView data, and returns to the Login screen.
+
+      function isMoreOrSettingsRoute() {
+        var path = window.location.pathname.toLowerCase();
+        var hash = (window.location.hash || '').toLowerCase();
+        return path === '/more' || path.indexOf('/more/') === 0 ||
+               path === '/settings' || path.indexOf('/settings/') === 0 ||
+               path === '/profile' || path.indexOf('/profile/') === 0 ||
+               path === '/account' || path.indexOf('/account/') === 0 ||
+               hash.indexOf('/more') !== -1 || hash.indexOf('/settings') !== -1 ||
+               hash.indexOf('/profile') !== -1 || hash.indexOf('/account') !== -1;
+      }
+
+      function performLogout() {
+        // 1. Clear ALL auth-related localStorage keys
+        var authKeys = [
+          'base44_access_token', 'base44_refresh_token', 'base44_auth_token',
+          'base44_user', 'access_token', 'refresh_token', 'token',
+          'CapacitorStorage.aa_token', 'CapacitorStorage.base44_auth_token'
+        ];
+        authKeys.forEach(function(key) {
+          try { localStorage.removeItem(key); } catch(e) {}
+        });
+
+        // 2. Clear sessionStorage recovery keys
+        try {
+          var ssKeys = [];
+          for (var i = 0; i < sessionStorage.length; i++) {
+            var k = sessionStorage.key(i);
+            if (k && (k.indexOf('aa-') === 0 || k.indexOf('aa_') === 0)) {
+              ssKeys.push(k);
+            }
+          }
+          ssKeys.forEach(function(k) { sessionStorage.removeItem(k); });
+        } catch(e) {}
+
+        // 3. Tell native side to clear cookies + WKWebView data + navigate to login
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaLogout) {
+          window.webkit.messageHandlers.aaLogout.postMessage('logout');
+        } else {
+          // Fallback for web: just navigate to login
+          window.location.href = '/login';
+        }
+      }
+
+      function showLogoutConfirmation() {
+        // Remove any existing confirmation
+        var existing = document.getElementById('aa-logout-confirm-overlay');
+        if (existing) { existing.remove(); return; }
+
+        var overlay = document.createElement('div');
+        overlay.id = 'aa-logout-confirm-overlay';
+
+        var card = document.createElement('div');
+        card.id = 'aa-logout-confirm-card';
+
+        var heading = document.createElement('h3');
+        heading.textContent = 'Log Out';
+        card.appendChild(heading);
+
+        var desc = document.createElement('p');
+        desc.textContent = 'Are you sure you want to log out? You will need to sign in again to access your account.';
+        card.appendChild(desc);
+
+        var yesBtn = document.createElement('button');
+        yesBtn.className = 'aa-logout-confirm-btn aa-logout-confirm-yes';
+        yesBtn.id = 'aa-logout-yes';
+        yesBtn.textContent = 'Log Out';
+        card.appendChild(yesBtn);
+
+        var cancelBtn = document.createElement('button');
+        cancelBtn.className = 'aa-logout-confirm-btn aa-logout-confirm-cancel';
+        cancelBtn.id = 'aa-logout-cancel';
+        cancelBtn.textContent = 'Cancel';
+        card.appendChild(cancelBtn);
+
+        overlay.appendChild(card);
+        document.body.appendChild(overlay);
+
+        yesBtn.addEventListener('click', function() {
+          overlay.remove();
+          performLogout();
+        });
+        cancelBtn.addEventListener('click', function() {
+          overlay.remove();
+        });
+        // Dismiss on background tap
+        overlay.addEventListener('click', function(e) {
+          if (e.target === overlay) overlay.remove();
+        });
+      }
+
+      function injectLogoutButton() {
+        if (!isMoreOrSettingsRoute()) {
+          // Remove logout button if navigated away
+          var stale = document.getElementById('aa-logout-section');
+          if (stale) stale.remove();
+          return;
+        }
+
+        // Don't inject twice
+        if (document.getElementById('aa-logout-section')) return;
+
+        var root = document.getElementById('root');
+        if (!root) return;
+
+        // Find the best container to append to
+        var container = root.querySelector('main') ||
+                        root.querySelector('[class*="scroll"]') ||
+                        root.querySelector('[class*="content"]') ||
+                        root;
+
+        // Wait until the page has some content (avoid injecting into loading state)
+        var text = (container.innerText || '').trim();
+        if (text.length < 10) return;
+
+        var section = document.createElement('div');
+        section.id = 'aa-logout-section';
+
+        var btn = document.createElement('button');
+        btn.id = 'aa-logout-btn';
+
+        // Logout icon (door-arrow SVG)
+        var svgNS = 'http://www.w3.org/2000/svg';
+        var svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('width', '18');
+        svg.setAttribute('height', '18');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', 'currentColor');
+        svg.setAttribute('stroke-width', '2');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+
+        var path1 = document.createElementNS(svgNS, 'path');
+        path1.setAttribute('d', 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4');
+        svg.appendChild(path1);
+
+        var poly = document.createElementNS(svgNS, 'polyline');
+        poly.setAttribute('points', '16 17 21 12 16 7');
+        svg.appendChild(poly);
+
+        var line = document.createElementNS(svgNS, 'line');
+        line.setAttribute('x1', '21');
+        line.setAttribute('y1', '12');
+        line.setAttribute('x2', '9');
+        line.setAttribute('y2', '12');
+        svg.appendChild(line);
+
+        btn.appendChild(svg);
+
+        var label = document.createElement('span');
+        label.textContent = 'Log Out';
+        btn.appendChild(label);
+
+        section.appendChild(btn);
+        container.appendChild(section);
+
+        btn.addEventListener('click', function(e) {
+          e.preventDefault();
+          e.stopPropagation();
+          showLogoutConfirmation();
+        });
+      }
+
       // ── 7. ORCHESTRATOR ──
 
       var patchTimer = null;
@@ -1330,6 +1638,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           fixMissingBackButtons();
           detectAndFixErrorScreen();
           interceptGoogleAuth();
+          injectLogoutButton();
         }, 250);
       }
 
