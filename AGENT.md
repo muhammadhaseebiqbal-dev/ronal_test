@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone 3 — App Store submission preparation
+**Current Phase:** Milestone 3 — App Store submission preparation (Build 11)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -85,6 +85,7 @@ npm run test           # Unit tests
 | `src/context/AuthContext.jsx` | Auth state management |
 | `ios/App/App/Info.plist` | iOS app configuration |
 | `ios/App/App/PrivacyInfo.xcprivacy` | Apple privacy manifest (iOS 17+) |
+| `worker/companion-validator/index.js` | Cloudflare Worker for cross-device Companion validation |
 
 ## Known Issues (Status)
 | Issue | Status |
@@ -117,6 +118,7 @@ npm run test           # Unit tests
 | Prayer Wall squashed/not responsive | ✅ FIXED — CSS grid forced to 1-column on mobile, overflow hidden |
 | No Log Out button | ✅ FIXED — Build 7: Injected on More/Settings page. Clears localStorage, cookies, WKWebView data, Capacitor Preferences. Navigates to Login. Confirmation dialog. |
 | IAP Companion subscription not wired | ✅ FIXED — Build 10: StoreKit 2 purchase bridge. Web buttons trigger native purchase/restore. Entitlements persisted in UserDefaults (`aa_is_companion`). |
+| Companion unlock local-only (no cross-device) | ✅ FIXED — Build 11: Cloudflare Worker validates Apple JWS server-side, updates Base44 user entity. Desktop browsers check `/check-companion`. `window.__aaCheckCompanion()` available on all devices. |
 | Session validation `no-token` false positive | ✅ FIXED — Build 8.1: Now checks 4 token keys instead of just `base44_access_token`. Base44 SDK stores token under `token` key initially. |
 | localStorage random clearing (iOS 17.4+) | ✅ FIXED — Build 8.1: Shared static `WKProcessPool` per Apple developer docs recommendation. |
 | Cookie sync lag | ✅ FIXED — Build 8.1: `WKHTTPCookieStoreObserver` auto-persists cookies on any change. iOS 26 batch API for atomic sync. |
@@ -163,6 +165,17 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 
 ## Last Change Log
 
+**2026-02-14 — Raouf: Build 11 — Cross-Device Companion Unlock via Server-Side Receipt Validation**
+- **Cloudflare Worker** (`worker/companion-validator/`): New serverless endpoint that validates Apple StoreKit 2 JWS signed transactions, then updates the user's `is_companion` field on Base44 via API. Two endpoints: `POST /validate-receipt` (JWS + auth token → verify with Apple JWKS → update Base44 user) and `GET /check-companion` (auth token → read user's companion status). Includes CORS, Apple JWKS caching, expiry/revocation checks.
+- **AAStoreManager JWS capture**: `purchase()` and `restorePurchases()` now return the `jwsRepresentation` from `VerificationResult`. New `checkEntitlementsWithJWS()` method returns JWS from latest active Companion entitlement.
+- **Server sync on purchase/restore**: After successful purchase or restore, `syncCompanionToServer(jws:)` POSTs the JWS + auth token to the Worker. Graceful degradation: if Worker is unreachable or not configured, local unlock still works.
+- **Server-side companion check on cold boot + resume**: `checkCompanionOnServer()` called in `viewDidLoad` and `handleWillEnterForeground`. Catches server-side changes (cancellation, refund) that local cache doesn't know about.
+- **Web-side companion check JS**: `window.__aaCheckCompanion()` function injected at document start. Returns a Promise that calls the Worker's `/check-companion` endpoint with the user's auth token. Updates `window.__aaIsCompanion`. Works on any device (iOS app, desktop browser).
+- **Worker URL placeholder**: `companionWorkerURL` static let. Roland updates after deploying Worker with `wrangler deploy`.
+- **Build number**: 10 → 11
+- **Deployment**: Roland runs `cd worker/companion-validator && wrangler deploy`, notes the URL, updates `companionWorkerURL` in Swift, rebuilds iOS app.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
 **2026-02-13 — Raouf: Build 10 — StoreKit 2 IAP Bridge for Companion Subscriptions**
 - **StoreKit 2 purchase bridge**: Native `AAStoreManager` class handles product purchase, restore, and entitlement checking using modern StoreKit 2 APIs (`Product.products(for:)`, `product.purchase()`, `Transaction.currentEntitlements`, `AppStore.sync()`).
 - **Web ↔ Native messaging**: `aaPurchase` WKScriptMessageHandler accepts `{ action: "buy", productId: "..." }` and `{ action: "restore" }` payloads from web JS.
@@ -175,7 +188,7 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - **Logout**: Companion state cleared on logout.
 - **Product IDs**: `com.abideandanchor.companion.monthly`, `com.abideandanchor.companion.yearly`
 - **Build number**: 9 → 10
-- **NOTE**: Website-wide Companion unlock (across devices/browsers) requires server-side receipt validation endpoint on Base44. Current implementation provides in-app local unlock only. If Roland adds a server endpoint, integrate signed transaction JWS submission.
+- **NOTE**: Website-wide Companion unlock (across devices/browsers) was local-only in Build 10. ✅ **Resolved in Build 11** — Cloudflare Worker validates Apple JWS server-side and updates Base44 user entity for cross-device unlock.
 - Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
 
 **2026-02-11 — Raouf: Build 9 — Native Token Two-Way Sync (Swift ↔ localStorage)**
@@ -321,6 +334,26 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-14 (Australia/Sydney)
+- **Scope:** Build 11 — Cross-Device Companion Unlock via Server-Side Receipt Validation
+- **Summary:** Implemented server-side receipt validation via Cloudflare Worker so Companion subscription status syncs across all devices. The Worker validates Apple StoreKit 2 JWS signed transactions using Apple's JWKS public keys, then updates the user's `is_companion` field on Base44. iOS app now captures JWS from purchase/restore and POSTs it to the Worker. On cold boot and foreground resume, the app also checks the server for companion status changes (catches cancellations/refunds). A `window.__aaCheckCompanion()` JS function is injected at document start so the web app on any device can check companion status.
+- **Files Changed:**
+  - `worker/companion-validator/index.js` — CREATED: Cloudflare Worker with `/validate-receipt` and `/check-companion` endpoints
+  - `worker/companion-validator/wrangler.toml` — CREATED: Cloudflare deployment config
+  - `worker/companion-validator/package.json` — CREATED: Worker package manifest
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added `companionWorkerURL`, `syncCompanionToServer()`, `checkCompanionOnServer()`, `checkEntitlementsWithJWS()`, JWS return from purchase/restore, server check on cold boot + foreground, `window.__aaCheckCompanion()` JS injection
+  - `ios/App/App.xcodeproj/project.pbxproj` — Build number 10 → 11
+  - `AGENT.md` — Updated Known Issues, Last Change Log, this Update Log entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED (exit 0)
+- **Follow-ups:**
+  - Roland creates Cloudflare account (free tier), runs `cd worker/companion-validator && wrangler deploy`
+  - Roland updates `companionWorkerURL` in PatchedBridgeViewController.swift with deployed Worker URL
+  - Roland rebuilds iOS app
+  - Test: purchase on iOS → check `window.__aaIsCompanion` on desktop browser
+  - Test: restore on new device → server updated
+  - Test: cancel subscription → next check returns `isCompanion: false`
 
 **Raouf:**
 - **Date:** 2026-02-13 (Australia/Sydney)

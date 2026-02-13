@@ -43,13 +43,13 @@ final class AAStoreManager {
     }
 
     /// Purchase a product by its full product ID.
-    /// Returns a tuple: (status, productId, isCompanion, message)
-    func purchase(productId: String) async -> (status: String, productId: String?, isCompanion: Bool, message: String?) {
+    /// Returns a tuple: (status, productId, isCompanion, message, jws)
+    func purchase(productId: String) async -> (status: String, productId: String?, isCompanion: Bool, message: String?, jws: String?) {
         do {
             let products = try await Product.products(for: [productId])
             guard let product = products.first else {
                 os_log(.error, log: Self.log, "[Purchase] Product not found: %{public}@", productId)
-                return ("error", nil, false, "Product not found: \(productId)")
+                return ("error", nil, false, "Product not found: \(productId)", nil)
             }
 
             let result = try await product.purchase()
@@ -60,39 +60,41 @@ final class AAStoreManager {
                 case .verified(let transaction):
                     await transaction.finish()
                     let isCompanion = Self.companionProductIds.contains(transaction.productID)
-                    os_log(.info, log: Self.log, "[Purchase] SUCCESS productId=%{public}@ isCompanion=%{public}@",
-                           transaction.productID, isCompanion ? "true" : "false")
-                    return ("success", transaction.productID, isCompanion, nil)
+                    let jwsString = verification.jwsRepresentation
+                    os_log(.info, log: Self.log, "[Purchase] SUCCESS productId=%{public}@ isCompanion=%{public}@ hasJWS=%{public}@",
+                           transaction.productID, isCompanion ? "true" : "false", jwsString.isEmpty ? "false" : "true")
+                    return ("success", transaction.productID, isCompanion, nil, jwsString)
                 case .unverified(_, let error):
                     os_log(.error, log: Self.log, "[Purchase] Unverified: %{public}@", error.localizedDescription)
-                    return ("error", nil, false, "Transaction verification failed")
+                    return ("error", nil, false, "Transaction verification failed", nil)
                 }
             case .userCancelled:
                 os_log(.info, log: Self.log, "[Purchase] User cancelled")
-                return ("cancelled", nil, false, nil)
+                return ("cancelled", nil, false, nil, nil)
             case .pending:
                 os_log(.info, log: Self.log, "[Purchase] Pending (Ask to Buy or deferred)")
-                return ("pending", nil, false, nil)
+                return ("pending", nil, false, nil, nil)
             @unknown default:
-                return ("error", nil, false, "Unknown purchase result")
+                return ("error", nil, false, "Unknown purchase result", nil)
             }
         } catch {
             os_log(.error, log: Self.log, "[Purchase] Error: %{public}@", error.localizedDescription)
-            return ("error", nil, false, error.localizedDescription)
+            return ("error", nil, false, error.localizedDescription, nil)
         }
     }
 
     /// Restore purchases via AppStore.sync() then re-check entitlements.
-    func restorePurchases() async -> (status: String, isCompanion: Bool, restoredProducts: [String], message: String?) {
+    /// Returns the JWS from the latest active Companion entitlement for server validation.
+    func restorePurchases() async -> (status: String, isCompanion: Bool, restoredProducts: [String], message: String?, jws: String?) {
         do {
             try await AppStore.sync()
-            let (isCompanion, products) = await checkEntitlements()
-            os_log(.info, log: Self.log, "[Restore] isCompanion=%{public}@ products=%{public}@",
-                   isCompanion ? "true" : "false", products.joined(separator: ","))
-            return ("success", isCompanion, products, nil)
+            let (isCompanion, products, latestJWS) = await checkEntitlementsWithJWS()
+            os_log(.info, log: Self.log, "[Restore] isCompanion=%{public}@ products=%{public}@ hasJWS=%{public}@",
+                   isCompanion ? "true" : "false", products.joined(separator: ","), latestJWS != nil ? "true" : "false")
+            return ("success", isCompanion, products, nil, latestJWS)
         } catch {
             os_log(.error, log: Self.log, "[Restore] Error: %{public}@", error.localizedDescription)
-            return ("error", false, [], error.localizedDescription)
+            return ("error", false, [], error.localizedDescription, nil)
         }
     }
 
@@ -112,6 +114,25 @@ final class AAStoreManager {
         return (!activeProducts.isEmpty, activeProducts)
     }
 
+    /// Check entitlements and return JWS from the latest active Companion transaction.
+    /// Used for server-side receipt validation during restore.
+    func checkEntitlementsWithJWS() async -> (isCompanion: Bool, activeProducts: [String], latestJWS: String?) {
+        var activeProducts: [String] = []
+        var latestJWS: String? = nil
+        for await result in Transaction.currentEntitlements {
+            if case .verified(let transaction) = result {
+                guard Self.companionProductIds.contains(transaction.productID) else { continue }
+                guard transaction.revocationDate == nil else { continue }
+                if let expirationDate = transaction.expirationDate, expirationDate < Date() {
+                    continue
+                }
+                activeProducts.append(transaction.productID)
+                latestJWS = result.jwsRepresentation
+            }
+        }
+        return (!activeProducts.isEmpty, activeProducts, latestJWS)
+    }
+
     deinit {
         transactionListener?.cancel()
     }
@@ -128,6 +149,7 @@ final class AAStoreManager {
 ///   7) Hides Google sign-in completely — Email/Password only for iOS (Build 6)
 ///   8) In-app diagnostics overlay triggered by 5-tap on version label (Build 6)
 ///   9) StoreKit 2 IAP bridge for Companion subscriptions (Build 10)
+///  10) Cross-device Companion unlock via server-side receipt validation (Build 11)
 ///
 /// Architecture: The WKWebView loads https://abideandanchor.app (remote Base44 platform).
 /// We cannot modify the remote source code, so we inject JS+CSS via WKUserScript to
@@ -158,6 +180,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// UserDefaults key for Companion subscription state persistence (Build 10).
     /// Survives app restarts. Down-synced to web at document start.
     private static let companionDefaultsKey = "aa_is_companion"
+
+    /// Cloudflare Worker URL for cross-device Companion validation (Build 11).
+    /// Roland: update this after deploying the Worker with `wrangler deploy`.
+    private static let companionWorkerURL = "https://companion-validator.YOUR_SUBDOMAIN.workers.dev"
 
     // MARK: – F) Script message handler (diagnostics copy)
 
@@ -224,6 +250,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 if result.status == "success" {
                     self.persistCompanionState(result.isCompanion)
                     self.refreshWebEntitlements(isCompanion: result.isCompanion)
+
+                    // Build 11: Sync to server for cross-device unlock
+                    if let jws = result.jws {
+                        self.syncCompanionToServer(jws: jws)
+                    }
                 }
             }
 
@@ -242,6 +273,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 self.sendPurchaseResult(payload)
                 self.persistCompanionState(result.isCompanion)
                 self.refreshWebEntitlements(isCompanion: result.isCompanion)
+
+                // Build 11: Sync to server for cross-device unlock
+                if result.isCompanion, let jws = result.jws {
+                    self.syncCompanionToServer(jws: jws)
+                }
             }
 
         default:
@@ -300,6 +336,103 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 os_log(.error, log: Self.log, "[IAP] Entitlement refresh JS error: %{public}@", error.localizedDescription)
             }
         }
+    }
+
+    // MARK: – Build 11: Server-Side Companion Sync
+
+    /// Posts the JWS signed transaction to the Cloudflare Worker for server-side validation.
+    /// This enables cross-device Companion unlock (desktop browser, new device, etc.).
+    /// Graceful degradation: if this fails, local unlock still works.
+    private func syncCompanionToServer(jws: String) {
+        guard let authToken = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey),
+              !authToken.isEmpty else {
+            os_log(.info, log: Self.log, "[ServerSync] No auth token in UserDefaults — skipping server sync")
+            return
+        }
+
+        let workerURL = Self.companionWorkerURL
+        guard !workerURL.contains("YOUR_SUBDOMAIN"),
+              let url = URL(string: "\(workerURL)/validate-receipt") else {
+            os_log(.info, log: Self.log, "[ServerSync] Worker URL not configured — skipping server sync")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 15
+
+        let body: [String: String] = ["jws": jws, "authToken": authToken]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
+            os_log(.error, log: Self.log, "[ServerSync] Failed to serialize request body")
+            return
+        }
+        request.httpBody = bodyData
+
+        os_log(.info, log: Self.log, "[ServerSync] Posting JWS to Worker for server-side validation...")
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                os_log(.error, log: Self.log, "[ServerSync] Network error: %{public}@", error.localizedDescription)
+                return
+            }
+            guard let httpResponse = response as? HTTPURLResponse else { return }
+            let statusCode = httpResponse.statusCode
+
+            if let data = data, let responseStr = String(data: data, encoding: .utf8) {
+                os_log(.info, log: Self.log, "[ServerSync] Response %d: %{public}@", statusCode, responseStr)
+            } else {
+                os_log(.info, log: Self.log, "[ServerSync] Response %d (no body)", statusCode)
+            }
+        }.resume()
+    }
+
+    /// Checks companion status from the server (Build 11 — cross-device sync).
+    /// Called on cold boot and foreground resume to catch server-side changes
+    /// (e.g., subscription cancelled/refunded that local cache doesn't know about).
+    private func checkCompanionOnServer() {
+        guard let authToken = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey),
+              !authToken.isEmpty else {
+            os_log(.info, log: Self.log, "[ServerCheck] No auth token — skipping server companion check")
+            return
+        }
+
+        let workerURL = Self.companionWorkerURL
+        guard !workerURL.contains("YOUR_SUBDOMAIN"),
+              let url = URL(string: "\(workerURL)/check-companion") else {
+            return // Worker not configured yet — silently skip
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+            if let error = error {
+                os_log(.error, log: Self.log, "[ServerCheck] Error: %{public}@", error.localizedDescription)
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return
+            }
+
+            let serverIsCompanion = json["isCompanion"] as? Bool ?? false
+            let localIsCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+
+            if serverIsCompanion != localIsCompanion {
+                os_log(.info, log: Self.log, "[ServerCheck] Server companion=%{public}@ differs from local=%{public}@ — updating",
+                       serverIsCompanion ? "true" : "false", localIsCompanion ? "true" : "false")
+                DispatchQueue.main.async {
+                    self.persistCompanionState(serverIsCompanion)
+                    self.refreshWebEntitlements(isCompanion: serverIsCompanion)
+                }
+            } else {
+                os_log(.info, log: Self.log, "[ServerCheck] Server companion=%{public}@ matches local", serverIsCompanion ? "true" : "false")
+            }
+        }.resume()
     }
 
     // MARK: – Full Logout (clears all auth state so a different account can log in)
@@ -377,6 +510,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 self.persistCompanionState(isCompanion)
             }
         }
+
+        // Build 11: Also check server-side companion status (catches remote changes)
+        checkCompanionOnServer()
     }
 
     // MARK: – IAP Transaction Listener (Build 10)
@@ -638,6 +774,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 self.refreshWebEntitlements(isCompanion: isCompanion)
             }
         }
+
+        // Build 11: Also check server-side companion status on resume
+        checkCompanionOnServer()
 
         guard let webView = self.webView else {
             os_log(.error, log: Self.log, "willEnterForeground: webView is nil — cannot recover")
@@ -917,6 +1056,33 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Build 10: IAP callback default + companion state
         window.__aaPurchaseResult = window.__aaPurchaseResult || function(_){};
         window.__aaIsCompanion = \(isCompanion ? "true" : "false");
+        // Build 11: Cross-device companion check via Cloudflare Worker
+        window.__aaCompanionWorkerURL = '\(Self.companionWorkerURL)';
+        window.__aaCheckCompanion = function() {
+          var workerURL = window.__aaCompanionWorkerURL;
+          if (!workerURL || workerURL.indexOf('YOUR_SUBDOMAIN') !== -1) return Promise.resolve({ isCompanion: window.__aaIsCompanion });
+          var token = null;
+          try {
+            var keys = ['base44_access_token', 'token', 'access_token', 'base44_auth_token'];
+            for (var i = 0; i < keys.length; i++) {
+              var val = localStorage.getItem(keys[i]);
+              if (val && val.length > 20) { token = val; break; }
+            }
+          } catch(e) {}
+          if (!token) return Promise.resolve({ isCompanion: false, reason: 'no-token' });
+          return fetch(workerURL + '/check-companion', {
+            method: 'GET',
+            headers: { 'Authorization': 'Bearer ' + token }
+          })
+          .then(function(res) { return res.json(); })
+          .then(function(data) {
+            window.__aaIsCompanion = data.isCompanion === true;
+            return data;
+          })
+          .catch(function(err) {
+            return { isCompanion: window.__aaIsCompanion, error: err.message };
+          });
+        };
         // Build 9: Restore token from UserDefaults → localStorage on cold boot.
         // This is the DOWN sync: native persistence → web persistence.
         // Only restores if localStorage has NO auth token (cleared by WebKit, reinstall, etc.)

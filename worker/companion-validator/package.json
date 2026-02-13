@@ -1,0 +1,14 @@
+{
+  "name": "companion-validator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker for Abide & Anchor Companion subscription validation",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

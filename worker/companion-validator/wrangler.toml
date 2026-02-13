@@ -1,0 +1,7 @@
+name = "companion-validator"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# Cloudflare Workers free tier is sufficient.
+# Deploy with: wrangler deploy
+# The deployed URL will be printed (e.g. https://companion-validator.<subdomain>.workers.dev)
