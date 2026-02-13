@@ -2265,8 +2265,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           }
 
           // Match restore purchase
-          if (text.indexOf('restore') !== -1 && (text.indexOf('purchase') !== -1 || text.indexOf('subscription') !== -1) ||
-              text === 'restore' || text === 'restore purchases') {
+          if ((text.indexOf('restore') !== -1 && (text.indexOf('purchase') !== -1 || text.indexOf('subscription') !== -1)) ||
+              text === 'restore' || text === 'restore purchases' || text === 'restore purchase') {
             btn.setAttribute('data-aa-iap-wired', 'restore');
             btn.addEventListener('click', function(e) {
               e.preventDefault();
