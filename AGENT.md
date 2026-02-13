@@ -116,6 +116,7 @@ npm run test           # Unit tests
 | "or" divider visible after Google hidden | ✅ FIXED — Broad sweep hides all or/divider/separator elements on login page |
 | Prayer Wall squashed/not responsive | ✅ FIXED — CSS grid forced to 1-column on mobile, overflow hidden |
 | No Log Out button | ✅ FIXED — Build 7: Injected on More/Settings page. Clears localStorage, cookies, WKWebView data, Capacitor Preferences. Navigates to Login. Confirmation dialog. |
+| IAP Companion subscription not wired | ✅ FIXED — Build 10: StoreKit 2 purchase bridge. Web buttons trigger native purchase/restore. Entitlements persisted in UserDefaults (`aa_is_companion`). |
 | Session validation `no-token` false positive | ✅ FIXED — Build 8.1: Now checks 4 token keys instead of just `base44_access_token`. Base44 SDK stores token under `token` key initially. |
 | localStorage random clearing (iOS 17.4+) | ✅ FIXED — Build 8.1: Shared static `WKProcessPool` per Apple developer docs recommendation. |
 | Cookie sync lag | ✅ FIXED — Build 8.1: `WKHTTPCookieStoreObserver` auto-persists cookies on any change. iOS 26 batch API for atomic sync. |
@@ -161,6 +162,21 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 ---
 
 ## Last Change Log
+
+**2026-02-13 — Raouf: Build 10 — StoreKit 2 IAP Bridge for Companion Subscriptions**
+- **StoreKit 2 purchase bridge**: Native `AAStoreManager` class handles product purchase, restore, and entitlement checking using modern StoreKit 2 APIs (`Product.products(for:)`, `product.purchase()`, `Transaction.currentEntitlements`, `AppStore.sync()`).
+- **Web ↔ Native messaging**: `aaPurchase` WKScriptMessageHandler accepts `{ action: "buy", productId: "..." }` and `{ action: "restore" }` payloads from web JS.
+- **JS callback + CustomEvent**: Native sends results via `window.__aaPurchaseResult(result)` AND `window.dispatchEvent(new CustomEvent('aa:iap', { detail: result }))`. Statuses: `success`, `cancelled`, `pending`, `error`.
+- **Button wiring**: Injected JS finds Subscribe Monthly/Yearly/Restore buttons by text content on remote site and attaches click handlers. Resilient: runs via MutationObserver, survives SPA rerenders.
+- **Entitlement persistence**: `aa_is_companion` stored in UserDefaults. Down-synced to web at `atDocumentStart` via `window.__aaIsCompanion`. Re-checked on cold boot, foreground resume, and transaction updates.
+- **Transaction listener**: `Transaction.updates` async stream monitors renewals, refunds, revocations in background. Updates entitlement state and notifies web automatically.
+- **Convenience bridge**: `window.aaPurchase("buy", productId)` and `window.aaPurchase("restore")` available at document start for web code.
+- **Diagnostics**: Companion subscription status added to diagnostics overlay.
+- **Logout**: Companion state cleared on logout.
+- **Product IDs**: `com.abideandanchor.companion.monthly`, `com.abideandanchor.companion.yearly`
+- **Build number**: 9 → 10
+- **NOTE**: Website-wide Companion unlock (across devices/browsers) requires server-side receipt validation endpoint on Base44. Current implementation provides in-app local unlock only. If Roland adds a server endpoint, integrate signed transaction JWS submission.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
 
 **2026-02-11 — Raouf: Build 9 — Native Token Two-Way Sync (Swift ↔ localStorage)**
 - **Critical discovery**: `src/lib/tokenStorage.js` and `src/context/AuthContext.jsx` are DEAD CODE in production. With `server.url` set, WKWebView loads the remote site's own JS — our local bundle never executes. Token persistence must be done entirely in native Swift.
@@ -305,6 +321,22 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-13 (Australia/Sydney)
+- **Scope:** Build 10 — StoreKit 2 IAP Bridge for Companion Subscriptions
+- **Summary:** Implemented complete native IAP bridge using StoreKit 2 so web subscription buttons trigger native App Store purchases. Added `AAStoreManager` class with purchase/restore/entitlement checking. Web buttons on the remote Base44 site are wired via injected JS click handlers (resilient text matching + MutationObserver). Results sent back to web via `window.__aaPurchaseResult()` callback + `aa:iap` CustomEvent. Entitlements persisted in UserDefaults (`aa_is_companion`), down-synced to web at document start. Transaction listener monitors renewals/refunds in background. Companion state included in diagnostics overlay.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added `import StoreKit`, `AAStoreManager` class (StoreKit 2 purchase/restore/entitlements), `aaPurchase` message handler, `handlePurchaseMessage()`, `sendPurchaseResult()`, `persistCompanionState()`, `refreshWebEntitlements()`, `startIAPTransactionListener()`, IAP bridge JS at document start, button wiring JS, entitlement re-check on foreground, companion state in diagnostics, companion state cleared on logout
+  - `ios/App/App.xcodeproj/project.pbxproj` — Build number 9 → 10
+  - `AGENT.md` — Updated Known Issues, Last Change Log, this Update Log entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:**
+  - Roland creates sandbox tester account in App Store Connect
+  - Test monthly purchase, yearly purchase, cancel, restore in sandbox
+  - Verify Companion features unlock immediately after purchase
+  - Verify entitlement persists across app restart
+  - Website-wide unlock requires server-side receipt validation (future)
 
 **Raouf:**
 - **Date:** 2026-02-11 (Australia/Sydney)

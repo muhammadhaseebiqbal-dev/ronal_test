@@ -2,6 +2,120 @@ import UIKit
 import WebKit
 import Capacitor
 import os.log
+import StoreKit
+
+// MARK: – StoreKit 2 Manager (Build 10 — IAP Bridge)
+
+/// Manages StoreKit 2 product fetching, purchasing, restoring, and entitlement checking.
+/// Companion subscription product IDs are configured in App Store Connect.
+@available(iOS 15.0, *)
+final class AAStoreManager {
+
+    static let shared = AAStoreManager()
+
+    private static let log = OSLog(subsystem: "com.abideandanchor.app", category: "IAP")
+
+    static let companionProductIds: Set<String> = [
+        "com.abideandanchor.companion.monthly",
+        "com.abideandanchor.companion.yearly"
+    ]
+
+    private var transactionListener: Task<Void, Never>?
+
+    private init() {}
+
+    /// Starts listening for transaction updates (renewals, refunds, revocations).
+    /// The callback is invoked on the main actor with the updated companion state.
+    func startTransactionListener(onUpdate: @escaping (Bool) -> Void) {
+        transactionListener?.cancel()
+        transactionListener = Task(priority: .background) {
+            for await result in Transaction.updates {
+                if case .verified(let transaction) = result {
+                    await transaction.finish()
+                    os_log(.info, log: Self.log, "[TxnUpdate] productId=%{public}@ revoked=%{public}@",
+                           transaction.productID,
+                           transaction.revocationDate != nil ? "YES" : "NO")
+                    let (isCompanion, _) = await self.checkEntitlements()
+                    await MainActor.run { onUpdate(isCompanion) }
+                }
+            }
+        }
+    }
+
+    /// Purchase a product by its full product ID.
+    /// Returns a tuple: (status, productId, isCompanion, message)
+    func purchase(productId: String) async -> (status: String, productId: String?, isCompanion: Bool, message: String?) {
+        do {
+            let products = try await Product.products(for: [productId])
+            guard let product = products.first else {
+                os_log(.error, log: Self.log, "[Purchase] Product not found: %{public}@", productId)
+                return ("error", nil, false, "Product not found: \(productId)")
+            }
+
+            let result = try await product.purchase()
+
+            switch result {
+            case .success(let verification):
+                switch verification {
+                case .verified(let transaction):
+                    await transaction.finish()
+                    let isCompanion = Self.companionProductIds.contains(transaction.productID)
+                    os_log(.info, log: Self.log, "[Purchase] SUCCESS productId=%{public}@ isCompanion=%{public}@",
+                           transaction.productID, isCompanion ? "true" : "false")
+                    return ("success", transaction.productID, isCompanion, nil)
+                case .unverified(_, let error):
+                    os_log(.error, log: Self.log, "[Purchase] Unverified: %{public}@", error.localizedDescription)
+                    return ("error", nil, false, "Transaction verification failed")
+                }
+            case .userCancelled:
+                os_log(.info, log: Self.log, "[Purchase] User cancelled")
+                return ("cancelled", nil, false, nil)
+            case .pending:
+                os_log(.info, log: Self.log, "[Purchase] Pending (Ask to Buy or deferred)")
+                return ("pending", nil, false, nil)
+            @unknown default:
+                return ("error", nil, false, "Unknown purchase result")
+            }
+        } catch {
+            os_log(.error, log: Self.log, "[Purchase] Error: %{public}@", error.localizedDescription)
+            return ("error", nil, false, error.localizedDescription)
+        }
+    }
+
+    /// Restore purchases via AppStore.sync() then re-check entitlements.
+    func restorePurchases() async -> (status: String, isCompanion: Bool, restoredProducts: [String], message: String?) {
+        do {
+            try await AppStore.sync()
+            let (isCompanion, products) = await checkEntitlements()
+            os_log(.info, log: Self.log, "[Restore] isCompanion=%{public}@ products=%{public}@",
+                   isCompanion ? "true" : "false", products.joined(separator: ","))
+            return ("success", isCompanion, products, nil)
+        } catch {
+            os_log(.error, log: Self.log, "[Restore] Error: %{public}@", error.localizedDescription)
+            return ("error", false, [], error.localizedDescription)
+        }
+    }
+
+    /// Check current entitlements for active Companion subscriptions.
+    func checkEntitlements() async -> (isCompanion: Bool, activeProducts: [String]) {
+        var activeProducts: [String] = []
+        for await result in Transaction.currentEntitlements {
+            if case .verified(let transaction) = result {
+                guard Self.companionProductIds.contains(transaction.productID) else { continue }
+                guard transaction.revocationDate == nil else { continue }
+                if let expirationDate = transaction.expirationDate, expirationDate < Date() {
+                    continue
+                }
+                activeProducts.append(transaction.productID)
+            }
+        }
+        return (!activeProducts.isEmpty, activeProducts)
+    }
+
+    deinit {
+        transactionListener?.cancel()
+    }
+}
 
 /// Custom CAPBridgeViewController that:
 ///
@@ -13,6 +127,7 @@ import os.log
 ///   6) Injects client-side CSS+JS patches for remote Base44 app issues (Build 3)
 ///   7) Hides Google sign-in completely — Email/Password only for iOS (Build 6)
 ///   8) In-app diagnostics overlay triggered by 5-tap on version label (Build 6)
+///   9) StoreKit 2 IAP bridge for Companion subscriptions (Build 10)
 ///
 /// Architecture: The WKWebView loads https://abideandanchor.app (remote Base44 platform).
 /// We cannot modify the remote source code, so we inject JS+CSS via WKUserScript to
@@ -40,6 +155,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// See: https://developer.apple.com/forums/thread/751820
     private static let sharedProcessPool = WKProcessPool()
 
+    /// UserDefaults key for Companion subscription state persistence (Build 10).
+    /// Survives app restarts. Down-synced to web at document start.
+    private static let companionDefaultsKey = "aa_is_companion"
+
     // MARK: – F) Script message handler (diagnostics copy)
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -52,6 +171,134 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         if message.name == "aaLogout" {
             os_log(.info, log: Self.log, "[LOGOUT] Native logout triggered — clearing all auth state")
             performFullLogout()
+        }
+
+        if message.name == "aaPurchase" {
+            handlePurchaseMessage(message)
+        }
+    }
+
+    // MARK: – IAP Purchase Message Handler (Build 10)
+
+    /// Handles `aaPurchase` messages from web JS.
+    /// Payloads:
+    ///   { action: "buy", productId: "com.abideandanchor.companion.monthly" }
+    ///   { action: "buy", productId: "com.abideandanchor.companion.yearly" }
+    ///   { action: "restore" }
+    private func handlePurchaseMessage(_ message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any],
+              let action = body["action"] as? String else {
+            os_log(.error, log: Self.log, "[IAP] Invalid message body")
+            sendPurchaseResult(["status": "error", "message": "Invalid message format"])
+            return
+        }
+
+        os_log(.info, log: Self.log, "[IAP] Received action=%{public}@", action)
+
+        guard #available(iOS 15.0, *) else {
+            sendPurchaseResult(["status": "error", "message": "StoreKit 2 requires iOS 15+"])
+            return
+        }
+
+        switch action {
+        case "buy":
+            guard let productId = body["productId"] as? String else {
+                sendPurchaseResult(["status": "error", "message": "Missing productId"])
+                return
+            }
+            // Validate product ID is one of our known IDs
+            guard AAStoreManager.companionProductIds.contains(productId) else {
+                os_log(.error, log: Self.log, "[IAP] Unknown productId: %{public}@", productId)
+                sendPurchaseResult(["status": "error", "message": "Unknown product: \(productId)"])
+                return
+            }
+            Task { @MainActor in
+                let result = await AAStoreManager.shared.purchase(productId: productId)
+                var payload: [String: Any] = ["status": result.status]
+                if let pid = result.productId { payload["productId"] = pid }
+                payload["isCompanion"] = result.isCompanion
+                if let msg = result.message { payload["message"] = msg }
+
+                self.sendPurchaseResult(payload)
+
+                if result.status == "success" {
+                    self.persistCompanionState(result.isCompanion)
+                    self.refreshWebEntitlements(isCompanion: result.isCompanion)
+                }
+            }
+
+        case "restore":
+            Task { @MainActor in
+                let result = await AAStoreManager.shared.restorePurchases()
+                var payload: [String: Any] = [
+                    "status": result.status,
+                    "isCompanion": result.isCompanion
+                ]
+                if !result.restoredProducts.isEmpty {
+                    payload["productId"] = result.restoredProducts.first ?? ""
+                }
+                if let msg = result.message { payload["message"] = msg }
+
+                self.sendPurchaseResult(payload)
+                self.persistCompanionState(result.isCompanion)
+                self.refreshWebEntitlements(isCompanion: result.isCompanion)
+            }
+
+        default:
+            os_log(.error, log: Self.log, "[IAP] Unknown action: %{public}@", action)
+            sendPurchaseResult(["status": "error", "message": "Unknown action: \(action)"])
+        }
+    }
+
+    /// Sends a purchase result back to web via JS callback + CustomEvent.
+    /// Serializes the payload as JSON and calls window.__aaPurchaseResult + dispatches aa:iap.
+    private func sendPurchaseResult(_ result: [String: Any]) {
+        guard let webView = self.webView else { return }
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: result),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            os_log(.error, log: Self.log, "[IAP] Failed to serialize result to JSON")
+            return
+        }
+
+        let js = """
+        (function() {
+            var result = \(jsonString);
+            if (typeof window.__aaPurchaseResult === 'function') {
+                window.__aaPurchaseResult(result);
+            }
+            window.dispatchEvent(new CustomEvent('aa:iap', { detail: result }));
+        })();
+        """
+
+        webView.evaluateJavaScript(js) { _, error in
+            if let error = error {
+                os_log(.error, log: Self.log, "[IAP] JS callback error: %{public}@", error.localizedDescription)
+            }
+        }
+    }
+
+    /// Persists the Companion subscription state in UserDefaults.
+    private func persistCompanionState(_ isCompanion: Bool) {
+        UserDefaults.standard.set(isCompanion, forKey: Self.companionDefaultsKey)
+        os_log(.info, log: Self.log, "[IAP] Persisted aa_is_companion=%{public}@", isCompanion ? "true" : "false")
+    }
+
+    /// Triggers web-side entitlement refresh after purchase/restore.
+    /// Calls refreshBase44Entitlements() if available, otherwise relies on aa:iap event.
+    private func refreshWebEntitlements(isCompanion: Bool) {
+        guard let webView = self.webView else { return }
+        let js = """
+        (function() {
+            window.__aaIsCompanion = \(isCompanion ? "true" : "false");
+            if (typeof window.refreshBase44Entitlements === 'function') {
+                window.refreshBase44Entitlements();
+            }
+        })();
+        """
+        webView.evaluateJavaScript(js) { _, error in
+            if let error = error {
+                os_log(.error, log: Self.log, "[IAP] Entitlement refresh JS error: %{public}@", error.localizedDescription)
+            }
         }
     }
 
@@ -107,6 +354,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Clear token from UserDefaults (native persistence layer)
         clearTokenFromUserDefaults()
 
+        // Clear companion subscription state (Build 10)
+        UserDefaults.standard.removeObject(forKey: Self.companionDefaultsKey)
+
         logDiagnostics(event: "logout")
     }
 
@@ -117,7 +367,34 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         injectPatches()
         injectNativeDiagnostics()
         setupLifecycleObservers()
+        startIAPTransactionListener()
         logDiagnostics(event: "coldBoot")
+
+        // Check entitlements on cold boot and persist state
+        if #available(iOS 15.0, *) {
+            Task { @MainActor in
+                let (isCompanion, _) = await AAStoreManager.shared.checkEntitlements()
+                self.persistCompanionState(isCompanion)
+            }
+        }
+    }
+
+    // MARK: – IAP Transaction Listener (Build 10)
+
+    /// Starts listening for StoreKit 2 transaction updates (renewals, refunds, etc.)
+    /// Updates entitlement state and notifies web when changes occur.
+    private func startIAPTransactionListener() {
+        guard #available(iOS 15.0, *) else { return }
+        AAStoreManager.shared.startTransactionListener { [weak self] isCompanion in
+            guard let self = self else { return }
+            self.persistCompanionState(isCompanion)
+            self.refreshWebEntitlements(isCompanion: isCompanion)
+            self.sendPurchaseResult([
+                "status": "success",
+                "isCompanion": isCompanion,
+                "source": "transactionUpdate"
+            ])
+        }
     }
 
     // MARK: – G) Native diagnostics injection
@@ -352,6 +629,16 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             self?.syncTokenToUserDefaults()
         }
 
+        // Re-check IAP entitlements on resume (catches renewals/expirations while backgrounded)
+        if #available(iOS 15.0, *) {
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                let (isCompanion, _) = await AAStoreManager.shared.checkEntitlements()
+                self.persistCompanionState(isCompanion)
+                self.refreshWebEntitlements(isCompanion: isCompanion)
+            }
+        }
+
         guard let webView = self.webView else {
             os_log(.error, log: Self.log, "willEnterForeground: webView is nil — cannot recover")
             return
@@ -538,8 +825,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Register native message handlers
         controller.add(self, name: "aaCopyDiagnostics")
         controller.add(self, name: "aaLogout")
+        controller.add(self, name: "aaPurchase")
 
-        // Inject native diagnostics data at DOCUMENT START so it's available
+        // Inject native diagnostics data + IAP callback at DOCUMENT START so it's available
         // before any other scripts run (fixes "unknown" race condition)
         let nativeDiagScript = WKUserScript(
             source: buildNativeDiagJS(),
@@ -547,6 +835,15 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             forMainFrameOnly: true
         )
         controller.addUserScript(nativeDiagScript)
+
+        // Inject IAP bridge helper at DOCUMENT START (Build 10)
+        // Provides window.aaPurchase() convenience function for web buttons
+        let iapBridgeScript = WKUserScript(
+            source: Self.iapBridgeJS,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        controller.addUserScript(iapBridgeScript)
 
         let cssScript = WKUserScript(
             source: Self.cssInjection,
@@ -602,6 +899,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "'", with: "\\'")
 
+        let isCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+
         return """
         window.__aaNativeDiag = {
           deviceModel: '\(machineStr)',
@@ -612,8 +911,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           buildNumber: '\(buildNumber)',
           dataStoreType: '\(storeType)',
           hasNativeToken: \(hasNativeToken ? "true" : "false"),
-          nativeTokenLen: \(nativeTokenLen)
+          nativeTokenLen: \(nativeTokenLen),
+          isCompanion: \(isCompanion ? "true" : "false")
         };
+        // Build 10: IAP callback default + companion state
+        window.__aaPurchaseResult = window.__aaPurchaseResult || function(_){};
+        window.__aaIsCompanion = \(isCompanion ? "true" : "false");
         // Build 9: Restore token from UserDefaults → localStorage on cold boot.
         // This is the DOWN sync: native persistence → web persistence.
         // Only restores if localStorage has NO auth token (cleared by WebKit, reinstall, etc.)
@@ -892,6 +1195,29 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         .aa-diag-close { background: #333; color: #e8e8e8; }
       `;
       document.head.appendChild(style);
+    })();
+    """
+
+    // MARK: – IAP Bridge JS (Build 10 — atDocumentStart)
+
+    /// Convenience bridge injected at document start so web code can call
+    /// `window.aaPurchase("buy", "com.abideandanchor.companion.monthly")`
+    /// or `window.aaPurchase("restore")` directly without checking messageHandlers.
+    private static let iapBridgeJS: String = """
+    (function() {
+      if (window.__aaIAPBridgeReady) return;
+      window.__aaIAPBridgeReady = true;
+      window.aaPurchase = function(action, productId) {
+        var payload = { action: action };
+        if (productId) payload.productId = productId;
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
+          window.webkit.messageHandlers.aaPurchase.postMessage(payload);
+        } else {
+          if (typeof window.__aaPurchaseResult === 'function') {
+            window.__aaPurchaseResult({ status: 'error', message: 'Native IAP bridge not available' });
+          }
+        }
+      };
     })();
     """
 
@@ -1614,6 +1940,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           lines.push('  No errors captured');
         }
         lines.push('');
+        lines.push('-- Companion Subscription (Build 10) --');
+        lines.push('  isCompanion: ' + (window.__aaIsCompanion ? 'true' : 'false'));
+        lines.push('  nativeDiag.isCompanion: ' + (native.isCompanion ? 'true' : 'false'));
+        lines.push('');
         lines.push('-- Login --');
         lines.push('  Method: Email/Password only (Google hidden on iOS)');
         lines.push('');
@@ -1888,6 +2218,69 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         });
       }
 
+      // ── 6e. IAP BUTTON WIRING (Build 10) ──
+      // Since we cannot modify the remote web app, we inject click handlers on
+      // Companion subscription buttons. Uses resilient matching: text content,
+      // retry loop + MutationObserver to survive SPA rerenders.
+
+      function wireIAPButtons() {
+        var root = document.getElementById('root');
+        if (!root) return;
+        var buttons = root.querySelectorAll('button, a, [role="button"]');
+        buttons.forEach(function(btn) {
+          if (btn.getAttribute('data-aa-iap-wired')) return;
+          var text = (btn.textContent || '').trim().toLowerCase();
+
+          // Match subscribe monthly
+          if ((text.indexOf('subscribe') !== -1 && text.indexOf('monthly') !== -1) ||
+              text === 'monthly' || text === 'subscribe monthly') {
+            btn.setAttribute('data-aa-iap-wired', 'monthly');
+            btn.addEventListener('click', function(e) {
+              e.preventDefault();
+              e.stopPropagation();
+              if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
+                window.webkit.messageHandlers.aaPurchase.postMessage({
+                  action: 'buy',
+                  productId: 'com.abideandanchor.companion.monthly'
+                });
+              }
+            });
+          }
+
+          // Match subscribe yearly
+          if ((text.indexOf('subscribe') !== -1 && text.indexOf('yearly') !== -1) ||
+              (text.indexOf('subscribe') !== -1 && text.indexOf('annual') !== -1) ||
+              text === 'yearly' || text === 'annual' || text === 'subscribe yearly') {
+            btn.setAttribute('data-aa-iap-wired', 'yearly');
+            btn.addEventListener('click', function(e) {
+              e.preventDefault();
+              e.stopPropagation();
+              if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
+                window.webkit.messageHandlers.aaPurchase.postMessage({
+                  action: 'buy',
+                  productId: 'com.abideandanchor.companion.yearly'
+                });
+              }
+            });
+          }
+
+          // Match restore purchase
+          if (text.indexOf('restore') !== -1 && (text.indexOf('purchase') !== -1 || text.indexOf('subscription') !== -1) ||
+              text === 'restore' || text === 'restore purchases') {
+            btn.setAttribute('data-aa-iap-wired', 'restore');
+            btn.addEventListener('click', function(e) {
+              e.preventDefault();
+              e.stopPropagation();
+              if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
+                window.webkit.messageHandlers.aaPurchase.postMessage({
+                  action: 'restore'
+                });
+              }
+            });
+          }
+        });
+      }
+
       // ── 6d. SESSION VALIDATION (Build 8) ──
       // Detects stale/expired tokens and clears them before the React app mounts.
       // This prevents "logged in but broken" states where an expired JWT sits in localStorage.
@@ -2012,6 +2405,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           detectAndFixErrorScreen();
           interceptGoogleAuth();
           injectLogoutButton();
+          wireIAPButtons();
         }, 250);
       }
 
