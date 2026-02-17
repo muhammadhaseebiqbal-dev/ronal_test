@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone 3 — App Store submission preparation (Build 11)
+**Current Phase:** Milestone 3 — App Store submission preparation (Build 12)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -161,9 +161,31 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 | 6 | Prayer List does not white-screen | ✅ FIXED (Build 6) |
 | 7 | **Log out button** in More/Settings that fully signs the user out, clears stored auth state, and returns to Login screen (so a different account can log in) | ✅ FIXED (Build 7) |
 
+## IAP Stage Two — Acceptance Criteria (Roland, 2026-02-15)
+
+| # | Criterion | Status |
+|---|-----------|--------|
+| 1 | New user, start trial (Monthly and Yearly) — Apple purchase sheet appears, purchase completes, paywall dismisses, Companion unlocks immediately, visible "Companion Active" indicator | ✅ Build 12: Toast "Companion features unlocked!", Settings shows "Companion Active" |
+| 2 | Persistence — Kill app, reopen = still unlocked. Logout/login = still unlocked | ✅ Build 10+: UserDefaults `aa_is_companion`, re-checked on cold boot + resume |
+| 3 | Restore on same device — Tap Restore, native restore flow runs, success/failure message shown | ✅ Build 12: AppStore.sync() + toast "Subscription restored!" or "No active subscription found." |
+| 4 | Restore on fresh install — Delete, reinstall, login, Restore Purchases = unlocks | ✅ Build 10+: AppStore.sync() fetches from Apple, JWS synced to server |
+| 5 | Already-subscribed user — Paywall should not block access | ✅ Build 12: Green "You have an active Companion subscription!" banner on paywall |
+| 6 | Cross-device unlock — iOS purchase unlocks on desktop web. Manual "Recheck subscription" in Settings | ✅ Build 11+12: Worker validates JWS, updates Base44. Recheck button in Settings |
+| 7 | Diagnostics — Subscription status line, last entitlement check time/result, last worker response code | ✅ Build 12: Enhanced diagnostics overlay with all requested data |
+
 ---
 
 ## Last Change Log
+
+**2026-02-18 — Raouf: Build 12 — Production-Ready IAP: Toast Feedback, Subscription Status UI, Diagnostics, Already-Subscribed Handling**
+- **Toast notifications (user-facing feedback)**: Purchase/restore results now show visible toast notifications at the top of the screen. Success (green), error (red), info (dark). Toasts auto-dismiss after 4 seconds. Distinguishes buy vs restore vs transaction updates via `action` field in payloads.
+- **Subscription Status UI on Settings/More page**: Visible "Companion Active" (green) or "Free" (gray) status indicator with a "Recheck Subscription" button. Recheck calls `__aaCheckCompanion()` for cross-device sync via the Cloudflare Worker. Updates in real-time after purchase/restore/recheck.
+- **Already-subscribed paywall handling**: When a subscribed user lands on the paywall, a green banner "You have an active Companion subscription!" is injected at the top. Prevents confusion about needing to re-purchase.
+- **Enhanced diagnostics (Build 12)**: Diagnostics overlay now shows: Subscription Status (COMPANION ACTIVE / FREE), Worker URL configured (YES/NO), Last entitlement check (time + result + products), Last worker call (endpoint + HTTP status code + time + error). Exposes `window.__aaLastEntitlementCheck` and `window.__aaLastWorkerResponse` globals updated in real-time from native Swift.
+- **Trial button matching**: IAP button wiring now matches "Start Companion Trial", "Start Free Trial", "Start Trial", "Try Companion", and generic trial buttons (defaults to monthly product).
+- **Action field in payloads**: Purchase results now include `"action": "buy"` or `"action": "restore"` so the toast system can show contextually appropriate messages.
+- **Build number**: 11 → 12
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
 
 **2026-02-14 — Raouf: Build 11 — Cross-Device Companion Unlock via Server-Side Receipt Validation**
 - **Cloudflare Worker** (`worker/companion-validator/`): New serverless endpoint that validates Apple StoreKit 2 JWS signed transactions, then updates the user's `is_companion` field on Base44 via API. Two endpoints: `POST /validate-receipt` (JWS + auth token → verify with Apple JWKS → update Base44 user) and `GET /check-companion` (auth token → read user's companion status). Includes CORS, Apple JWKS caching, expiry/revocation checks.
@@ -334,6 +356,25 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-18 (Australia/Sydney)
+- **Scope:** Build 12 — Production-Ready IAP: Toast Feedback, Subscription Status UI, Diagnostics, Already-Subscribed Handling
+- **Summary:** Addressed Roland's full IAP Definition of Done checklist. Added user-visible toast notifications for all purchase/restore/renewal events so the user always sees feedback. Added a "Subscription" status section on the Settings/More page showing "Companion Active" or "Free" with a "Recheck Subscription" button for manual cross-device sync. Added "already subscribed" banner on the paywall page so subscribed users aren't confused. Enhanced diagnostics overlay with last entitlement check time/result and last worker response code (200/401/etc) for quick debugging. Extended IAP button wiring to match trial-related button text. Added `action` field to purchase result payloads for toast differentiation.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added toast notification CSS+JS, subscription status UI injection, already-subscribed banner, enhanced diagnostics overlay, pushEntitlementCheckToJS + pushWorkerResponseToJS helper methods, action field in buy/restore payloads, trial button matching, workerConfigured diag field, updated orchestrator
+  - `ios/App/App.xcodeproj/project.pbxproj` — Build number 11 → 12
+  - `AGENT.md` — Updated Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED (exit 0)
+- **Client Acceptance Tests Addressed:**
+  1. New user start trial (Monthly/Yearly) → toast "Companion features unlocked!" on success
+  2. Persistence → UserDefaults `aa_is_companion` survives kill/reopen; login re-checks entitlements + server
+  3. Restore on same device → AppStore.sync() + toast feedback (success or "no subscription found")
+  4. Restore on fresh install → same restore flow with JWS server sync
+  5. Already-subscribed user → green banner on paywall, status shown in Settings
+  6. Cross-device unlock → Recheck Subscription button calls Worker; server status synced
+  7. Diagnostics → Subscription status line, last entitlement check, last worker response code
 
 **Raouf:**
 - **Date:** 2026-02-14 (Australia/Sydney)

@@ -4,6 +4,73 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-18 — Raouf: Build 12 — Production-Ready IAP: Toast Feedback, Subscription Status UI, Diagnostics, Already-Subscribed Handling
+
+**Scope:** Address Roland's full IAP Definition of Done checklist — ensure all 7 acceptance tests pass end-to-end. Add user-visible feedback, subscription status UI, already-subscribed handling, and enhanced diagnostics.
+
+**What changed:**
+
+1. **Toast Notification System**
+   - Added CSS-animated toast notifications at top of screen (success/error/info variants)
+   - Purchase success: "Companion features unlocked!" (green)
+   - Purchase cancelled: no toast (user-initiated)
+   - Purchase error: error message shown (red)
+   - Purchase pending: "Purchase pending approval." (dark)
+   - Restore success with subscription: "Subscription restored! Companion unlocked." (green)
+   - Restore success without subscription: "No active subscription found." (dark)
+   - Restore error: error message shown (red)
+   - Background renewal: "Subscription renewed" (green)
+   - Auto-dismisses after 4 seconds with slide-up animation
+
+2. **Subscription Status UI on Settings/More Page**
+   - Injected "Subscription" section showing "Companion Active" (green) or "Free" (gray)
+   - Detail text: "Your Companion subscription is active." / "Subscribe to unlock Companion features."
+   - "Recheck Subscription" button calls `window.__aaCheckCompanion()` for cross-device sync
+   - Button shows loading state ("Checking...") and result toast
+   - Positioned above the Log Out button for visibility
+
+3. **Already-Subscribed Paywall Handling**
+   - When `window.__aaIsCompanion === true` and paywall buttons are detected, injects green banner: "You have an active Companion subscription!"
+   - Banner auto-removes if subscription expires/revokes
+
+4. **Enhanced Diagnostics Overlay**
+   - Subscription section now shows: COMPANION ACTIVE / FREE status, Worker URL configured (YES/NO)
+   - Last entitlement check: time, isCompanion result, active products
+   - Last worker call: endpoint, HTTP status code, time, error if any
+   - New `window.__aaLastEntitlementCheck` and `window.__aaLastWorkerResponse` globals updated in real-time from native Swift
+
+5. **Action Field in Purchase Payloads**
+   - Buy payloads now include `"action": "buy"`
+   - Restore payloads now include `"action": "restore"`
+   - Enables toast system to show contextually appropriate messages
+
+6. **Trial Button Matching (IAP Wiring)**
+   - Extended text patterns: "start companion trial", "start free trial", "start trial", "try companion"
+   - Generic trial buttons (without "yearly"/"annual") default to monthly product
+   - Trial yearly buttons still wire to yearly product
+
+7. **Native Diagnostics Tracking**
+   - `pushEntitlementCheckToJS()`: Pushes entitlement check results (time, isCompanion, products) to JS after every check
+   - `pushWorkerResponseToJS()`: Pushes worker response (endpoint, HTTP status, time, error) to JS after every server call
+   - Called from: viewDidLoad, handleWillEnterForeground, syncCompanionToServer, checkCompanionOnServer
+
+8. **Build number: 11 → 12**
+
+**Files Changed:**
+- `ios/App/App/PatchedBridgeViewController.swift` — Toast CSS+JS, subscription status UI, already-subscribed banner, enhanced diagnostics, helper methods, action field, trial matching, orchestrator
+- `ios/App/App.xcodeproj/project.pbxproj` — Build 11 → 12
+- `AGENT.md` — Updated phase, Known Issues, IAP Stage Two table, Last Change Log, Update Log
+- `CHANGELOG.md` — This entry
+
+**Verification:**
+- `npm run lint` → 0 errors ✅
+- `npm run test` → 42/42 passed ✅
+- `npm run build` → success ✅
+- `npx cap sync ios` → 3 plugins ✅
+- `xcodebuild Release` → BUILD SUCCEEDED ✅
+
+---
+
 ### 2026-02-11 — Raouf: Build 9 — Native Token Two-Way Sync (Swift ↔ localStorage)
 
 **Scope:** Fix critical gap where token exists in localStorage but NOT in native persistence (UserDefaults). The previous fix (tokenStorage.js + AuthContext.jsx) was DEAD CODE in production — the app loads the remote Base44 site, not our local bundle.

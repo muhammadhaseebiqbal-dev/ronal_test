@@ -240,7 +240,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             }
             Task { @MainActor in
                 let result = await AAStoreManager.shared.purchase(productId: productId)
-                var payload: [String: Any] = ["status": result.status]
+                var payload: [String: Any] = ["status": result.status, "action": "buy"]
                 if let pid = result.productId { payload["productId"] = pid }
                 payload["isCompanion"] = result.isCompanion
                 if let msg = result.message { payload["message"] = msg }
@@ -263,7 +263,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 let result = await AAStoreManager.shared.restorePurchases()
                 var payload: [String: Any] = [
                     "status": result.status,
-                    "isCompanion": result.isCompanion
+                    "isCompanion": result.isCompanion,
+                    "action": "restore"
                 ]
                 if !result.restoredProducts.isEmpty {
                     payload["productId"] = result.restoredProducts.first ?? ""
@@ -371,9 +372,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
         os_log(.info, log: Self.log, "[ServerSync] Posting JWS to Worker for server-side validation...")
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             if let error = error {
                 os_log(.error, log: Self.log, "[ServerSync] Network error: %{public}@", error.localizedDescription)
+                DispatchQueue.main.async { self?.pushWorkerResponseToJS(endpoint: "/validate-receipt", statusCode: 0, error: error.localizedDescription) }
                 return
             }
             guard let httpResponse = response as? HTTPURLResponse else { return }
@@ -384,6 +386,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             } else {
                 os_log(.info, log: Self.log, "[ServerSync] Response %d (no body)", statusCode)
             }
+            DispatchQueue.main.async { self?.pushWorkerResponseToJS(endpoint: "/validate-receipt", statusCode: statusCode, error: nil) }
         }.resume()
     }
 
@@ -410,17 +413,23 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+
             if let error = error {
                 os_log(.error, log: Self.log, "[ServerCheck] Error: %{public}@", error.localizedDescription)
+                DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: 0, error: error.localizedDescription) }
                 return
             }
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: "Invalid response") }
                 return
             }
 
             let serverIsCompanion = json["isCompanion"] as? Bool ?? false
             let localIsCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+
+            DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: nil) }
 
             if serverIsCompanion != localIsCompanion {
                 os_log(.info, log: Self.log, "[ServerCheck] Server companion=%{public}@ differs from local=%{public}@ — updating",
@@ -433,6 +442,39 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 os_log(.info, log: Self.log, "[ServerCheck] Server companion=%{public}@ matches local", serverIsCompanion ? "true" : "false")
             }
         }.resume()
+    }
+
+    // MARK: – Build 12: Push diagnostics to JS
+
+    /// Pushes entitlement check results to JS for diagnostics (Build 12).
+    private func pushEntitlementCheckToJS(isCompanion: Bool, products: [String]) {
+        guard let webView = self.webView else { return }
+        let timeStr = ISO8601DateFormatter().string(from: Date())
+        let productsStr = products.joined(separator: ",")
+        let js = """
+        window.__aaLastEntitlementCheck = {
+          time: '\(timeStr)',
+          isCompanion: \(isCompanion ? "true" : "false"),
+          products: '\(productsStr)'
+        };
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    /// Pushes worker response details to JS for diagnostics (Build 12).
+    private func pushWorkerResponseToJS(endpoint: String, statusCode: Int, error: String?) {
+        guard let webView = self.webView else { return }
+        let timeStr = ISO8601DateFormatter().string(from: Date())
+        let safeError = (error ?? "").replacingOccurrences(of: "'", with: "\\'")
+        let js = """
+        window.__aaLastWorkerResponse = {
+          endpoint: '\(endpoint)',
+          statusCode: \(statusCode),
+          time: '\(timeStr)',
+          error: \(error != nil ? "'\(safeError)'" : "null")
+        };
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     // MARK: – Full Logout (clears all auth state so a different account can log in)
@@ -506,8 +548,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Check entitlements on cold boot and persist state
         if #available(iOS 15.0, *) {
             Task { @MainActor in
-                let (isCompanion, _) = await AAStoreManager.shared.checkEntitlements()
+                let (isCompanion, activeProducts) = await AAStoreManager.shared.checkEntitlements()
                 self.persistCompanionState(isCompanion)
+                self.pushEntitlementCheckToJS(isCompanion: isCompanion, products: activeProducts)
             }
         }
 
@@ -769,9 +812,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         if #available(iOS 15.0, *) {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                let (isCompanion, _) = await AAStoreManager.shared.checkEntitlements()
+                let (isCompanion, activeProducts) = await AAStoreManager.shared.checkEntitlements()
                 self.persistCompanionState(isCompanion)
                 self.refreshWebEntitlements(isCompanion: isCompanion)
+                self.pushEntitlementCheckToJS(isCompanion: isCompanion, products: activeProducts)
             }
         }
 
@@ -1051,13 +1095,17 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           dataStoreType: '\(storeType)',
           hasNativeToken: \(hasNativeToken ? "true" : "false"),
           nativeTokenLen: \(nativeTokenLen),
-          isCompanion: \(isCompanion ? "true" : "false")
+          isCompanion: \(isCompanion ? "true" : "false"),
+          workerConfigured: \(!Self.companionWorkerURL.contains("YOUR_SUBDOMAIN") ? "true" : "false")
         };
         // Build 10: IAP callback default + companion state
         window.__aaPurchaseResult = window.__aaPurchaseResult || function(_){};
         window.__aaIsCompanion = \(isCompanion ? "true" : "false");
         // Build 11: Cross-device companion check via Cloudflare Worker
         window.__aaCompanionWorkerURL = '\(Self.companionWorkerURL)';
+        // Build 12: Diagnostics tracking globals
+        window.__aaLastEntitlementCheck = window.__aaLastEntitlementCheck || null;
+        window.__aaLastWorkerResponse = window.__aaLastWorkerResponse || null;
         window.__aaCheckCompanion = function() {
           var workerURL = window.__aaCompanionWorkerURL;
           if (!workerURL || workerURL.indexOf('YOUR_SUBDOMAIN') !== -1) return Promise.resolve({ isCompanion: window.__aaIsCompanion });
@@ -1359,6 +1407,89 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
         .aa-diag-copy { background: #c9a96e; color: #0b1f2a; }
         .aa-diag-close { background: #333; color: #e8e8e8; }
+
+        /* ── Build 12: Toast notification ── */
+        .aa-toast {
+          position: fixed;
+          top: calc(env(safe-area-inset-top, 44px) + 8px);
+          left: 16px;
+          right: 16px;
+          z-index: 99997;
+          padding: 16px 20px;
+          border-radius: 14px;
+          font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+          font-size: 15px;
+          font-weight: 600;
+          text-align: center;
+          box-shadow: 0 4px 24px rgba(0,0,0,0.15);
+          transform: translateY(-120%);
+          transition: transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+          pointer-events: none;
+        }
+        .aa-toast.visible { transform: translateY(0); }
+        .aa-toast.success { background: #059669; color: #ffffff; }
+        .aa-toast.error { background: #dc2626; color: #ffffff; }
+        .aa-toast.info { background: #1e293b; color: #ffffff; }
+
+        /* ── Build 12: Subscription Status section on More/Settings ── */
+        #aa-subscription-section {
+          margin: 16px 16px 8px 16px;
+          padding: 16px;
+          background: #f8f9fa;
+          border-radius: 12px;
+          border: 1px solid #e5e7eb;
+          font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+        }
+        #aa-subscription-section .aa-sub-label {
+          font-size: 13px;
+          font-weight: 500;
+          color: #6b7280;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+          margin: 0 0 8px 0;
+        }
+        #aa-subscription-section .aa-sub-status {
+          font-size: 17px;
+          font-weight: 700;
+          margin: 0 0 4px 0;
+        }
+        #aa-subscription-section .aa-sub-status.active { color: #059669; }
+        #aa-subscription-section .aa-sub-status.free { color: #6b7280; }
+        #aa-subscription-section .aa-sub-detail {
+          font-size: 13px;
+          color: #9ca3af;
+          margin: 0 0 12px 0;
+        }
+        #aa-sub-recheck-btn {
+          display: block;
+          width: 100%;
+          padding: 12px;
+          background: #f1f5f9;
+          border: 1px solid #cbd5e1;
+          border-radius: 10px;
+          color: #334155;
+          font-size: 15px;
+          font-weight: 600;
+          cursor: pointer;
+          -webkit-tap-highlight-color: transparent;
+          font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+          text-align: center;
+        }
+        #aa-sub-recheck-btn:active { background: #e2e8f0; }
+        #aa-sub-recheck-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+        /* ── Build 12: Already-subscribed banner on paywall ── */
+        #aa-already-subscribed {
+          background: #059669;
+          color: #fff;
+          padding: 14px 16px;
+          text-align: center;
+          font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+          font-weight: 600;
+          font-size: 15px;
+          border-radius: 10px;
+          margin: 8px 16px;
+        }
       `;
       document.head.appendChild(style);
     })();
@@ -1394,6 +1525,62 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       'use strict';
       if (window.__aaPatched) return;
       window.__aaPatched = true;
+
+      // ── 0a. TOAST NOTIFICATION SYSTEM (Build 12) ──
+      var __aaToastTimer = null;
+      function showAAToast(message, type) {
+        var existing = document.querySelector('.aa-toast');
+        if (existing) existing.remove();
+        if (__aaToastTimer) { clearTimeout(__aaToastTimer); __aaToastTimer = null; }
+        var toast = document.createElement('div');
+        toast.className = 'aa-toast ' + (type || 'info');
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        requestAnimationFrame(function() {
+          requestAnimationFrame(function() { toast.classList.add('visible'); });
+        });
+        __aaToastTimer = setTimeout(function() {
+          toast.classList.remove('visible');
+          setTimeout(function() { if (toast.parentNode) toast.remove(); }, 400);
+          __aaToastTimer = null;
+        }, 4000);
+      }
+
+      // ── 0b. PURCHASE RESULT HANDLER WITH TOAST (Build 12) ──
+      window.__aaPurchaseResult = function(result) {
+        if (!result) return;
+        var status = result.status;
+        var action = result.action || '';
+        var source = result.source || '';
+        // Background renewal/refund
+        if (source === 'transactionUpdate') {
+          if (result.isCompanion) { showAAToast('Subscription renewed', 'success'); }
+          else { showAAToast('Subscription status changed', 'info'); }
+          updateSubscriptionStatusUI(result.isCompanion);
+          return;
+        }
+        if (action === 'restore') {
+          if (status === 'success' && result.isCompanion) {
+            showAAToast('Subscription restored! Companion unlocked.', 'success');
+          } else if (status === 'success' && !result.isCompanion) {
+            showAAToast('No active subscription found.', 'info');
+          } else if (status === 'error') {
+            showAAToast(result.message || 'Restore failed. Please try again.', 'error');
+          }
+        } else if (action === 'buy') {
+          if (status === 'success' && result.isCompanion) {
+            showAAToast('Companion features unlocked!', 'success');
+          } else if (status === 'error') {
+            showAAToast(result.message || 'Purchase failed. Please try again.', 'error');
+          } else if (status === 'pending') {
+            showAAToast('Purchase pending approval.', 'info');
+          }
+          // cancelled: no toast — user initiated it
+        }
+        if (result.isCompanion !== undefined) {
+          updateSubscriptionStatusUI(result.isCompanion);
+        }
+      };
 
       // ── 0. GOOGLE SIGN-IN: HIDDEN ON iOS (Build 6) ──
       // Roland confirmed: Email/Password only for iOS. No Base44 subscription for Google.
@@ -2106,9 +2293,26 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           lines.push('  No errors captured');
         }
         lines.push('');
-        lines.push('-- Companion Subscription (Build 10) --');
-        lines.push('  isCompanion: ' + (window.__aaIsCompanion ? 'true' : 'false'));
+        lines.push('-- Companion Subscription (Build 12) --');
+        lines.push('  Status: ' + (window.__aaIsCompanion ? 'COMPANION ACTIVE' : 'FREE'));
+        lines.push('  JS isCompanion: ' + (window.__aaIsCompanion ? 'true' : 'false'));
         lines.push('  nativeDiag.isCompanion: ' + (native.isCompanion ? 'true' : 'false'));
+        lines.push('  Worker URL configured: ' + (native.workerConfigured ? 'YES' : 'NO'));
+        var lastCheck = window.__aaLastEntitlementCheck;
+        if (lastCheck) {
+          lines.push('  Last entitlement check: ' + (lastCheck.time || 'never'));
+          lines.push('  Check result: isCompanion=' + lastCheck.isCompanion + ' products=[' + (lastCheck.products || '') + ']');
+        } else {
+          lines.push('  Last entitlement check: none yet');
+        }
+        var lastWorker = window.__aaLastWorkerResponse;
+        if (lastWorker) {
+          lines.push('  Last worker call: ' + (lastWorker.endpoint || '?') + ' -> HTTP ' + (lastWorker.statusCode || '?'));
+          lines.push('  Worker call time: ' + (lastWorker.time || 'unknown'));
+          if (lastWorker.error) lines.push('  Worker error: ' + lastWorker.error);
+        } else {
+          lines.push('  Last worker call: none yet');
+        }
         lines.push('');
         lines.push('-- Login --');
         lines.push('  Method: Email/Password only (Google hidden on iOS)');
@@ -2397,9 +2601,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           if (btn.getAttribute('data-aa-iap-wired')) return;
           var text = (btn.textContent || '').trim().toLowerCase();
 
-          // Match subscribe monthly
+          // Match subscribe monthly + trial (Build 12: added trial patterns)
           if ((text.indexOf('subscribe') !== -1 && text.indexOf('monthly') !== -1) ||
-              text === 'monthly' || text === 'subscribe monthly') {
+              text === 'monthly' || text === 'subscribe monthly' ||
+              text === 'start free trial' || text === 'start trial' ||
+              text === 'start companion trial' || text === 'try companion' ||
+              (text.indexOf('trial') !== -1 && text.indexOf('yearly') === -1 && text.indexOf('annual') === -1)) {
             btn.setAttribute('data-aa-iap-wired', 'monthly');
             btn.addEventListener('click', function(e) {
               e.preventDefault();
@@ -2445,6 +2652,124 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             });
           }
         });
+      }
+
+      // ── 6f. SUBSCRIPTION STATUS UI (Build 12) ──
+      // Visible "Companion Active" / "Free" indicator on More/Settings page.
+      // "Recheck Subscription" button calls __aaCheckCompanion() for cross-device sync.
+
+      function updateSubscriptionStatusUI(isCompanion) {
+        var statusEl = document.getElementById('aa-sub-status-text');
+        if (statusEl) {
+          statusEl.textContent = isCompanion ? 'Companion Active' : 'Free';
+          statusEl.className = 'aa-sub-status ' + (isCompanion ? 'active' : 'free');
+        }
+        var detailEl = document.getElementById('aa-sub-detail-text');
+        if (detailEl) {
+          detailEl.textContent = isCompanion ? 'Your Companion subscription is active.' : 'Subscribe to unlock Companion features.';
+        }
+        // Update global state
+        window.__aaIsCompanion = isCompanion;
+        // Remove already-subscribed banner if subscription expired
+        if (!isCompanion) {
+          var banner = document.getElementById('aa-already-subscribed');
+          if (banner) banner.remove();
+        }
+      }
+
+      function injectSubscriptionStatus() {
+        if (!isMoreOrSettingsRoute()) {
+          var stale = document.getElementById('aa-subscription-section');
+          if (stale) stale.remove();
+          return;
+        }
+        if (document.getElementById('aa-subscription-section')) return;
+        var root = document.getElementById('root');
+        if (!root) return;
+        var container = root.querySelector('main') ||
+                        root.querySelector('[class*="scroll"]') ||
+                        root.querySelector('[class*="content"]') ||
+                        root;
+        var text = (container.innerText || '').trim();
+        if (text.length < 10) return;
+
+        var isCompanion = window.__aaIsCompanion === true;
+        var section = document.createElement('div');
+        section.id = 'aa-subscription-section';
+
+        var label = document.createElement('div');
+        label.className = 'aa-sub-label';
+        label.textContent = 'Subscription';
+        section.appendChild(label);
+
+        var status = document.createElement('div');
+        status.id = 'aa-sub-status-text';
+        status.className = 'aa-sub-status ' + (isCompanion ? 'active' : 'free');
+        status.textContent = isCompanion ? 'Companion Active' : 'Free';
+        section.appendChild(status);
+
+        var detail = document.createElement('div');
+        detail.id = 'aa-sub-detail-text';
+        detail.className = 'aa-sub-detail';
+        detail.textContent = isCompanion ? 'Your Companion subscription is active.' : 'Subscribe to unlock Companion features.';
+        section.appendChild(detail);
+
+        var recheckBtn = document.createElement('button');
+        recheckBtn.id = 'aa-sub-recheck-btn';
+        recheckBtn.textContent = 'Recheck Subscription';
+        recheckBtn.addEventListener('click', function(e) {
+          e.preventDefault();
+          recheckBtn.disabled = true;
+          recheckBtn.textContent = 'Checking...';
+          var p = (typeof window.__aaCheckCompanion === 'function')
+            ? window.__aaCheckCompanion()
+            : Promise.resolve({ isCompanion: window.__aaIsCompanion });
+          p.then(function(data) {
+            window.__aaIsCompanion = data.isCompanion === true;
+            updateSubscriptionStatusUI(data.isCompanion === true);
+            recheckBtn.disabled = false;
+            recheckBtn.textContent = 'Recheck Subscription';
+            if (data.isCompanion) {
+              showAAToast('Companion subscription confirmed!', 'success');
+            } else {
+              showAAToast('No active subscription found.', 'info');
+            }
+          }).catch(function() {
+            recheckBtn.disabled = false;
+            recheckBtn.textContent = 'Recheck Subscription';
+            showAAToast('Could not check subscription. Try again.', 'error');
+          });
+        });
+        section.appendChild(recheckBtn);
+
+        var logoutSection = document.getElementById('aa-logout-section');
+        if (logoutSection) {
+          container.insertBefore(section, logoutSection);
+        } else {
+          container.appendChild(section);
+        }
+      }
+
+      // ── 6g. ALREADY-SUBSCRIBED PAYWALL HANDLING (Build 12) ──
+      // If user already has Companion, show a banner on the paywall page.
+
+      function handleAlreadySubscribed() {
+        if (!window.__aaIsCompanion) {
+          var banner = document.getElementById('aa-already-subscribed');
+          if (banner) banner.remove();
+          return;
+        }
+        var root = document.getElementById('root');
+        if (!root) return;
+        // Detect paywall: page has IAP-wired buttons
+        var wiredBtns = root.querySelectorAll('[data-aa-iap-wired]');
+        if (wiredBtns.length === 0) return;
+        if (document.getElementById('aa-already-subscribed')) return;
+        var banner = document.createElement('div');
+        banner.id = 'aa-already-subscribed';
+        banner.textContent = 'You have an active Companion subscription!';
+        var main = root.querySelector('main') || root;
+        main.insertBefore(banner, main.firstChild);
       }
 
       // ── 6d. SESSION VALIDATION (Build 8) ──
@@ -2570,8 +2895,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           fixMissingBackButtons();
           detectAndFixErrorScreen();
           interceptGoogleAuth();
+          injectSubscriptionStatus();
           injectLogoutButton();
           wireIAPButtons();
+          handleAlreadySubscribed();
         }, 250);
       }
 
