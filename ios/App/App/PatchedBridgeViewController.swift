@@ -182,8 +182,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     private static let companionDefaultsKey = "aa_is_companion"
 
     /// Cloudflare Worker URL for cross-device Companion validation (Build 11).
-    /// Roland: update this after deploying the Worker with `wrangler deploy`.
-    private static let companionWorkerURL = "https://companion-validator.YOUR_SUBDOMAIN.workers.dev"
+    /// Deployed by Roland — 2026-02-18.
+    private static let companionWorkerURL = "https://companion-validator.abideandanchor.workers.dev"
 
     // MARK: – F) Script message handler (diagnostics copy)
 

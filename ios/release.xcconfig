@@ -1,2 +1,4 @@
 // Release configuration for Abide & Anchor iOS
 // No debug flags — production-ready
+// Lock bundle ID — prevents Xcode Automatic signing from overriding it
+PRODUCT_BUNDLE_IDENTIFIER = com.abideandanchor.app

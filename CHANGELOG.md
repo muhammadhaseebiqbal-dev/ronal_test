@@ -4,6 +4,78 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-18 — Raouf: Full Audit — Bundle ID Still Wrong in pbxproj (Critical Fix)
+
+- **Root cause identified**: xcconfig has lower priority than target-level pbxproj settings in Xcode's build settings hierarchy. `PRODUCT_BUNDLE_IDENTIFIER = com.abideandanchor.app` in xcconfig was being overridden by `com.abideandanchor.test` explicitly set in both Debug and Release target configs in `project.pbxproj`. This meant the wrong bundle ID was being used for signing and StoreKit product lookups.
+- **Fixed** both `504EC3171FED79650016851F /* Debug */` and `504EC3181FED79650016851F /* Release */` target configs in `project.pbxproj`: `com.abideandanchor.test` → `com.abideandanchor.app`
+- **Verified**: `grep abideandanchor.test project.pbxproj` → 0 matches. Both configs now show `com.abideandanchor.app`.
+- **All other checks passed**: entitlements empty ✅, xcconfig locked ✅, xcscheme path correct ✅, storekit products match Swift IDs ✅, worker URL live ✅, all error simulations disabled ✅
+- **Files changed**: `ios/App/App.xcodeproj/project.pbxproj`
+
+---
+
+### 2026-02-18 — Raouf: Fix Wrong xcscheme storeKitConfigurationFileReference Path
+
+- **Bug**: `App.xcscheme` had `storeKitConfigurationFileReference = "../Configuration.storekit"` — path resolved to `ios/Configuration.storekit` which does not exist. This meant Xcode never loaded the local StoreKit config, so `Product.products(for:)` still hit Apple servers and returned empty (products not in App Store Connect).
+- **Fix**: Changed path to `Configuration.storekit` (no `../`). The scheme's `storeKitConfigurationFileReference` is relative to the `.xcodeproj` container directory (`ios/App/`). The file lives at `ios/App/Configuration.storekit` — same directory.
+- **Effect**: Xcode will now intercept all `Product.products()` and `product.purchase()` calls through the local config. Red banner "Product not found" should be resolved.
+- **Files changed**: `ios/App/App.xcodeproj/xcshareddata/xcschemes/App.xcscheme` (line 43)
+- **Next step for Roland**: Close Xcode completely → reopen `ios/App/App.xcodeproj` → plug iPhone via USB → press Run. The purchase sheet should now appear.
+
+---
+
+### 2026-02-18 — Raouf: StoreKit Local Configuration for IAP Testing (No App Store Connect Required)
+
+- **Root cause confirmed via Xcode console**: `[Purchase] Product not found` — `Product.products(for:)` returns empty because products `com.abideandanchor.companion.monthly` / `.yearly` are not yet configured in App Store Connect.
+- **Created `ios/App/Configuration.storekit`**: Local StoreKit 2 configuration file defining both Companion subscription products with pricing ($9.99/month, $79.99/year). When active in the Xcode scheme, this intercepts all `Product.products()` and `product.purchase()` calls and simulates the full App Store flow locally — no App Store Connect setup required.
+- **Created `App.xcodeproj/xcshareddata/xcschemes/App.xcscheme`**: Shared Xcode scheme with `storeKitConfigurationFileReference` pointing to `Configuration.storekit`. This means every dev that opens the project gets the same test config automatically.
+- **Registered `Configuration.storekit`** as a file reference and group member in `project.pbxproj` so it appears in the Xcode file navigator.
+- **To activate**: Open `ios/App/App.xcodeproj` in Xcode → scheme is auto-shared → run directly on device via USB. Purchase sheet appears, full toast + server sync flow runs.
+- **For production**: Roland still needs paid Apple Developer account + products in App Store Connect for TestFlight/App Store.
+- Verification: xcodebuild Debug ✅ BUILD SUCCEEDED
+
+---
+
+### 2026-02-18 — Raouf: Fix Wrong Entitlement + Lock Bundle ID Against Xcode Overrides
+
+- **Removed** `com.apple.developer.in-app-payments` from `App.entitlements` — that key is for Apple Pay web/NFC payments, NOT for StoreKit App Store IAP. Adding it caused "Personal teams do not support Apple Pay capability" error and blocked signing. StoreKit IAP requires no explicit entitlement in the .entitlements file.
+- **Locked bundle ID** in both `debug.xcconfig` and `release.xcconfig` (`PRODUCT_BUNDLE_IDENTIFIER = com.abideandanchor.app`). Xcode Automatic signing rewrites the pbxproj value when it encounters signing errors; xcconfig values are the base layer and are harder for Xcode to silently override.
+- **Re-fixed** `project.pbxproj` bundle ID back to `com.abideandanchor.app` in both Debug and Release configs (Xcode had reverted it to `test` during a signing resolution attempt).
+- **Cleared** Xcode DerivedData cache to force Xcode to re-evaluate signing with the correct bundle ID.
+- Verification: build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+---
+
+### 2026-02-18 — Raouf: Wire Cloudflare Worker URL (Cross-Device Companion Sync Now Live)
+
+- Updated `companionWorkerURL` in `PatchedBridgeViewController.swift:186` from `YOUR_SUBDOMAIN` placeholder to the deployed Worker: `https://companion-validator.abideandanchor.workers.dev`
+- Effect: `syncCompanionToServer()` (called after purchase/restore) will now POST JWS to Worker for server-side validation. `checkCompanionOnServer()` (called on cold boot + foreground resume) will now GET companion status from Worker. `window.__aaCheckCompanion()` in web JS will also resolve to the real endpoint. Diagnostics overlay will show `workerConfigured: true`.
+- **Verification:** lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+---
+
+### 2026-02-18 — Raouf: IAP Audit — Critical Bundle ID Fix + In-App Purchase Entitlement
+
+**Root cause of IAP not connecting to Apple Store — 2 critical issues fixed:**
+
+1. **Bundle ID mismatch (CRITICAL)** — `PRODUCT_BUNDLE_IDENTIFIER` was `com.abideandanchor.test` in BOTH Debug and Release build configurations in `project.pbxproj`. Apple's App Store routes `Product.products(for:)` calls by bundle ID. With the wrong ID, the App Store returns an empty product list — StoreKit logs "Product not found" and purchase never launches.
+   - Fixed: `com.abideandanchor.test` → `com.abideandanchor.app` in both configs (lines 322, 346)
+
+2. **Missing In-App Purchase entitlement (CRITICAL)** — No `.entitlements` file existed. No `CODE_SIGN_ENTITLEMENTS` was set in build settings. Without the `com.apple.developer.in-app-payments` entitlement, the provisioning profile cannot grant IAP access and StoreKit calls are rejected at OS level.
+   - Created: `ios/App/App/App.entitlements` with `com.apple.developer.in-app-payments = []`
+   - Added: `CODE_SIGN_ENTITLEMENTS = App/App.entitlements` to both Debug and Release configs
+   - Added: `App.entitlements` as a file reference and group member in `project.pbxproj`
+
+**Verification:** lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+**Remaining action required (Roland):**
+- Ensure `com.abideandanchor.app` app record exists in App Store Connect with In-App Purchase capability enabled
+- Ensure products `com.abideandanchor.companion.monthly` and `com.abideandanchor.companion.yearly` are configured in App Store Connect under that app record
+- Create a sandbox tester account in App Store Connect for testing
+- Deploy Cloudflare Worker and update `companionWorkerURL` in `PatchedBridgeViewController.swift:186` (currently still has `YOUR_SUBDOMAIN` placeholder — server sync is silently skipped)
+
+---
+
 ### 2026-02-18 — Raouf: Build 12 — Production-Ready IAP: Toast Feedback, Subscription Status UI, Diagnostics, Already-Subscribed Handling
 
 **Scope:** Address Roland's full IAP Definition of Done checklist — ensure all 7 acceptance tests pass end-to-end. Add user-visible feedback, subscription status UI, already-subscribed handling, and enhanced diagnostics.

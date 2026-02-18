@@ -103,7 +103,7 @@ npm run test           # Unit tests
 | Missing back buttons | ✅ FIXED — DOM patch injects back nav |
 | Bottom nav squashed (5 tabs) | ✅ FIXED — CSS flex/min-width patch |
 | White screen on error | ✅ FIXED — Global error handler fallback |
-| Bundle ID mismatch | ✅ FIXED — com.abideandanchor.app |
+| Bundle ID mismatch (project.pbxproj had .test) | ✅ FIXED — com.abideandanchor.app in both Debug + Release |
 | Missing privacy manifest | ✅ FIXED — PrivacyInfo.xcprivacy |
 | armv7 architecture | ✅ FIXED — arm64 only |
 | No offline handling | ✅ FIXED — OfflineScreen component |
@@ -176,6 +176,19 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 ---
 
 ## Last Change Log
+
+**2026-02-18 — Raouf: Wire Cloudflare Worker URL (Cross-Device Companion Sync Now Live)**
+- Updated `companionWorkerURL` from placeholder to `https://companion-validator.abideandanchor.workers.dev`
+- All server-sync paths now active: `syncCompanionToServer()`, `checkCompanionOnServer()`, `window.__aaCheckCompanion()`, diagnostics `workerConfigured: true`
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+**2026-02-18 — Raouf: IAP Audit — Critical Bundle ID Fix + In-App Purchase Entitlement**
+- **Root cause found**: `PRODUCT_BUNDLE_IDENTIFIER = com.abideandanchor.test` in BOTH Debug and Release configs caused `Product.products(for:)` to return empty (App Store routes by bundle ID). Zero products → zero purchases.
+- **Fix 1**: `com.abideandanchor.test` → `com.abideandanchor.app` in `project.pbxproj` (both configs)
+- **Fix 2**: Created `ios/App/App/App.entitlements` with `com.apple.developer.in-app-payments` capability
+- **Fix 3**: Added `CODE_SIGN_ENTITLEMENTS = App/App.entitlements` to Debug + Release build settings; added file reference and group entry in `project.pbxproj`
+- **Worker**: `companionWorkerURL` still has `YOUR_SUBDOMAIN` placeholder — Roland must deploy Worker and update URL before cross-device sync works
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
 
 **2026-02-18 — Raouf: Build 12 — Production-Ready IAP: Toast Feedback, Subscription Status UI, Diagnostics, Already-Subscribed Handling**
 - **Toast notifications (user-facing feedback)**: Purchase/restore results now show visible toast notifications at the top of the screen. Success (green), error (red), info (dark). Toasts auto-dismiss after 4 seconds. Distinguishes buy vs restore vs transaction updates via `action` field in payloads.
@@ -356,6 +369,22 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-18 (Australia/Sydney)
+- **Scope:** IAP Audit — Critical Bundle ID Fix + In-App Purchase Entitlement
+- **Summary:** Full audit of IAP pipeline revealed two critical blockers preventing App Store connection. (1) `PRODUCT_BUNDLE_IDENTIFIER` was `com.abideandanchor.test` in both Debug and Release target configs — Apple's StoreKit routes `Product.products(for:)` by the bundle ID of the running app, so it returned an empty array and purchases were silently blocked with "Product not found". (2) No `.entitlements` file existed and `CODE_SIGN_ENTITLEMENTS` was never set — without `com.apple.developer.in-app-payments`, the provisioning profile doesn't grant IAP access at OS level. Fixed both. Also noted that `companionWorkerURL` still has `YOUR_SUBDOMAIN` placeholder.
+- **Files Changed:**
+  - `ios/App/App/App.entitlements` — CREATED: New entitlements file with `com.apple.developer.in-app-payments`
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Added `App.entitlements` file reference + group entry; added `CODE_SIGN_ENTITLEMENTS = App/App.entitlements`; fixed `PRODUCT_BUNDLE_IDENTIFIER = com.abideandanchor.app` in both Debug (504EC3171) and Release (504EC3181) target build configs
+  - `AGENT.md` — Updated Known Issues, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED (exit 0)
+- **Follow-ups:**
+  - Roland: verify App Store Connect app record `com.abideandanchor.app` exists with In-App Purchase capability ON
+  - Roland: verify products `com.abideandanchor.companion.monthly` + `com.abideandanchor.companion.yearly` exist in App Store Connect
+  - Roland: create sandbox tester account, run TestFlight build, test purchase flow
+  - Roland: deploy Cloudflare Worker (`cd worker/companion-validator && wrangler deploy`), update `companionWorkerURL` in `PatchedBridgeViewController.swift:186`, rebuild
 
 **Raouf:**
 - **Date:** 2026-02-18 (Australia/Sydney)
