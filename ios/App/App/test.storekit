@@ -1,5 +1,15 @@
 {
-  "identifier" : "CompanionSubscriptions",
+  "appPolicies" : {
+    "eula" : "",
+    "policies" : [
+      {
+        "locale" : "en_US",
+        "policyText" : "",
+        "policyURL" : ""
+      }
+    ]
+  },
+  "identifier" : "0D262338",
   "nonRenewingSubscriptions" : [
 
   ],
@@ -7,48 +17,22 @@
 
   ],
   "settings" : {
+    "_askToBuyEnabled" : false,
+    "_billingGracePeriodEnabled" : false,
+    "_billingIssuesEnabled" : false,
+    "_disableDialogs" : false,
+    "_failTransactionsEnabled" : false,
     "_locale" : "en_US",
+    "_renewalBillingIssuesEnabled" : false,
+    "_storefront" : "USA",
     "_storeKitErrors" : [
-      {
-        "current" : null,
-        "enabled" : false,
-        "name" : "Load Products"
-      },
-      {
-        "current" : null,
-        "enabled" : false,
-        "name" : "Purchase"
-      },
-      {
-        "current" : null,
-        "enabled" : false,
-        "name" : "Verification"
-      },
-      {
-        "current" : null,
-        "enabled" : false,
-        "name" : "App Store Sync"
-      },
-      {
-        "current" : null,
-        "enabled" : false,
-        "name" : "Restore Purchases"
-      },
-      {
-        "current" : null,
-        "enabled" : false,
-        "name" : "App Transaction"
-      },
-      {
-        "current" : null,
-        "enabled" : false,
-        "name" : "Manage Subscriptions Sheet"
-      }
-    ]
+
+    ],
+    "_timeRate" : 0
   },
   "subscriptionGroups" : [
     {
-      "id" : "AA_COMPANION_GROUP",
+      "id" : "C0C11001",
       "localizations" : [
 
       ],
@@ -64,7 +48,7 @@
           "displayPrice" : "9.99",
           "familyShareable" : false,
           "groupNumber" : 1,
-          "internalID" : "AA_COMPANION_MONTHLY_001",
+          "internalID" : "C0C11002",
           "introductoryOffer" : null,
           "localizations" : [
             {
@@ -76,6 +60,7 @@
           "productID" : "com.abideandanchor.companion.monthly",
           "recurringSubscriptionPeriod" : "P1M",
           "referenceName" : "Companion Monthly",
+          "subscriptionGroupID" : "C0C11001",
           "type" : "RecurringSubscription",
           "winBackOffers" : [
 
@@ -91,7 +76,7 @@
           "displayPrice" : "79.99",
           "familyShareable" : false,
           "groupNumber" : 2,
-          "internalID" : "AA_COMPANION_YEARLY_001",
+          "internalID" : "C0C11003",
           "introductoryOffer" : null,
           "localizations" : [
             {
@@ -103,6 +88,7 @@
           "productID" : "com.abideandanchor.companion.yearly",
           "recurringSubscriptionPeriod" : "P1Y",
           "referenceName" : "Companion Yearly",
+          "subscriptionGroupID" : "C0C11001",
           "type" : "RecurringSubscription",
           "winBackOffers" : [
 
@@ -112,7 +98,7 @@
     }
   ],
   "version" : {
-    "major" : 2,
+    "major" : 4,
     "minor" : 0
   }
 }

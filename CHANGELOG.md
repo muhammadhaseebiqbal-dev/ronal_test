@@ -4,6 +4,72 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-23 — Raouf: StoreKit Config Cleanup — Version 4 Fix Confirmed Working
+
+- **Problem (resolved)**: `Product.products(for:)` returned empty for both Companion products. Extensive debugging across multiple sessions revealed the root cause: Xcode 26.2 requires StoreKit configuration file format **version 4** (major:4, minor:0). Our manually-created `Configuration.storekit` used version 2 format and was silently ignored by Xcode.
+- **Fix**: Created `test.storekit` via Xcode's File > New > StoreKit Configuration File wizard (generates correct v4 format with `appPolicies` section). Added both subscription products:
+  - `com.abideandanchor.companion.monthly` — $9.99/month
+  - `com.abideandanchor.companion.yearly` — $79.99/year
+  - Subscription group: "Companion" (ID: C0C11001)
+- **Confirmed working**: Products load successfully on device when running from Xcode debugger.
+- **Cleanup performed**:
+  1. Removed temporary `diagnoseProductAvailability()` + `showDiagnosticAlert()` from AAStoreManager (debugging aids no longer needed)
+  2. Removed stale `Configuration.storekit` file reference + group entry from `project.pbxproj` (file no longer exists on disk)
+  3. Fixed `test.storekit` `lastKnownFileType` from `text` to `com.apple.dt.storekit`
+- **Files changed**: `PatchedBridgeViewController.swift`, `project.pbxproj`, `AGENT.md`, `CHANGELOG.md`
+- **Build number**: 12 → 13
+- **Verification**: xcodebuild Debug ✅ BUILD SUCCEEDED
+
+**⚠️ ROLAND — Please check these two things before building:**
+
+1. **Scheme → StoreKit Configuration**: Open Xcode → Edit Scheme (Cmd+<) → Run → Options tab → **StoreKit Configuration** dropdown → make sure `test.storekit` is selected (NOT "None"). Without this, products won't load during local testing.
+
+2. **Bundle ID is `com.abideandanchor.test`**: The Xcode project currently uses bundle ID `com.abideandanchor.test` (set by Xcode's automatic signing for Raouf's dev team). For **TestFlight / App Store**, Roland needs to change this back to `com.abideandanchor.app` to match App Store Connect. The xcconfig files (`debug.xcconfig` / `release.xcconfig`) already have `com.abideandanchor.app`, but Xcode's target-level settings override xcconfig. To fix: Xcode → App target → Build Settings → search "Bundle Identifier" → change to `com.abideandanchor.app` for both Debug and Release. This requires Roland's Apple Developer team provisioning profile.
+
+- **Key learnings**:
+  - Xcode 26.2 StoreKit config v4 format: has `appPolicies` section, `_billingGracePeriodEnabled`, `_renewalBillingIssuesEnabled` etc. in settings
+  - StoreKit local config ONLY works when launched from Xcode debugger (not `devicectl`)
+  - Always create `.storekit` files via Xcode's wizard — manual JSON gets wrong version format
+  - `lastKnownFileType` for `.storekit` must be `com.apple.dt.storekit`
+
+---
+
+### 2026-02-23 — Raouf: Fix StoreKit Configuration Not Loading ("Product not found") — Take 2
+
+- **Problem**: `Product.products(for:)` returned empty → `[Purchase] Product not found` for both monthly and yearly products. Products existed in `Configuration.storekit` with correct IDs, but Xcode never loaded the config.
+- **Root cause (two issues)**:
+  1. `App.xcscheme` used the wrong XML format: simple attribute on `<LaunchAction>` instead of `<StoreKitConfigurationFileReference>` nested element. Xcode silently ignored it.
+  2. Path was set to `../Configuration.storekit` but the scheme `identifier` path is relative to the `.xcodeproj` **container directory** (`ios/App/`), not the xcodeproj itself. File is at `ios/App/Configuration.storekit`, so path should be `Configuration.storekit` (no `../`).
+- **Fix**:
+  1. Replaced attribute with proper `<StoreKitConfigurationFileReference identifier="Configuration.storekit">` nested element
+  2. Added `diagnoseProductAvailability()` method to `AAStoreManager` — runs at app startup, logs whether products load or not, and explains the most likely cause if they don't
+- **Apple docs reference**: [TN3185](https://developer.apple.com/documentation/technotes/tn3185), [Setting up StoreKit Testing in Xcode](https://developer.apple.com/documentation/xcode/setting-up-storekit-testing-in-xcode)
+- **Files changed**: `ios/App/App.xcodeproj/xcshareddata/xcschemes/App.xcscheme`, `ios/App/App/PatchedBridgeViewController.swift`
+- **Verification**: xcodebuild Debug ✅ BUILD SUCCEEDED
+- **IMPORTANT for Roland**: The local StoreKit config ONLY works when running from Xcode (Debug). For TestFlight/App Store, products MUST be configured in App Store Connect.
+- **Next steps for Roland**:
+  1. Close Xcode completely (Cmd+Q)
+  2. Reopen `ios/App/App.xcodeproj`
+  3. Edit Scheme → Run → Options → StoreKit Configuration → select `Configuration.storekit`
+  4. Plug iPhone via USB → Press Run
+  5. Check Xcode console for `[DIAG:products]` lines — they'll show whether products loaded or not
+
+---
+
+### 2026-02-23 — Raouf: Build 13 — Web Refresh After Purchase (Instant Companion Unlock)
+
+- **Problem**: After a successful IAP purchase/restore, the native side updated UserDefaults and synced to the Cloudflare Worker, but the Base44 React app in the WebView still showed old user data. The app only re-fetched `/User/me` on kill/reopen, not after purchase.
+- **Fix**: Added `triggerWebRefreshAfterPurchase()` method using native `WKWebView.reloadFromOrigin()` (Apple docs: "performs end-to-end revalidation of the content using cache-validating conditionals"). Called in three places:
+  1. After `syncCompanionToServer()` returns 200 OK — ensures web refreshes once server-side `/User/me` data is updated
+  2. After successful purchase when no JWS is available (Worker sync won't fire)
+  3. After successful restore when no JWS is available
+- **Apple docs audit**: Used native `reloadFromOrigin()` instead of JS `window.location.reload(true)` — the `forceGet` parameter is deprecated/non-standard in modern WebKit, while `reloadFromOrigin()` is Apple's recommended API for cache-bypassing reloads.
+- **Effect**: Purchase completes → Worker updates Base44 user → WebView reloads from origin → Base44 re-fetches `/User/me` → Companion unlocks immediately. No kill/reopen needed.
+- **Files changed**: `ios/App/App/PatchedBridgeViewController.swift`
+- **Verification**: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+---
+
 ### 2026-02-18 — Raouf: Full Audit — Bundle ID Still Wrong in pbxproj (Critical Fix)
 
 - **Root cause identified**: xcconfig has lower priority than target-level pbxproj settings in Xcode's build settings hierarchy. `PRODUCT_BUNDLE_IDENTIFIER = com.abideandanchor.app` in xcconfig was being overridden by `com.abideandanchor.test` explicitly set in both Debug and Release target configs in `project.pbxproj`. This meant the wrong bundle ID was being used for signing and StoreKit product lookups.

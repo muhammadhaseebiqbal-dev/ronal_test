@@ -177,6 +177,20 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 
 ## Last Change Log
 
+**2026-02-23 — Raouf: StoreKit Config Cleanup — Version 4 Fix Confirmed Working**
+- **Root cause (resolved)**: Xcode 26.2 requires StoreKit config file format version 4 (major:4, minor:0). Our manually-created `Configuration.storekit` used version 2 and was silently ignored.
+- **Fix**: Created `test.storekit` via Xcode's File > New > StoreKit Configuration File wizard (generates correct v4 format), added both Companion subscription products (monthly $9.99, yearly $79.99), set in scheme.
+- **Cleanup**: Removed temporary `diagnoseProductAvailability()` + `showDiagnosticAlert()` from AAStoreManager (was for debugging). Removed stale `Configuration.storekit` references from project.pbxproj. Fixed `test.storekit` lastKnownFileType to `com.apple.dt.storekit`.
+- **Confirmed**: Products load successfully on device via Xcode debugger.
+- Verification: xcodebuild Debug ✅ BUILD SUCCEEDED
+
+**2026-02-23 — Raouf: Build 13 — Web Refresh After Purchase (Instant Companion Unlock)**
+- Added `triggerWebRefreshAfterPurchase()` using native `WKWebView.reloadFromOrigin()` (Apple docs: cache-bypassing reload)
+- Called after Worker sync returns 200 OK, and as fallback when no JWS available
+- Apple docs audit: `reloadFromOrigin()` is the correct API — `window.location.reload(true)` `forceGet` param is deprecated/non-standard in WebKit
+- Ensures Base44 re-fetches `/User/me` immediately so Companion unlocks without kill/reopen
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
 **2026-02-18 — Raouf: Wire Cloudflare Worker URL (Cross-Device Companion Sync Now Live)**
 - Updated `companionWorkerURL` from placeholder to `https://companion-validator.abideandanchor.workers.dev`
 - All server-sync paths now active: `syncCompanionToServer()`, `checkCompanionOnServer()`, `window.__aaCheckCompanion()`, diagnostics `workerConfigured: true`
@@ -369,6 +383,35 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-23 (Australia/Sydney)
+- **Scope:** StoreKit Config Cleanup — Version 4 Fix Confirmed Working
+- **Summary:** After extensive debugging, discovered the root cause of `Product.products(for:)` returning empty: Xcode 26.2 requires StoreKit config file format version 4 (major:4, minor:0), but our manually-created `Configuration.storekit` used version 2 and was silently ignored. Fix: created `test.storekit` via Xcode's File > New > StoreKit Configuration File wizard (generates correct v4 format), added both Companion subscription products (monthly $9.99, yearly $79.99), set in scheme. Confirmed working on device — products now load. Cleanup: removed temporary `diagnoseProductAvailability()` + `showDiagnosticAlert()` diagnostic methods from AAStoreManager. Removed stale `Configuration.storekit` file reference and group entry from project.pbxproj (file no longer exists on disk). Fixed `test.storekit` lastKnownFileType from `text` to `com.apple.dt.storekit`.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Removed `diagnoseProductAvailability()`, `showDiagnosticAlert()`, and startup diagnostic call
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Removed stale `Configuration.storekit` file reference + group entry; fixed `test.storekit` lastKnownFileType to `com.apple.dt.storekit`
+  - `AGENT.md` — Updated Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** xcodebuild Debug ✅ BUILD SUCCEEDED
+- **Key learnings:**
+  - Xcode 26.2 StoreKit config format: version 4 with `appPolicies` section, different `settings` fields
+  - StoreKit local config ONLY works when launched from Xcode debugger (not devicectl)
+  - Must create `.storekit` files via Xcode's wizard — manual JSON creation gets wrong version format
+  - `lastKnownFileType` for `.storekit` files must be `com.apple.dt.storekit`
+
+**Raouf:**
+- **Date:** 2026-02-23 (Australia/Sydney)
+- **Scope:** Build 13 — Web Refresh After Purchase (Instant Companion Unlock)
+- **Summary:** After a successful IAP purchase or restore, the native side updated UserDefaults and synced to the Cloudflare Worker, but the Base44 React app in the WebView didn't re-fetch `/User/me` until the app was killed and reopened. Added `triggerWebRefreshAfterPurchase()` method using native `WKWebView.reloadFromOrigin()` (Apple docs: "performs end-to-end revalidation of the content using cache-validating conditionals") after the Worker sync returns 200 OK. Also added fallback calls in the buy and restore paths for when no JWS is available (Worker sync won't fire). Apple docs audit confirmed `reloadFromOrigin()` is the correct API — JS `window.location.reload(true)` `forceGet` param is deprecated/non-standard in modern WebKit. This completes Roland's DoD criterion: "purchase unlocks instantly."
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added `triggerWebRefreshAfterPurchase()` using native `reloadFromOrigin()`, called from `syncCompanionToServer()` on 200 OK and from buy/restore fallback paths
+  - `AGENT.md` — Updated Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED (code signing skipped — no provisioning profile on this machine)
+- **Follow-ups:**
+  - Roland: rebuild and test purchase on device — Companion should unlock immediately after purchase without kill/reopen
+  - Roland: test restore flow — same instant unlock expected
 
 **Raouf:**
 - **Date:** 2026-02-18 (Australia/Sydney)

@@ -254,6 +254,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                     // Build 11: Sync to server for cross-device unlock
                     if let jws = result.jws {
                         self.syncCompanionToServer(jws: jws)
+                        // Web refresh happens inside syncCompanionToServer on 200 OK
+                    } else {
+                        // Build 13: No JWS available — refresh web directly so Base44 re-fetches /User/me
+                        self.triggerWebRefreshAfterPurchase()
                     }
                 }
             }
@@ -278,6 +282,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 // Build 11: Sync to server for cross-device unlock
                 if result.isCompanion, let jws = result.jws {
                     self.syncCompanionToServer(jws: jws)
+                    // Web refresh happens inside syncCompanionToServer on 200 OK
+                } else if result.isCompanion {
+                    // Build 13: No JWS available — refresh web directly so Base44 re-fetches /User/me
+                    self.triggerWebRefreshAfterPurchase()
                 }
             }
 
@@ -386,8 +394,30 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             } else {
                 os_log(.info, log: Self.log, "[ServerSync] Response %d (no body)", statusCode)
             }
-            DispatchQueue.main.async { self?.pushWorkerResponseToJS(endpoint: "/validate-receipt", statusCode: statusCode, error: nil) }
+            DispatchQueue.main.async {
+                self?.pushWorkerResponseToJS(endpoint: "/validate-receipt", statusCode: statusCode, error: nil)
+                // Build 13: Trigger web refresh after successful server sync so Base44 re-fetches /User/me
+                if statusCode == 200 {
+                    self?.triggerWebRefreshAfterPurchase()
+                }
+            }
         }.resume()
+    }
+
+    /// Forces the WebView to reload so the Base44 React app re-fetches /User/me
+    /// and immediately reflects the updated Companion subscription status.
+    /// Uses native WKWebView.reloadFromOrigin() (Apple docs: "performs end-to-end
+    /// revalidation of the content using cache-validating conditionals") instead of
+    /// JS window.location.reload() — more reliable and bypasses cache properly.
+    /// Called after successful purchase/restore + server sync.
+    private func triggerWebRefreshAfterPurchase() {
+        DispatchQueue.main.async {
+            if let nav = self.webView?.reloadFromOrigin() {
+                os_log(.info, log: Self.log, "[DIAG:iap] Successfully triggered web refresh after purchase (navigation: %{public}@)", String(describing: nav))
+            } else {
+                os_log(.error, log: Self.log, "[DIAG:iap] Failed to trigger web refresh — webView or reload returned nil")
+            }
+        }
     }
 
     /// Checks companion status from the server (Build 11 — cross-device sync).
