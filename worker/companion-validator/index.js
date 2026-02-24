@@ -271,22 +271,19 @@ async function handleCheckCompanion(request, origin) {
   const isCompanion = user.is_companion === true;
   const expiresAt = user.companion_expires_at || null;
 
-  // Check if subscription has expired server-side
-  if (isCompanion && expiresAt) {
-    const expMs = Date.parse(expiresAt);
-    if (expMs < Date.now()) {
-      // Subscription expired — update Base44
-      const userId = user._id || user.id;
-      if (userId) {
-        try {
-          await updateBase44User(userId, { is_companion: false }, authToken);
-        } catch (err) {
-          console.error('Failed to clear expired companion status:', err.message);
-        }
-      }
-      return jsonResponse({ isCompanion: false, reason: 'Subscription expired', expiresAt }, 200, origin);
-    }
-  }
+  // NOTE (Build 16): This endpoint is READ-ONLY. It never writes is_companion: false.
+  // Reason: companion_expires_at is from the INITIAL purchase JWS. StoreKit 2
+  // auto-renews subscriptions on-device, creating new transactions that are NOT
+  // re-posted to this Worker. So companion_expires_at becomes stale after the first
+  // renewal period. Checking expiry here and deactivating the subscription would
+  // void active auto-renewed subscriptions.
+  //
+  // Proper deactivation should happen via:
+  // 1. Apple Server-to-Server Notifications V2 (DID_CHANGE_RENEWAL_STATUS, EXPIRED, REVOKE)
+  // 2. The iOS app's Transaction.updates listener posting a fresh JWS on revocation/expiry
+  // 3. Manual admin action
+  //
+  // The expiry date is returned for informational/diagnostic purposes only.
 
   return jsonResponse(
     {

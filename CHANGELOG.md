@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-24 — Raouf: Build 16 — Fix Support Section Hijack + Fix Recheck Voiding Subscription
+
+**Bug 1 — Support section hijack**: Selecting the Support section redirected to the Apple purchase sheet. Root cause: `wireIAPButtons()` broad `indexOf('companion')` matching caught navigation links.
+
+- **Fix 1a — Non-IAP word exclusion**: Added blocklist (`support`, `help`, `contact`, `learn`, `about`, `faq`, `terms`, `privacy`, `policy`, `manage`, `cancel`, `account`). Buttons with these words are skipped entirely.
+- **Fix 1b — Skip external links**: `<a>` tags with external `href` (http, mailto, tel) are skipped.
+- **Fix 1c — Tighten restore matching**: Requires "restore" + "purchase" together, or "restore" in short text (≤25 chars).
+- **Fix 1d — Added `unlock` exclusion**: Broad `companion` match excludes "unlock" text.
+
+**Bug 2 — Recheck Subscription voids active subscription**: Pressing "Recheck Subscription" caused the user to lose Companion access. Root cause chain:
+  1. Cloudflare Worker `/check-companion` had a **destructive** server-side expiry check
+  2. It compared `companion_expires_at` against `Date.now()` — when expired, it **wrote `is_companion: false` to Base44**
+  3. But `companion_expires_at` is from the INITIAL purchase JWS only — StoreKit 2 auto-renewals create new transactions that are never re-posted to the Worker
+  4. In sandbox testing: 1 month = 5 minutes, so expiry was hit almost immediately
+  5. Native `checkCompanionOnServer()` trusted the server's wrong answer and overwrote local UserDefaults
+
+- **Fix 2a — Worker is now read-only**: Removed destructive expiry check from `/check-companion`. Endpoint now only returns stored status without modifying it.
+- **Fix 2b — Native StoreKit cross-check before downgrade**: When server says not-companion but local says companion, native now checks StoreKit entitlements first. If StoreKit has an active subscription, trusts StoreKit and re-syncs fresh JWS to server.
+- **Fix 2c — JS defers to native on downgrade**: `__aaCheckCompanion()` now triggers native `recheckEntitlements` action instead of immediately setting `__aaIsCompanion = false` when server disagrees.
+- **Fix 2d — New `recheckEntitlements` IAP action**: Checks StoreKit entitlements natively and re-syncs JWS to server if active.
+
+- **Files changed**: `PatchedBridgeViewController.swift`, `worker/companion-validator/index.js`, `project.pbxproj` (build 15→16)
+- **Verification**: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+- **IMPORTANT**: Roland must also redeploy the Cloudflare Worker: `cd worker/companion-validator && wrangler deploy`
+
+---
+
 ### 2026-02-24 — Raouf: Build 15 — Fix Dead Buttons, Contradictory States, Paywall Popup Handling
 
 - **Root cause 1 (dead buttons)**: `wireIAPButtons()` searched only `#root` but Base44 paywall popups render as React portals **outside `#root`** (directly on `document.body`). Buttons like "Get Companion on iPhone", "Start Companion Trial", and "Restore Purchase" in popups were never found or wired.

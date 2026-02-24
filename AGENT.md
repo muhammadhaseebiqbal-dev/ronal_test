@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone B — App Store submission preparation (Build 15)
+**Current Phase:** Milestone B — App Store submission preparation (Build 16)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -181,6 +181,12 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - **Root cause**: `wireIAPButtons()` and `handleAlreadySubscribed()` searched only `#root`, but Base44 paywall popups render as React portals outside `#root` (directly on `document.body`). Buttons in popups were never found or wired.
 - **Fixes**: Both functions now search `document.body`. Button classification uses priority-based logic (restore > trial > yearly > monthly). Broader text matching catches "Get Companion on iPhone" via `indexOf`. When subscribed, popup/modal containers are dismissed. Added body-level `MutationObserver` for portaled elements. Periodic IAP check every 3s for 30s.
 - Build number 14→15.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+**2026-02-24 — Raouf: Build 16 — Fix Support Section Hijack + Fix Recheck Voiding Subscription**
+- **Bug 1**: Support section redirected to Apple purchase sheet. `wireIAPButtons()` broad matching caught navigation links. Fix: non-IAP word blocklist, skip external `<a>` hrefs, tighter restore matching.
+- **Bug 2**: "Recheck Subscription" voided active subscriptions. Worker `/check-companion` had destructive expiry check that wrote `is_companion: false` to Base44 based on stale `companion_expires_at` (doesn't track auto-renewals). Fix: Worker is now read-only, native cross-checks StoreKit before accepting server downgrade, JS defers to native on downgrade, re-syncs fresh JWS to fix stale server data.
+- Build number 15→16. **Roland must redeploy Worker: `cd worker/companion-validator && wrangler deploy`**
 - Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
 
 **2026-02-24 — Raouf: Build 14 — Monthly-Only Launch Scope (Milestone B)**
@@ -394,6 +400,23 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-24 (Australia/Sydney)
+- **Scope:** Build 16 — Fix Support Section Hijack + Fix Recheck Voiding Subscription
+- **Summary:** Two critical bugs fixed. (1) Support section redirected to Apple purchase sheet — `wireIAPButtons()` broad `indexOf('companion')` matching caught navigation links. Fix: added non-IAP word blocklist, skip external `<a>` hrefs, tighter restore matching. (2) "Recheck Subscription" button voided active subscriptions — Cloudflare Worker `/check-companion` had a destructive server-side expiry check. It compared `companion_expires_at` against `Date.now()` and when "expired", **wrote `is_companion: false` to Base44**. This was wrong because `companion_expires_at` is from the initial JWS only — StoreKit 2 auto-renewals create new transactions that aren't re-posted to the Worker, so the stored expiry becomes stale. In sandbox, 1 month = 5 minutes. The native `checkCompanionOnServer()` then trusted the server's wrong answer and overwrote UserDefaults. Fix chain: (a) Worker `/check-companion` is now read-only — no writes, just returns stored status. (b) Native `checkCompanionOnServer()` now cross-checks StoreKit entitlements before accepting a server downgrade — if StoreKit has an active subscription, trusts StoreKit and re-syncs fresh JWS. (c) JS `__aaCheckCompanion()` defers to native `recheckEntitlements` action on downgrade instead of immediately setting `__aaIsCompanion = false`. (d) New `recheckEntitlements` IAP message handler verifies with StoreKit and re-syncs JWS to server.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Non-IAP word blocklist in wireIAPButtons(), external link skip, tighter restore, StoreKit cross-check in checkCompanionOnServer(), recheckEntitlements action handler, JS __aaCheckCompanion() defers on downgrade
+  - `worker/companion-validator/index.js` — MODIFIED: Removed destructive expiry check from /check-companion (now read-only)
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Build number 15 → 16
+  - `AGENT.md` — Updated Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:**
+  - Roland: **MUST redeploy Cloudflare Worker**: `cd worker/companion-validator && wrangler deploy` — the old Worker will still void subscriptions
+  - Roland: rebuild iOS on device and test Support section navigates correctly
+  - Roland: test Recheck Subscription — should NOT void subscription
+  - Roland: verify subscribe/restore buttons on paywall still work
 
 **Raouf:**
 - **Date:** 2026-02-24 (Australia/Sydney)

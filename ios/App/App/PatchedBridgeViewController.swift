@@ -295,6 +295,27 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 }
             }
 
+        case "recheckEntitlements":
+            // Build 16: JS-triggered recheck — cross-verify server claim with local StoreKit.
+            // Called when server says not-companion but user was previously companion.
+            Task { @MainActor in
+                let (storeKitIsCompanion, products) = await AAStoreManager.shared.checkEntitlements()
+                os_log(.info, log: Self.log, "[IAP:recheck] StoreKit isCompanion=%{public}@ products=%{public}@",
+                       storeKitIsCompanion ? "true" : "false", products.joined(separator: ","))
+
+                self.persistCompanionState(storeKitIsCompanion)
+                self.refreshWebEntitlements(isCompanion: storeKitIsCompanion)
+                self.pushEntitlementCheckToJS(isCompanion: storeKitIsCompanion, products: products)
+
+                if storeKitIsCompanion {
+                    // StoreKit says active — re-sync fresh JWS to server to fix stale expiry
+                    let (_, _, latestJWS) = await AAStoreManager.shared.checkEntitlementsWithJWS()
+                    if let jws = latestJWS {
+                        self.syncCompanionToServer(jws: jws)
+                    }
+                }
+            }
+
         default:
             os_log(.error, log: Self.log, "[IAP] Unknown action: %{public}@", action)
             sendPurchaseResult(["status": "error", "message": "Unknown action: \(action)"])
@@ -468,11 +489,43 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: nil) }
 
             if serverIsCompanion != localIsCompanion {
-                os_log(.info, log: Self.log, "[ServerCheck] Server companion=%{public}@ differs from local=%{public}@ — updating",
+                os_log(.info, log: Self.log, "[ServerCheck] Server companion=%{public}@ differs from local=%{public}@ — checking StoreKit",
                        serverIsCompanion ? "true" : "false", localIsCompanion ? "true" : "false")
-                DispatchQueue.main.async {
-                    self.persistCompanionState(serverIsCompanion)
-                    self.refreshWebEntitlements(isCompanion: serverIsCompanion)
+
+                // Build 16: Before downgrading from companion → non-companion,
+                // cross-check local StoreKit entitlements. If StoreKit says user has
+                // an active subscription, trust StoreKit over the server.
+                // The server's companion_expires_at can be stale (doesn't track auto-renewals).
+                if !serverIsCompanion && localIsCompanion {
+                    if #available(iOS 15.0, *) {
+                        Task {
+                            let (storeKitIsCompanion, products) = await AAStoreManager.shared.checkEntitlements()
+                            os_log(.info, log: Self.log, "[ServerCheck] StoreKit cross-check: isCompanion=%{public}@ products=%{public}@",
+                                   storeKitIsCompanion ? "true" : "false", products.joined(separator: ","))
+                            if storeKitIsCompanion {
+                                // StoreKit says active — server is wrong (stale expiry). Keep local state.
+                                // Also re-sync to server with fresh JWS.
+                                os_log(.info, log: Self.log, "[ServerCheck] StoreKit active — ignoring server downgrade, re-syncing JWS")
+                                let (_, _, latestJWS) = await AAStoreManager.shared.checkEntitlementsWithJWS()
+                                if let jws = latestJWS {
+                                    await MainActor.run { self.syncCompanionToServer(jws: jws) }
+                                }
+                            } else {
+                                // StoreKit also says not subscribed — genuinely lost subscription.
+                                os_log(.info, log: Self.log, "[ServerCheck] StoreKit also not subscribed — updating local to non-companion")
+                                await MainActor.run {
+                                    self.persistCompanionState(false)
+                                    self.refreshWebEntitlements(isCompanion: false)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Server says companion, local says not — upgrade (server has newer info)
+                    DispatchQueue.main.async {
+                        self.persistCompanionState(serverIsCompanion)
+                        self.refreshWebEntitlements(isCompanion: serverIsCompanion)
+                    }
                 }
             } else {
                 os_log(.info, log: Self.log, "[ServerCheck] Server companion=%{public}@ matches local", serverIsCompanion ? "true" : "false")
@@ -1154,12 +1207,24 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             }
           } catch(e) {}
           if (!token) return Promise.resolve({ isCompanion: false, reason: 'no-token' });
+          var wasCompanion = window.__aaIsCompanion === true;
           return fetch(workerURL + '/check-companion', {
             method: 'GET',
             headers: { 'Authorization': 'Bearer ' + token }
           })
           .then(function(res) { return res.json(); })
           .then(function(data) {
+            // Build 16: If server says not-companion but we were companion,
+            // trigger native StoreKit entitlement recheck before downgrading.
+            // The server's expiry data can be stale (doesn't track auto-renewals).
+            if (!data.isCompanion && wasCompanion) {
+              // Ask native to recheck — it will cross-verify with StoreKit
+              if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
+                window.webkit.messageHandlers.aaPurchase.postMessage({ action: 'recheckEntitlements' });
+              }
+              // Don't update __aaIsCompanion yet — let native decide
+              return { isCompanion: wasCompanion, pendingNativeRecheck: true };
+            }
             window.__aaIsCompanion = data.isCompanion === true;
             return data;
           })
@@ -2639,14 +2704,34 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           var text = (btn.textContent || '').trim().toLowerCase();
           if (!text || text.length > 80) return; // Skip empty or very long text (nav items, paragraphs)
 
+          // Skip <a> tags with external href — these are navigation links, not action buttons
+          if (btn.tagName === 'A') {
+            var href = (btn.getAttribute('href') || '').toLowerCase();
+            if (href.indexOf('http') === 0 || href.indexOf('mailto:') === 0 || href.indexOf('tel:') === 0) return;
+          }
+
           // ── CLASSIFY BUTTON ──
           var isMonthlySubscribe = false;
           var isYearly = false;
           var isTrial = false;
           var isRestore = false;
 
+          // Non-IAP context words — if present, skip classification entirely.
+          // Prevents hijacking support/help/about/contact links and navigation items.
+          var nonIAPWords = ['support', 'help', 'contact', 'learn', 'about', 'faq',
+                             'terms', 'privacy', 'policy', 'manage', 'cancel', 'account'];
+          var hasNonIAP = false;
+          for (var w = 0; w < nonIAPWords.length; w++) {
+            if (text.indexOf(nonIAPWords[w]) !== -1) { hasNonIAP = true; break; }
+          }
+          if (hasNonIAP) return;
+
           // RESTORE — check first (highest priority, prevents misclassification)
-          if (text.indexOf('restore') !== -1) {
+          if (text.indexOf('restore') !== -1 && text.indexOf('purchase') !== -1) {
+            isRestore = true;
+          }
+          // Also match just "restore purchases" or standalone "restore" only if short
+          if (!isRestore && text.indexOf('restore') !== -1 && text.length <= 25) {
             isRestore = true;
           }
 
@@ -2678,11 +2763,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             if (text.indexOf('get companion') !== -1) {
               isMonthlySubscribe = true;
             }
-            // "companion" in action context (not status/info text)
+            // "companion" in action context (not status/info text, not navigation)
             if (text.indexOf('companion') !== -1 &&
                 text.indexOf('active') === -1 && text.indexOf('recheck') === -1 &&
                 text.indexOf('subscription is') === -1 && text.indexOf('have an') === -1 &&
-                text.indexOf('status') === -1) {
+                text.indexOf('status') === -1 && text.indexOf('unlock') === -1) {
               isMonthlySubscribe = true;
             }
           }
