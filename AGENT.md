@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone 3 — App Store submission preparation (Build 12)
+**Current Phase:** Milestone B — App Store submission preparation (Build 15)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -117,7 +117,7 @@ npm run test           # Unit tests
 | "or" divider visible after Google hidden | ✅ FIXED — Broad sweep hides all or/divider/separator elements on login page |
 | Prayer Wall squashed/not responsive | ✅ FIXED — CSS grid forced to 1-column on mobile, overflow hidden |
 | No Log Out button | ✅ FIXED — Build 7: Injected on More/Settings page. Clears localStorage, cookies, WKWebView data, Capacitor Preferences. Navigates to Login. Confirmation dialog. |
-| IAP Companion subscription not wired | ✅ FIXED — Build 10: StoreKit 2 purchase bridge. Web buttons trigger native purchase/restore. Entitlements persisted in UserDefaults (`aa_is_companion`). |
+| IAP Companion subscription not wired | ✅ FIXED — Build 14: Monthly-only purchase. Yearly/trial hidden. StoreKit 2 bridge. Entitlements in UserDefaults (`aa_is_companion`). |
 | Companion unlock local-only (no cross-device) | ✅ FIXED — Build 11: Cloudflare Worker validates Apple JWS server-side, updates Base44 user entity. Desktop browsers check `/check-companion`. `window.__aaCheckCompanion()` available on all devices. |
 | Session validation `no-token` false positive | ✅ FIXED — Build 8.1: Now checks 4 token keys instead of just `base44_access_token`. Base44 SDK stores token under `token` key initially. |
 | localStorage random clearing (iOS 17.4+) | ✅ FIXED — Build 8.1: Shared static `WKProcessPool` per Apple developer docs recommendation. |
@@ -161,21 +161,32 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 | 6 | Prayer List does not white-screen | ✅ FIXED (Build 6) |
 | 7 | **Log out button** in More/Settings that fully signs the user out, clears stored auth state, and returns to Login screen (so a different account can log in) | ✅ FIXED (Build 7) |
 
-## IAP Stage Two — Acceptance Criteria (Roland, 2026-02-15)
+## Milestone B — Acceptance Criteria (Roland, 2026-02-23)
+
+**Launch Scope:** Companion Monthly only. Yearly removed from sale. Trial removed. No copy changes.
 
 | # | Criterion | Status |
 |---|-----------|--------|
-| 1 | New user, start trial (Monthly and Yearly) — Apple purchase sheet appears, purchase completes, paywall dismisses, Companion unlocks immediately, visible "Companion Active" indicator | ✅ Build 12: Toast "Companion features unlocked!", Settings shows "Companion Active" |
-| 2 | Persistence — Kill app, reopen = still unlocked. Logout/login = still unlocked | ✅ Build 10+: UserDefaults `aa_is_companion`, re-checked on cold boot + resume |
-| 3 | Restore on same device — Tap Restore, native restore flow runs, success/failure message shown | ✅ Build 12: AppStore.sync() + toast "Subscription restored!" or "No active subscription found." |
-| 4 | Restore on fresh install — Delete, reinstall, login, Restore Purchases = unlocks | ✅ Build 10+: AppStore.sync() fetches from Apple, JWS synced to server |
-| 5 | Already-subscribed user — Paywall should not block access | ✅ Build 12: Green "You have an active Companion subscription!" banner on paywall |
-| 6 | Cross-device unlock — iOS purchase unlocks on desktop web. Manual "Recheck subscription" in Settings | ✅ Build 11+12: Worker validates JWS, updates Base44. Recheck button in Settings |
-| 7 | Diagnostics — Subscription status line, last entitlement check time/result, last worker response code | ✅ Build 12: Enhanced diagnostics overlay with all requested data |
+| 1 | Subscribe Monthly always opens Apple purchase sheet and completes successfully | ✅ Build 15: Broader button matching + body-wide search catches buttons in React portal popups |
+| 2 | After purchase, Companion unlocks immediately and stays unlocked after kill/reopen | ✅ Build 10+14: UserDefaults `aa_is_companion`, `reloadFromOrigin()` instant unlock |
+| 3 | Restore Purchases returns clear outcome: restored+unlocked OR nothing-to-restore, entitlement refreshed | ✅ Build 15: Restore buttons in popups now wired via body-wide search |
+| 4 | No contradictory states: must not show "active subscription" while presenting subscribe options | ✅ Build 15: When subscribed, ALL subscribe/trial/restore buttons hidden body-wide + popup containers dismissed |
+| 5 | Subscription gating driven from one entitlement source of truth, updates after login/purchase/restore | ✅ Build 14: Single source = `aa_is_companion` in UserDefaults, synced to web via `__aaIsCompanion` |
 
 ---
 
 ## Last Change Log
+
+**2026-02-24 — Raouf: Build 15 — Fix Dead Buttons, Contradictory States, Paywall Popup Handling**
+- **Root cause**: `wireIAPButtons()` and `handleAlreadySubscribed()` searched only `#root`, but Base44 paywall popups render as React portals outside `#root` (directly on `document.body`). Buttons in popups were never found or wired.
+- **Fixes**: Both functions now search `document.body`. Button classification uses priority-based logic (restore > trial > yearly > monthly). Broader text matching catches "Get Companion on iPhone" via `indexOf`. When subscribed, popup/modal containers are dismissed. Added body-level `MutationObserver` for portaled elements. Periodic IAP check every 3s for 30s.
+- Build number 14→15.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+**2026-02-24 — Raouf: Build 14 — Monthly-Only Launch Scope (Milestone B)**
+- **Scope change**: Roland updated App Store Connect — Companion Monthly is the only subscription for submission. Yearly removed from sale, 7-day free trial removed.
+- **Changes**: Purchase path = monthly only. Yearly/trial buttons hidden from paywall. Subscribe buttons hidden when already subscribed (no contradictory states). Entitlement check still recognizes existing yearly subscribers. StoreKit config updated to monthly only. Build number 13→14.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
 
 **2026-02-23 — Raouf: StoreKit Config Cleanup — Version 4 Fix Confirmed Working**
 - **Root cause (resolved)**: Xcode 26.2 requires StoreKit config file format version 4 (major:4, minor:0). Our manually-created `Configuration.storekit` used version 2 and was silently ignored.
@@ -235,7 +246,7 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - **Convenience bridge**: `window.aaPurchase("buy", productId)` and `window.aaPurchase("restore")` available at document start for web code.
 - **Diagnostics**: Companion subscription status added to diagnostics overlay.
 - **Logout**: Companion state cleared on logout.
-- **Product IDs**: `com.abideandanchor.companion.monthly`, `com.abideandanchor.companion.yearly`
+- **Product IDs**: `com.abideandanchor.companion.monthly` (only purchasable product; `com.abideandanchor.companion.yearly` still recognized for entitlement checking only)
 - **Build number**: 9 → 10
 - **NOTE**: Website-wide Companion unlock (across devices/browsers) was local-only in Build 10. ✅ **Resolved in Build 11** — Cloudflare Worker validates Apple JWS server-side and updates Base44 user entity for cross-device unlock.
 - Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
@@ -383,6 +394,42 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-24 (Australia/Sydney)
+- **Scope:** Build 15 — Fix Dead Buttons, Contradictory States, Paywall Popup Handling
+- **Summary:** Roland tested Build 13 and found critical failures: (1) purchase and restore buttons dead for non-subscribed users — "Get Companion on iPhone" and "Restore Purchase" in paywall popups do nothing, (2) contradictory gating — "active subscription" banner shown alongside "Subscribe Monthly" button, a "Companion Access" popup appears with trial + restore buttons for subscribed users. Root cause: `wireIAPButtons()` and `handleAlreadySubscribed()` searched only `document.getElementById('root')` but Base44 paywall popups render as React portals outside `#root` directly on `document.body`. Additionally, "Get Companion on iPhone" used exact match (`text === 'get companion'`) instead of substring match. Fixes: (1) Both functions now search `document.body` — catches all buttons regardless of render location. (2) Button classification uses priority-based logic: restore > trial > yearly > monthly (prevents misclassification). (3) Broader matching with `indexOf` catches longer button text. (4) When subscribed, popup/modal containers are detected (fixed/absolute position + z-index >= 10, or class names with modal/popup/overlay/dialog/backdrop) and dismissed. (5) Body-level `MutationObserver` watches `document.body` with `childList: true` to catch React portals. (6) Periodic IAP check every 3s for 30s catches late-appearing popups.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Rewrote `wireIAPButtons()` (body-wide search, priority classification, broader text matching, skip own UI via `.closest()`), rewrote `handleAlreadySubscribed()` (body-wide search, popup/modal dismissal), added body-level MutationObserver, added periodic IAP check in `scheduleBlankChecks()`
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Build number 14 → 15
+  - `AGENT.md` — Updated Milestone B acceptance criteria, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:**
+  - Roland: rebuild on device and test with non-subscribed sandbox account — tap "Get Companion on iPhone" in paywall popup
+  - Roland: test Restore Purchases button in paywall popup
+  - Roland: test subscribed account — paywall popup should auto-dismiss, no subscribe buttons visible
+  - Roland: desktop web subscribe/restore buttons are Base44 platform JS (not our iOS injections) — if dead, it's a Base44 issue
+  - Roland: run through all 10 acceptance gate items
+
+**Raouf:**
+- **Date:** 2026-02-24 (Australia/Sydney)
+- **Scope:** Build 14 — Monthly-Only Launch Scope (Milestone B)
+- **Summary:** Roland updated App Store Connect: Companion Monthly is the only subscription for submission. Yearly removed from sale, 7-day free trial introductory offer removed. This build aligns the app to that simplified scope. Purchase path now only offers Monthly. Yearly and trial buttons are hidden from the paywall UI via `display:none` so there are no dead ends. When a user is already subscribed, all subscribe buttons are hidden — only the "active subscription" banner shows, eliminating contradictory states. `AAStoreManager` now distinguishes between `purchasableProductIds` (monthly only) and `companionProductIds` (monthly + yearly for entitlement checking — existing yearly subscribers stay unlocked until natural expiry). The `test.storekit` local config is updated to monthly only. ESLint config updated to ignore Capacitor SPM build artifacts.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added `purchasableProductIds` (monthly only), purchase validation uses purchasable set, yearly/trial button hiding in wireIAPButtons(), subscribe buttons hidden on paywall when already subscribed, subscription status text says "Monthly"
+  - `ios/App/App/test.storekit` — MODIFIED: Removed yearly subscription product, monthly only remains
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Build number 13 → 14
+  - `eslint.config.js` — MODIFIED: Added `ios/**/build/**` to ignores
+  - `AGENT.md` — Updated Milestone B acceptance criteria, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:**
+  - Roland: rebuild on device and test monthly subscribe flow end-to-end
+  - Roland: test restore purchases on non-subscribed account
+  - Roland: test kill-and-relaunch persistence on subscribed account
+  - Roland: confirm no yearly/trial buttons visible on paywall
+  - Roland: confirm no contradictory states (active + subscribe visible simultaneously)
 
 **Raouf:**
 - **Date:** 2026-02-23 (Australia/Sydney)

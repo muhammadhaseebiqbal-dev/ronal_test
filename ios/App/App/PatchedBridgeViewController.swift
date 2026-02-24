@@ -15,6 +15,13 @@ final class AAStoreManager {
 
     private static let log = OSLog(subsystem: "com.abideandanchor.app", category: "IAP")
 
+    /// Products available for NEW purchases — Monthly only (yearly + trial removed per Roland 2026-02-23).
+    static let purchasableProductIds: Set<String> = [
+        "com.abideandanchor.companion.monthly"
+    ]
+
+    /// All Companion product IDs for ENTITLEMENT checking (includes yearly for existing subscribers).
+    /// Yearly is removed from sale but existing subscriptions remain valid until expiry.
     static let companionProductIds: Set<String> = [
         "com.abideandanchor.companion.monthly",
         "com.abideandanchor.companion.yearly"
@@ -209,7 +216,6 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// Handles `aaPurchase` messages from web JS.
     /// Payloads:
     ///   { action: "buy", productId: "com.abideandanchor.companion.monthly" }
-    ///   { action: "buy", productId: "com.abideandanchor.companion.yearly" }
     ///   { action: "restore" }
     private func handlePurchaseMessage(_ message: WKScriptMessage) {
         guard let body = message.body as? [String: Any],
@@ -232,8 +238,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 sendPurchaseResult(["status": "error", "message": "Missing productId"])
                 return
             }
-            // Validate product ID is one of our known IDs
-            guard AAStoreManager.companionProductIds.contains(productId) else {
+            // Validate product ID is one of our purchasable IDs (monthly only)
+            guard AAStoreManager.purchasableProductIds.contains(productId) else {
                 os_log(.error, log: Self.log, "[IAP] Unknown productId: %{public}@", productId)
                 sendPurchaseResult(["status": "error", "message": "Unknown product: \(productId)"])
                 return
@@ -2618,25 +2624,72 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         });
       }
 
-      // ── 6e. IAP BUTTON WIRING (Build 10) ──
-      // Since we cannot modify the remote web app, we inject click handlers on
-      // Companion subscription buttons. Uses resilient matching: text content,
-      // retry loop + MutationObserver to survive SPA rerenders.
+      // ── 6e. IAP BUTTON WIRING (Build 15) ──
+      // Searches the ENTIRE document.body (not just #root) to catch buttons
+      // in React portals, modals, popups, and overlays that render outside #root.
+      // Uses broad text-content matching to be resilient to copy changes.
 
       function wireIAPButtons() {
-        var root = document.getElementById('root');
-        if (!root) return;
-        var buttons = root.querySelectorAll('button, a, [role="button"]');
+        // CRITICAL: Search entire body — Base44 paywall popups render outside #root
+        var buttons = document.querySelectorAll('button, a, [role="button"]');
         buttons.forEach(function(btn) {
           if (btn.getAttribute('data-aa-iap-wired')) return;
+          // Skip our own injected UI
+          if (btn.closest('.aa-diag-overlay, #aa-logout-section, #aa-subscription-section, .aa-error-fallback, #aa-logout-confirm-overlay, #aa-already-subscribed, .aa-toast')) return;
           var text = (btn.textContent || '').trim().toLowerCase();
+          if (!text || text.length > 80) return; // Skip empty or very long text (nav items, paragraphs)
 
-          // Match subscribe monthly + trial (Build 12: added trial patterns)
-          if ((text.indexOf('subscribe') !== -1 && text.indexOf('monthly') !== -1) ||
-              text === 'monthly' || text === 'subscribe monthly' ||
-              text === 'start free trial' || text === 'start trial' ||
-              text === 'start companion trial' || text === 'try companion' ||
-              (text.indexOf('trial') !== -1 && text.indexOf('yearly') === -1 && text.indexOf('annual') === -1)) {
+          // ── CLASSIFY BUTTON ──
+          var isMonthlySubscribe = false;
+          var isYearly = false;
+          var isTrial = false;
+          var isRestore = false;
+
+          // RESTORE — check first (highest priority, prevents misclassification)
+          if (text.indexOf('restore') !== -1) {
+            isRestore = true;
+          }
+
+          // TRIAL — "trial" anywhere (except restore)
+          if (!isRestore && text.indexOf('trial') !== -1) {
+            isTrial = true;
+          }
+
+          // YEARLY — "yearly" or "annual" in subscribe/action context
+          if (!isRestore && !isTrial) {
+            if ((text.indexOf('yearly') !== -1 || text.indexOf('annual') !== -1) &&
+                (text.indexOf('subscribe') !== -1 || text.indexOf('companion') !== -1 ||
+                 text === 'yearly' || text === 'annual')) {
+              isYearly = true;
+            }
+          }
+
+          // MONTHLY SUBSCRIBE — broad matching for all subscribe-like actions
+          if (!isRestore && !isTrial && !isYearly) {
+            // Exact patterns
+            if (text === 'subscribe' || text === 'subscribe monthly' || text === 'monthly') {
+              isMonthlySubscribe = true;
+            }
+            // "subscribe" without yearly/annual qualifier
+            if (text.indexOf('subscribe') !== -1 && text.indexOf('yearly') === -1 && text.indexOf('annual') === -1) {
+              isMonthlySubscribe = true;
+            }
+            // "get companion" (e.g. "Get Companion on iPhone", "Get Companion")
+            if (text.indexOf('get companion') !== -1) {
+              isMonthlySubscribe = true;
+            }
+            // "companion" in action context (not status/info text)
+            if (text.indexOf('companion') !== -1 &&
+                text.indexOf('active') === -1 && text.indexOf('recheck') === -1 &&
+                text.indexOf('subscription is') === -1 && text.indexOf('have an') === -1 &&
+                text.indexOf('status') === -1) {
+              isMonthlySubscribe = true;
+            }
+          }
+
+          // ── WIRE OR HIDE ──
+
+          if (isMonthlySubscribe) {
             btn.setAttribute('data-aa-iap-wired', 'monthly');
             btn.addEventListener('click', function(e) {
               e.preventDefault();
@@ -2650,26 +2703,19 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             });
           }
 
-          // Match subscribe yearly
-          if ((text.indexOf('subscribe') !== -1 && text.indexOf('yearly') !== -1) ||
-              (text.indexOf('subscribe') !== -1 && text.indexOf('annual') !== -1) ||
-              text === 'yearly' || text === 'annual' || text === 'subscribe yearly') {
-            btn.setAttribute('data-aa-iap-wired', 'yearly');
-            btn.addEventListener('click', function(e) {
-              e.preventDefault();
-              e.stopPropagation();
-              if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
-                window.webkit.messageHandlers.aaPurchase.postMessage({
-                  action: 'buy',
-                  productId: 'com.abideandanchor.companion.yearly'
-                });
-              }
-            });
+          if (isYearly) {
+            btn.setAttribute('data-aa-iap-wired', 'hidden-yearly');
+            btn.style.display = 'none';
+            hideEmptyParent(btn);
           }
 
-          // Match restore purchase
-          if ((text.indexOf('restore') !== -1 && (text.indexOf('purchase') !== -1 || text.indexOf('subscription') !== -1)) ||
-              text === 'restore' || text === 'restore purchases' || text === 'restore purchase') {
+          if (isTrial) {
+            btn.setAttribute('data-aa-iap-wired', 'hidden-trial');
+            btn.style.display = 'none';
+            hideEmptyParent(btn);
+          }
+
+          if (isRestore) {
             btn.setAttribute('data-aa-iap-wired', 'restore');
             btn.addEventListener('click', function(e) {
               e.preventDefault();
@@ -2684,6 +2730,18 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         });
       }
 
+      // Helper: hide parent container if all children are hidden
+      function hideEmptyParent(el) {
+        var parent = el.parentElement;
+        if (!parent) return;
+        var visibleChildren = 0;
+        for (var i = 0; i < parent.children.length; i++) {
+          if (parent.children[i].style.display !== 'none' &&
+              parent.children[i].offsetHeight > 0) visibleChildren++;
+        }
+        if (visibleChildren === 0) parent.style.display = 'none';
+      }
+
       // ── 6f. SUBSCRIPTION STATUS UI (Build 12) ──
       // Visible "Companion Active" / "Free" indicator on More/Settings page.
       // "Recheck Subscription" button calls __aaCheckCompanion() for cross-device sync.
@@ -2696,7 +2754,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
         var detailEl = document.getElementById('aa-sub-detail-text');
         if (detailEl) {
-          detailEl.textContent = isCompanion ? 'Your Companion subscription is active.' : 'Subscribe to unlock Companion features.';
+          detailEl.textContent = isCompanion ? 'Your Companion Monthly subscription is active.' : 'Subscribe monthly to unlock Companion features.';
         }
         // Update global state
         window.__aaIsCompanion = isCompanion;
@@ -2741,7 +2799,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         var detail = document.createElement('div');
         detail.id = 'aa-sub-detail-text';
         detail.className = 'aa-sub-detail';
-        detail.textContent = isCompanion ? 'Your Companion subscription is active.' : 'Subscribe to unlock Companion features.';
+        detail.textContent = isCompanion ? 'Your Companion Monthly subscription is active.' : 'Subscribe monthly to unlock Companion features.';
         section.appendChild(detail);
 
         var recheckBtn = document.createElement('button');
@@ -2780,21 +2838,80 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
       }
 
-      // ── 6g. ALREADY-SUBSCRIBED PAYWALL HANDLING (Build 12) ──
-      // If user already has Companion, show a banner on the paywall page.
+      // ── 6g. ALREADY-SUBSCRIBED PAYWALL HANDLING (Build 15) ──
+      // Searches entire document.body to catch paywall popups/modals.
+      // When subscribed: hides subscribe/trial buttons AND dismisses paywall overlays.
+      // When not subscribed: ensures buttons are visible.
 
       function handleAlreadySubscribed() {
         if (!window.__aaIsCompanion) {
+          // Not subscribed: remove banner and unhide buttons
           var banner = document.getElementById('aa-already-subscribed');
           if (banner) banner.remove();
+          var hiddenBuy = document.querySelectorAll('[data-aa-sub-hidden]');
+          hiddenBuy.forEach(function(el) {
+            el.style.display = '';
+            el.removeAttribute('data-aa-sub-hidden');
+          });
           return;
         }
+
+        // SUBSCRIBED: Search entire body (catches popups/portals outside #root)
+        var wiredBtns = document.querySelectorAll('[data-aa-iap-wired]');
+        if (wiredBtns.length === 0) return;
+
+        // Hide ALL subscribe/trial/yearly buttons everywhere
+        wiredBtns.forEach(function(btn) {
+          var wiredType = btn.getAttribute('data-aa-iap-wired');
+          if (wiredType === 'monthly' || wiredType === 'yearly' ||
+              wiredType === 'hidden-yearly' || wiredType === 'hidden-trial') {
+            btn.style.display = 'none';
+            btn.setAttribute('data-aa-sub-hidden', '1');
+          }
+          // Also hide restore on paywall when subscribed (not needed)
+          if (wiredType === 'restore') {
+            btn.style.display = 'none';
+            btn.setAttribute('data-aa-sub-hidden', '1');
+          }
+        });
+
+        // Dismiss paywall popups/modals that are now empty of action buttons.
+        // Walk up from each hidden button to find overlay containers
+        // (fixed/absolute position with high z-index = modal/popup).
+        wiredBtns.forEach(function(btn) {
+          if (!btn.getAttribute('data-aa-sub-hidden')) return;
+          var el = btn.parentElement;
+          var depth = 0;
+          while (el && el !== document.body && el !== document.documentElement && depth < 15) {
+            depth++;
+            // Skip our own injected elements
+            if (el.id && el.id.indexOf('aa-') === 0) { el = el.parentElement; continue; }
+            var style = window.getComputedStyle(el);
+            var pos = style.position;
+            var zIndex = parseInt(style.zIndex) || 0;
+            // Detect overlay: fixed/absolute + high z-index + looks like a backdrop
+            if ((pos === 'fixed' || pos === 'absolute') && zIndex >= 10) {
+              el.style.display = 'none';
+              el.setAttribute('data-aa-sub-hidden', '1');
+              break;
+            }
+            // Also detect by class name patterns (modal, popup, overlay, dialog)
+            var cls = (el.className || '').toLowerCase();
+            if (cls.indexOf('modal') !== -1 || cls.indexOf('popup') !== -1 ||
+                cls.indexOf('overlay') !== -1 || cls.indexOf('dialog') !== -1 ||
+                cls.indexOf('backdrop') !== -1) {
+              el.style.display = 'none';
+              el.setAttribute('data-aa-sub-hidden', '1');
+              break;
+            }
+            el = el.parentElement;
+          }
+        });
+
+        // Inject banner in #root on paywall pages
+        if (document.getElementById('aa-already-subscribed')) return;
         var root = document.getElementById('root');
         if (!root) return;
-        // Detect paywall: page has IAP-wired buttons
-        var wiredBtns = root.querySelectorAll('[data-aa-iap-wired]');
-        if (wiredBtns.length === 0) return;
-        if (document.getElementById('aa-already-subscribed')) return;
         var banner = document.createElement('div');
         banner.id = 'aa-already-subscribed';
         banner.textContent = 'You have an active Companion subscription!';
@@ -2932,11 +3049,26 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }, 250);
       }
 
-      // MutationObserver for DOM changes
+      // MutationObserver for DOM changes in #root
       var observer = new MutationObserver(function(mutations) {
         for (var i = 0; i < mutations.length; i++) {
           if (mutations[i].addedNodes.length > 0 || mutations[i].removedNodes.length > 0) {
             runAllPatches();
+            return;
+          }
+        }
+      });
+
+      // Build 15: Body-level observer for popups/modals that render outside #root
+      // React portals, paywall popups, and modal overlays often attach directly to document.body
+      var bodyObserver = new MutationObserver(function(mutations) {
+        for (var i = 0; i < mutations.length; i++) {
+          if (mutations[i].addedNodes.length > 0) {
+            // Only run IAP-related patches for body changes (not full patch suite)
+            setTimeout(function() {
+              wireIAPButtons();
+              handleAlreadySubscribed();
+            }, 150);
             return;
           }
         }
@@ -2950,9 +3082,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         } else {
           setTimeout(startObserving, 100);
         }
+        // Observe body for portaled popups (only direct children, not subtree — more efficient)
+        bodyObserver.observe(document.body, { childList: true });
       }
 
-      // Periodic checks (blank screen + prayer routes) — every 3s for first 30s
+      // Periodic checks (blank screen + prayer routes + IAP button wiring) — every 3s for first 30s
       var blankCheckCount = 0;
       function scheduleBlankChecks() {
         blankCheckCount = 0;
@@ -2962,6 +3096,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           blankCheckCount++;
           detectBlankScreen();
           monitorPrayerRoutes();
+          // Build 15: Also check for new IAP buttons (catches late-appearing popups)
+          wireIAPButtons();
+          handleAlreadySubscribed();
           if (blankCheckCount >= 10) clearInterval(interval);
         }, 3000);
       }

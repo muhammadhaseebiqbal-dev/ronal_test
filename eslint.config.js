@@ -58,6 +58,7 @@ export default [
             'dist/',
             'node_modules/',
             'ios/**/public/**',
+            'ios/**/build/**',
             'coverage/',
             'test-results/',
             '*.xcresult/**'

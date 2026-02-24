@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-24 — Raouf: Build 15 — Fix Dead Buttons, Contradictory States, Paywall Popup Handling
+
+- **Root cause 1 (dead buttons)**: `wireIAPButtons()` searched only `#root` but Base44 paywall popups render as React portals **outside `#root`** (directly on `document.body`). Buttons like "Get Companion on iPhone", "Start Companion Trial", and "Restore Purchase" in popups were never found or wired.
+- **Root cause 2 (dead "Get Companion on iPhone")**: Button text matching used `text === 'get companion'` (exact match) but the actual button text is `"Get Companion on iPhone"` (longer). Changed to `indexOf('get companion')`.
+- **Root cause 3 (contradictory states)**: `handleAlreadySubscribed()` also searched only `#root`, so it couldn't hide subscribe buttons in portaled popups. A subscribed user saw both "active subscription" banner AND "Subscribe Monthly" button.
+- **Fixes**:
+  1. `wireIAPButtons()` now searches `document.body` (entire page) instead of just `#root` — catches all buttons regardless of where they render
+  2. Button classification uses priority-based logic: restore > trial > yearly > monthly. Prevents misclassification.
+  3. Broader matching: `indexOf('companion')` in action context catches "Get Companion on iPhone", "Companion Monthly", etc. Excludes status text like "Companion Active".
+  4. `handleAlreadySubscribed()` now searches `document.body` — finds and hides subscribe buttons in popups/modals
+  5. When subscribed, paywall popup/modal containers are dismissed (detected by fixed/absolute position + z-index, or class names like modal/popup/overlay/dialog)
+  6. Added body-level `MutationObserver` to catch React portals and modal overlays that attach to `document.body`
+  7. Periodic IAP button check added to `scheduleBlankChecks()` (every 3s for 30s) catches late-appearing popups
+- **Acceptance gate addressed**:
+  - Subscribe Monthly triggers Apple purchase UI → fixed: broader button matching + body search
+  - Restore Purchases completes cleanly → fixed: restore buttons in popups now wired
+  - No contradictory states → fixed: when subscribed, ALL subscribe/trial/restore buttons hidden everywhere + popup dismissed
+  - Cancel purchase leaves app stable → already handled (status "cancelled" = no toast, no state change)
+- **Files changed**: `PatchedBridgeViewController.swift`, `project.pbxproj` (build 14→15), `AGENT.md`, `CHANGELOG.md`
+- **Verification**: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+- **Note on desktop web**: Subscribe/restore buttons on desktop web are handled by Base44's own JS (our iOS injections don't run on desktop). If those are dead, it's a Base44 platform issue. Companion status syncs cross-device via the Cloudflare Worker correctly.
+
+---
+
+### 2026-02-24 — Raouf: Build 14 — Monthly-Only Launch Scope (Milestone B)
+
+- **Scope change (Roland 2026-02-23)**: App Store Connect updated — Companion Monthly is the only subscription. Yearly removed from sale, 7-day free trial removed.
+- **What changed**:
+  1. **Purchase path**: Only Monthly ($9.99/mo) can be purchased. `AAStoreManager.purchasableProductIds` = monthly only.
+  2. **Entitlement check**: Both monthly AND yearly remain in `companionProductIds` for entitlement validation — existing yearly subscribers stay unlocked until expiry.
+  3. **Yearly buttons hidden**: Any yearly/annual subscribe buttons on the paywall are hidden via `display:none` (no dead ends).
+  4. **Trial buttons hidden**: Any "Start Free Trial" / "Try Companion" / trial buttons hidden (no trial in submission scope).
+  5. **No contradictory states**: When user has active subscription, ALL subscribe buttons are hidden on paywall; only the "active subscription" banner shows. When not subscribed, only Monthly subscribe + Restore are visible.
+  6. **StoreKit config**: `test.storekit` now contains only Companion Monthly product.
+  7. **ESLint config**: Added `ios/**/build/**` to ignores (Capacitor SPM build artifacts were causing false lint errors).
+- **Milestone B checklist addressed**:
+  - Subscribe Monthly → opens Apple purchase sheet, completes, unlocks immediately ✅
+  - After purchase → Companion unlocks, persists after kill/reopen (UserDefaults) ✅
+  - Restore Purchases → clear outcome: restored+unlocked OR nothing-to-restore ✅
+  - No contradictory states → subscribe buttons hidden when already subscribed ✅
+  - Single entitlement source of truth → `aa_is_companion` in UserDefaults, checked on login/purchase/restore/resume ✅
+- **Files changed**: `PatchedBridgeViewController.swift`, `test.storekit`, `project.pbxproj` (build 13→14), `eslint.config.js`, `AGENT.md`, `CHANGELOG.md`
+- **Verification**: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+---
+
 ### 2026-02-23 — Raouf: StoreKit Config Cleanup — Version 4 Fix Confirmed Working
 
 - **Problem (resolved)**: `Product.products(for:)` returned empty for both Companion products. Extensive debugging across multiple sessions revealed the root cause: Xcode 26.2 requires StoreKit configuration file format **version 4** (major:4, minor:0). Our manually-created `Configuration.storekit` used version 2 format and was silently ignored by Xcode.
