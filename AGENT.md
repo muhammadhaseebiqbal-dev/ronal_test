@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone B — App Store submission preparation (Build 18)
+**Current Phase:** Milestone B — App Store submission preparation (Build 19)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -170,32 +170,57 @@ These features require an active Companion subscription. "Companion adds a perso
 3. **Weekly Review** — Save weekly reflections and record spiritual growth
 4. **Highlights and Verse Bank** — Save verses and highlights to return to later
 
-**Gating mechanism:** TBD — need to verify whether Base44's web app already checks the `is_companion` user field to gate these features, or whether we need to inject JS-based gating from the iOS side. Test with a non-subscribed account: if you can access these features freely, iOS-side gating is needed.
+**Gating mechanism (confirmed by Roland 2026-02-24):** Base44's `is_companion` field on the user entity is the source of truth. The web app gates Companion features based on this field. iOS must NOT build duplicate gating logic — instead, iOS ensures `is_companion: true` is set via the Cloudflare Worker after purchase/restore, then refreshes user state (re-fetch `/User/me` via `reloadFromOrigin()`) so Base44's gating unlocks immediately.
 
 ---
 
-## Milestone B — Acceptance Criteria (Roland, 2026-02-23)
+## Milestone B — Build Acceptance Sheet (Roland, 2026-02-24)
 
-**Launch Scope:** Companion Monthly only. Yearly removed from sale. Trial removed. No copy changes.
+**Launch Scope:** Companion Monthly only. Yearly removed from sale. Trial removed. No copy changes except removing obsolete trial/yearly text.
 
+### A. Subscription UI
 | # | Criterion | Status |
 |---|-----------|--------|
-| 1 | Subscribe Monthly always opens Apple purchase sheet and completes successfully | ✅ Build 15: Broader button matching + body-wide search catches buttons in React portal popups |
-| 2 | After purchase, Companion unlocks immediately and stays unlocked after kill/reopen | ✅ Build 10+14: UserDefaults `aa_is_companion`, `reloadFromOrigin()` instant unlock |
-| 3 | Restore Purchases returns clear outcome: restored+unlocked OR nothing-to-restore, entitlement refreshed | ✅ Build 15: Restore buttons in popups now wired via body-wide search |
-| 4 | No contradictory states: must not show "active subscription" while presenting subscribe options | ✅ Build 15: When subscribed, ALL subscribe/trial/restore buttons hidden body-wide + popup containers dismissed |
-| 5 | Subscription gating driven from one entitlement source of truth, updates after login/purchase/restore | ✅ Build 14: Single source = `aa_is_companion` in UserDefaults, synced to web via `__aaIsCompanion` |
+| 1 | No "Yearly" option anywhere in the app UI | ✅ Build 18: `hideYearlyTextElements()` + yearly buttons hidden |
+| 2 | No "Trial" or "Free trial" wording anywhere in the app UI | ✅ Build 19: `hideTrialTextElements()` + trial buttons hidden |
+| 3 | Companion purchase UI shows Monthly only | ✅ Build 14: `purchasableProductIds` = monthly only |
+
+### B. Entitlement Consistency
+| # | Criterion | Status |
+|---|-----------|--------|
+| 4 | If user is subscribed, app must not show subscribe buttons or paywall options anywhere | ✅ Build 15+18: `handleAlreadySubscribed()` body-wide search + popup dismissal |
+| 5 | App must never show contradictory states (e.g. "active subscription" + Subscribe buttons) | ✅ Build 15+18: All subscribe/trial/restore buttons hidden when subscribed |
+
+### C. Purchase Flow
+| # | Criterion | Status |
+|---|-----------|--------|
+| 6 | Non-subscribed user taps Subscribe Monthly → Apple purchase sheet appears | ✅ Build 15+18: Broader button matching + body-wide search |
+| 7 | Complete purchase unlocks Companion immediately | ✅ Build 13: Worker sync + `reloadFromOrigin()` instant unlock |
+| 8 | Kill app and relaunch → Companion remains unlocked | ✅ Build 10: UserDefaults `aa_is_companion` persists |
+
+### D. Restore Flow
+| # | Criterion | Status |
+|---|-----------|--------|
+| 9 | Restore Purchases must always do something, must not silently do nothing | ✅ Build 12: Toast notifications for all outcomes |
+| 10 | On subscribed account, Restore = Companion unlocked + clear success message | ✅ Build 12: "Subscription restored! Companion unlocked." toast |
+| 11 | On non-subscribed account, Restore = clear "Nothing to restore" message | ✅ Build 12: "No active subscription found." toast |
+| 12 | After restore, entitlement state refreshed and UI updates correctly | ✅ Build 13: `refreshWebEntitlements()` + `reloadFromOrigin()` |
+
+### E. Feature Gating Source of Truth
+| # | Criterion | Status |
+|---|-----------|--------|
+| 13 | Base44 gating driven by `is_companion` on Base44 user entity | ✅ Build 11: Worker validates JWS → updates Base44 user |
+| 14 | No duplicate iOS-only gating logic; set `is_companion` via Worker, refresh user state | ✅ Build 11+13: Worker POST → `reloadFromOrigin()` → Base44 re-fetches `/User/me` |
 
 ---
 
 ## Last Change Log
 
-**2026-02-24 — Raouf: Build 18 — Fix Subscribe Button, Remove Yearly Text, Fix Captain's Log Black Popup, Remove Duplicate Logout**
-- **Bug 1 (subscribe button)**: Button matching too narrow + `handleAlreadySubscribed()` stale hiding. Fix: broader patterns (upgrade/start now/choose plan) + companion match excludes feature names.
-- **Bug 2 (yearly text)**: `wireIAPButtons()` only hid yearly buttons, not pricing labels/cards. Fix: new `hideYearlyTextElements()` scans text elements for yearly/annual pricing and hides them.
-- **Bug 3 (Captain's Log black popup)**: `handleAlreadySubscribed()` overlay dismissal was too aggressive — hid ALL modals including Captain's Log. Fix: only dismiss containers whose text is subscription-related (not feature-related). Added stale `data-aa-sub-hidden` cleanup on navigation.
-- **Bug 4 (duplicate logout)**: Base44 renders its own logout alongside our red `#aa-logout-btn`. Fix: new `hideBase44NativeLogout()` hides non-red logout buttons on More/Settings.
-- Build number 17→18.
+**2026-02-24 — Raouf: Build 19 — Hide Trial Text Elements + Acceptance Sheet Compliance**
+- **Gap**: Trial buttons were hidden but non-button trial text (labels, descriptions, pricing cards) could still appear in subscription/paywall UI.
+- **Fix**: New `hideTrialTextElements()` function scans DOM for "free trial", "7-day trial", "start trial", "trial" + subscription context text and hides them + parent pricing containers. CSS rule `[data-aa-trial-hidden]` with `display: none !important`. Called from `wireIAPButtons()` alongside existing `hideYearlyTextElements()`.
+- **AGENT.md**: Updated Companion Features gating mechanism from "TBD" to Roland's confirmed approach (Base44 `is_companion`, no iOS-only gating). Updated Milestone B acceptance criteria to full 14-point Build Acceptance Sheet.
+- Build number 18→19.
 - Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
 
 **2026-02-24 — Raouf: Build 17 — Fix localStorage SecurityError in WKWebView**
@@ -427,6 +452,18 @@ These features require an active Companion subscription. "Companion adds a perso
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-24 (Australia/Sydney)
+- **Scope:** Build 19 — Hide Trial Text Elements + Build Acceptance Sheet Compliance
+- **Summary:** Roland provided a formal 14-point Build Acceptance Sheet for Milestone B. Audited Build 18 against all 14 items. Found one gap: trial *buttons* were hidden by `wireIAPButtons()` but non-button trial TEXT (labels, descriptions, pricing cards like "7-day free trial", "Start free trial") was not caught. Added `hideTrialTextElements()` which mirrors the existing `hideYearlyTextElements()` pattern — scans non-button DOM elements for trial-related text with subscription context, walks up the DOM tree to find parent pricing containers, and hides them with `data-aa-trial-hidden` attribute + CSS `display: none !important`. Also updated AGENT.md: replaced "TBD" gating mechanism in Companion Features section with Roland's confirmed approach (Base44 `is_companion` is source of truth, no iOS-only gating logic), and replaced the 5-item Milestone B table with the full 14-point Build Acceptance Sheet organized into sections A-E.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: New `hideTrialTextElements()` function, CSS rule `[data-aa-trial-hidden]`, wired into `wireIAPButtons()` after `hideYearlyTextElements()`
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Build number 18 → 19
+  - `AGENT.md` — Updated Current Phase, Companion Features gating mechanism, Milestone B acceptance criteria (14-point sheet), Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
+- **Follow-ups:** Test on device: (a) no "trial" or "free trial" text visible anywhere, (b) all 14 acceptance items pass on device
 
 **Raouf:**
 - **Date:** 2026-02-24 (Australia/Sydney)

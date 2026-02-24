@@ -1611,6 +1611,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         [data-aa-yearly-hidden] {
           display: none !important;
         }
+        /* ── Build 19: Hide trial/free-trial text elements via CSS ── */
+        [data-aa-trial-hidden] {
+          display: none !important;
+        }
         /* Hide Base44 native logout (non-red) */
         [data-aa-native-logout-hidden] {
           display: none !important;
@@ -2870,6 +2874,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Build 18: Hide "yearly"/"annual" text labels/descriptions outside of buttons.
         // These are pricing text elements that Base44 renders (not action buttons).
         hideYearlyTextElements();
+
+        // Build 19: Hide "trial"/"free trial" text labels/descriptions outside of buttons.
+        hideTrialTextElements();
       }
 
       // Helper: hide parent container if all children are hidden
@@ -2955,6 +2962,78 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             }
             target.style.display = 'none';
             target.setAttribute('data-aa-yearly-hidden', '1');
+          }
+        });
+      }
+
+      // Build 19: Hide elements containing "trial"/"free trial" text in subscription/paywall UI.
+      // Only targets non-button elements (labels, descriptions, cards).
+      // Trial buttons are already hidden by wireIAPButtons() classification.
+      function hideTrialTextElements() {
+        var candidates = document.querySelectorAll('div, span, li, p, label, small, h1, h2, h3, h4, h5, h6, td');
+        candidates.forEach(function(el) {
+          if (el.getAttribute('data-aa-trial-hidden')) return;
+          // Skip our own injected UI
+          if (el.closest('#aa-logout-section, #aa-subscription-section, .aa-diag-overlay, .aa-toast, #aa-already-subscribed')) return;
+          // Skip elements already handled by wireIAPButtons
+          if (el.getAttribute('data-aa-iap-wired')) return;
+          // Skip if it contains interactive children
+          if (el.querySelector('button, input, textarea, select')) return;
+
+          var text = (el.textContent || '').trim().toLowerCase();
+          if (!text || text.length > 200) return;
+
+          var isTrialText = false;
+
+          // "free trial" in any context within subscription UI
+          if (text.indexOf('free trial') !== -1) {
+            isTrialText = true;
+          }
+
+          // "trial" with subscription/pricing context
+          if (!isTrialText && text.indexOf('trial') !== -1 &&
+              (text.indexOf('start') !== -1 || text.indexOf('day') !== -1 ||
+               text.indexOf('free') !== -1 || text.indexOf('try') !== -1 ||
+               text.indexOf('begin') !== -1 || text.indexOf('companion') !== -1 ||
+               text.indexOf('subscribe') !== -1 || text.indexOf('included') !== -1 ||
+               text.indexOf('offer') !== -1 || text.indexOf('introductory') !== -1)) {
+            isTrialText = true;
+          }
+
+          // Standalone short labels: "Free Trial", "7-day trial", "Trial", "Start Trial"
+          if (!isTrialText && text.length <= 30) {
+            if (text === 'trial' || text === 'free trial' || text === 'start trial' ||
+                text === 'start free trial' || text === 'try free' || text === 'try for free' ||
+                text.indexOf('7-day') !== -1 || text.indexOf('7 day') !== -1 ||
+                text.indexOf('-day trial') !== -1 || text.indexOf(' day trial') !== -1) {
+              isTrialText = true;
+            }
+          }
+
+          if (isTrialText) {
+            // Walk up to find the nearest container and hide it
+            var target = el;
+            var parent = el.parentElement;
+            var depth = 0;
+            while (parent && parent !== document.body && depth < 5) {
+              depth++;
+              var siblings = parent.children;
+              if (siblings.length <= 4) {
+                var allText = '';
+                for (var s = 0; s < siblings.length; s++) {
+                  allText += ' ' + (siblings[s].textContent || '').trim().toLowerCase();
+                }
+                if (allText.indexOf('trial') !== -1 &&
+                    (allText.indexOf('free') !== -1 || allText.indexOf('day') !== -1 ||
+                     allText.indexOf('start') !== -1 || allText.indexOf('try') !== -1)) {
+                  target = parent;
+                  break;
+                }
+              }
+              parent = parent.parentElement;
+            }
+            target.style.display = 'none';
+            target.setAttribute('data-aa-trial-hidden', '1');
           }
         });
       }

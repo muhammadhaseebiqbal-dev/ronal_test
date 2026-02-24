@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-24 — Raouf: Build 19 — Hide Trial Text Elements + Build Acceptance Sheet Compliance
+
+**Gap — "Trial" / "Free trial" text still visible**: `wireIAPButtons()` hid trial *buttons* (via `data-aa-iap-wired="hidden-trial"` + `display: none`), but Base44's subscription/paywall UI also renders trial text in labels, descriptions, and pricing cards that are NOT buttons. Roland's acceptance item A2: "No 'Trial' or 'Free trial' wording anywhere in the app UI."
+
+- **Fix — New `hideTrialTextElements()` function**: Mirrors `hideYearlyTextElements()`. Scans non-button DOM elements (div, span, li, p, label, etc.) for trial-related text:
+  - "free trial" in any context
+  - "trial" with subscription context: start, day, free, try, begin, companion, subscribe, included, offer, introductory
+  - Standalone short labels: "Trial", "Free Trial", "Start Trial", "7-day trial", etc.
+  - Walks up DOM tree (max 5 levels) to find parent pricing card container for clean hiding
+  - Marks hidden elements with `data-aa-trial-hidden="1"`, CSS rule `[data-aa-trial-hidden] { display: none !important }`
+- **Wired into `wireIAPButtons()`**: Called after `hideYearlyTextElements()` on every patch cycle
+- **AGENT.md updates**:
+  - Companion Features gating mechanism: updated from "TBD" to Roland's confirmed approach (Base44 `is_companion` = source of truth, no iOS-only gating)
+  - Milestone B: replaced 5-item table with Roland's full 14-point Build Acceptance Sheet (A1-A3, B4-B5, C6-C8, D9-D12, E13-E14)
+- **Files changed**: `PatchedBridgeViewController.swift`, `project.pbxproj` (build 18→19), `AGENT.md`, `CHANGELOG.md`
+- **Verification**: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
+
+---
+
 ### 2026-02-24 — Raouf: Build 18 — Fix Subscribe Button, Remove Yearly Text, Fix Captain's Log Black Popup, Remove Duplicate Logout
 
 **Bug 1 — Subscribe button not working**: Subscribe buttons could go unmatched if their text didn't contain "companion" or "subscribe". Also, `handleAlreadySubscribed()` was incorrectly hiding buttons when `window.__aaIsCompanion` was stale.
