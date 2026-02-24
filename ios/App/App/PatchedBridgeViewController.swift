@@ -3507,14 +3507,40 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       }
 
       // SPA navigation hooks
+
+      // Build 22 FIX: Track last URL to detect login→dashboard transitions.
+      // After logout, aa_is_companion is cleared from UserDefaults, so the WKUserScript
+      // sets window.__aaIsCompanion = false on the login page. After login, the SPA
+      // navigates to dashboard but nothing re-checks StoreKit entitlements — so the
+      // subscription appears lost. This detects the transition and triggers a native
+      // entitlement recheck via the existing recheckEntitlements message handler.
+      var __aaLastPath = window.location.pathname;
+
+      function checkLoginTransition() {
+        var currentPath = window.location.pathname;
+        var wasOnLogin = __aaLastPath === '/login' || __aaLastPath === '/login/';
+        var nowOnLogin = currentPath === '/login' || currentPath === '/login/';
+        __aaLastPath = currentPath;
+
+        // Transitioned FROM login TO another page → user just logged in
+        if (wasOnLogin && !nowOnLogin) {
+          console.log('[AA] Login transition detected — rechecking StoreKit entitlements');
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
+            window.webkit.messageHandlers.aaPurchase.postMessage({ action: 'recheckEntitlements' });
+          }
+        }
+      }
+
       window.addEventListener('popstate', function() {
         setTimeout(runAllPatches, 300);
         scheduleBlankChecks();
+        checkLoginTransition();
       });
 
       window.addEventListener('hashchange', function() {
         setTimeout(runAllPatches, 300);
         scheduleBlankChecks();
+        checkLoginTransition();
       });
 
       var origPush = history.pushState;
@@ -3523,12 +3549,14 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         var result = origPush.apply(this, arguments);
         setTimeout(runAllPatches, 300);
         scheduleBlankChecks();
+        checkLoginTransition();
         return result;
       };
       history.replaceState = function() {
         var result = origReplace.apply(this, arguments);
         setTimeout(runAllPatches, 300);
         scheduleBlankChecks();
+        checkLoginTransition();
         return result;
       };
 

@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-24 — Raouf: Build 22 — Fix Subscription State Lost After Logout + Login
+
+**Bug — Subscription disappears after logout + login**: After logging out and logging back in, the subscription state is lost. The user sees subscribe/paywall buttons as if they're not subscribed, and must tap Restore Purchases to recover.
+
+**Root cause**: `performFullLogout()` (line 647) clears `aa_is_companion` from UserDefaults. When the login page loads, the WKUserScript at `.atDocumentStart` calls `buildNativeDiagJS()` which reads `UserDefaults.bool(forKey: companionDefaultsKey)` → returns `false` → sets `window.__aaIsCompanion = false`. After the user logs in, the SPA navigates from `/login` to the dashboard via `history.pushState()`, but **nothing re-checks StoreKit entitlements**:
+- `viewDidLoad()` only runs once on cold boot (same WebView instance reused)
+- `handleWillEnterForeground()` only fires on app resume from background
+- `checkCompanionOnServer()` only runs on `willEnterForeground`
+- So `window.__aaIsCompanion` stays `false` indefinitely after login
+
+**Fix — Login transition detection in SPA navigation hooks**:
+- Added `__aaLastPath` variable that tracks the current URL path
+- Added `checkLoginTransition()` function that detects when the user navigates from `/login` to any other path (= successful login)
+- On login transition, triggers `recheckEntitlements` via the existing `aaPurchase` native message handler
+- The native handler calls `AAStoreManager.shared.checkEntitlements()` → checks `Transaction.currentEntitlements` → `persistCompanionState()` → `refreshWebEntitlements()` → updates `window.__aaIsCompanion` + calls `__aaRunAllPatches()` → subscription UI updates immediately
+- `checkLoginTransition()` is called from all SPA navigation intercepts: `popstate`, `hashchange`, `history.pushState`, `history.replaceState`
+
+This reuses the existing `recheckEntitlements` infrastructure (Build 16) — no new native code needed.
+
+- **Files changed**: `PatchedBridgeViewController.swift`, `project.pbxproj` (build 21→22)
+- **Verification**: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED — 0 warnings
+
+---
+
 ### 2026-02-24 — Raouf: Build 21 — Dismiss Paywall Overlay After Confirmed Purchase
 
 **Bug — Paywall popup stays after successful purchase**: After Build 20 removed overlay dismissal from `handleAlreadySubscribed()`, the Base44 paywall popup remains on screen after a successful StoreKit purchase. The wired buttons inside get hidden, but the popup container itself blocks the UI.

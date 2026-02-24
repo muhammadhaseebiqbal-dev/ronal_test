@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone B — App Store submission preparation (Build 21)
+**Current Phase:** Milestone B — App Store submission preparation (Build 22)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -215,6 +215,13 @@ These features require an active Companion subscription. "Companion adds a perso
 ---
 
 ## Last Change Log
+
+**2026-02-24 — Raouf: Build 22 — Fix Subscription State Lost After Logout + Login**
+- **Bug**: After logout and re-login, subscription state is lost — user has to manually tap Restore. Subscription works fine until logout, then disappears after login.
+- **Root cause**: `performFullLogout()` clears `aa_is_companion` from UserDefaults. On login page reload, WKUserScript reads `UserDefaults.bool(forKey: companionDefaultsKey)` → `false` → sets `window.__aaIsCompanion = false`. After login, SPA navigates to dashboard but nothing re-checks StoreKit entitlements. `viewDidLoad()` only runs once on cold boot. `handleWillEnterForeground()` only fires on app resume from background. So `window.__aaIsCompanion` stays `false` indefinitely.
+- **Fix**: Added login transition detection to SPA navigation hooks. Tracks `__aaLastPath` and detects when URL changes from `/login` to any other path (= user just logged in). On transition, triggers `recheckEntitlements` via existing native message handler → `AAStoreManager.shared.checkEntitlements()` → `persistCompanionState()` → `refreshWebEntitlements()` → `runAllPatches()` → subscription UI updates immediately.
+- Build number 21→22.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED — 0 warnings
 
 **2026-02-24 — Raouf: Build 21 — Dismiss Paywall Overlay After Confirmed Purchase**
 - **Bug**: After successful StoreKit purchase, the Base44 paywall popup stays on screen. Build 20 removed overlay dismissal from `handleAlreadySubscribed()` (to fix Bug 5), but didn't add a replacement for the post-purchase case. Compounded in Xcode testing: Xcode-signed JWS can't be validated by the Worker → `reloadFromOrigin()` never fires → popup stays forever.
@@ -471,6 +478,18 @@ These features require an active Companion subscription. "Companion adds a perso
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-24 (Australia/Sydney)
+- **Scope:** Build 22 — Fix Subscription State Lost After Logout + Login
+- **Summary:** After logout and re-login, the subscription state was lost because `performFullLogout()` clears `aa_is_companion` from UserDefaults, and after login the SPA navigates to dashboard without re-checking StoreKit entitlements. Fix: added login transition detection in the injected JS SPA navigation hooks — tracks `__aaLastPath` and detects `/login` → dashboard transitions, then triggers `recheckEntitlements` via the existing native message handler. This re-checks `Transaction.currentEntitlements`, persists the state, and calls `refreshWebEntitlements()` which updates `window.__aaIsCompanion` and runs all patches.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Added `__aaLastPath` tracking + `checkLoginTransition()` function in SPA navigation hooks section, called from `popstate`, `hashchange`, `history.pushState`, and `history.replaceState` intercepts
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Build number 21 → 22
+  - `AGENT.md` — Updated Current Phase, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED — 0 warnings
+- **Follow-ups:** Test on Xcode: (a) logout → login → subscription state restored automatically without manual Restore, (b) verify `recheckEntitlements` fires in console on login transition, (c) verify no double-check on non-login navigations
 
 **Raouf:**
 - **Date:** 2026-02-24 (Australia/Sydney)
