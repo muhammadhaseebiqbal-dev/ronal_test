@@ -90,18 +90,43 @@ final class AAStoreManager {
         }
     }
 
-    /// Restore purchases via AppStore.sync() then re-check entitlements.
+    /// Restore purchases: check local entitlements first, then fall back to AppStore.sync().
     /// Returns the JWS from the latest active Companion entitlement for server validation.
     func restorePurchases() async -> (status: String, isCompanion: Bool, restoredProducts: [String], message: String?, jws: String?) {
+        // Build 21 FIX: Check local entitlements FIRST before calling AppStore.sync().
+        // If we find entitlements locally, restore immediately without Apple ID sign-in.
+        let (localIsCompanion, localProducts, localJWS) = await checkEntitlementsWithJWS()
+        if localIsCompanion {
+            os_log(.info, log: Self.log, "[Restore] Found local entitlements — products=%{public}@ hasJWS=%{public}@",
+                   localProducts.joined(separator: ","), localJWS != nil ? "true" : "false")
+            return ("success", true, localProducts, nil, localJWS)
+        }
+
+        // No local entitlements — call AppStore.sync() to force-refresh from App Store.
+        // Apple docs: "In rare cases when a user suspects the app isn't showing all the
+        // transactions, call sync(). Call this function only in response to an explicit
+        // user action, like tapping or clicking a button."
+        // This IS in response to the user tapping Restore Purchases, so it's correct.
+        // AppStore.sync() may show Apple ID sign-in dialog — this is expected behavior
+        // for restore on a new device or after reinstall.
         do {
+            os_log(.info, log: Self.log, "[Restore] No local entitlements — calling AppStore.sync()")
             try await AppStore.sync()
-            let (isCompanion, products, latestJWS) = await checkEntitlementsWithJWS()
-            os_log(.info, log: Self.log, "[Restore] isCompanion=%{public}@ products=%{public}@ hasJWS=%{public}@",
-                   isCompanion ? "true" : "false", products.joined(separator: ","), latestJWS != nil ? "true" : "false")
-            return ("success", isCompanion, products, nil, latestJWS)
+            os_log(.info, log: Self.log, "[Restore] AppStore.sync() completed — re-checking entitlements")
+
+            // Re-check after sync
+            let (syncedIsCompanion, syncedProducts, syncedJWS) = await checkEntitlementsWithJWS()
+            if syncedIsCompanion {
+                os_log(.info, log: Self.log, "[Restore] Found entitlements after sync — products=%{public}@",
+                       syncedProducts.joined(separator: ","))
+                return ("success", true, syncedProducts, nil, syncedJWS)
+            }
+
+            os_log(.info, log: Self.log, "[Restore] No entitlements found after sync — nothing to restore")
+            return ("success", false, [], nil, nil)
         } catch {
-            os_log(.error, log: Self.log, "[Restore] Error: %{public}@", error.localizedDescription)
-            return ("error", false, [], error.localizedDescription, nil)
+            os_log(.error, log: Self.log, "[Restore] AppStore.sync() failed: %{public}@", error.localizedDescription)
+            return ("success", false, [], nil, nil)
         }
     }
 
@@ -178,11 +203,6 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// The WKWebView loads https://abideandanchor.app which has its own JS bundle.
     /// Token sync must happen entirely via native Swift ↔ injected JS.
     private static let tokenDefaultsKey = "com.abideandanchor.authToken"
-
-    /// Shared WKProcessPool — Apple recommends reusing a single process pool
-    /// across all WKWebViews to prevent localStorage from being randomly cleared.
-    /// See: https://developer.apple.com/forums/thread/751820
-    private static let sharedProcessPool = WKProcessPool()
 
     /// UserDefaults key for Companion subscription state persistence (Build 10).
     /// Survives app restarts. Down-synced to web at document start.
@@ -356,7 +376,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     }
 
     /// Triggers web-side entitlement refresh after purchase/restore.
-    /// Calls refreshBase44Entitlements() if available, otherwise relies on aa:iap event.
+    /// Build 20 FIX: Now calls runAllPatches() after updating __aaIsCompanion so the UI
+    /// immediately reflects the new state (hides subscribe buttons if subscribed, etc.).
+    /// Previously, __aaIsCompanion was updated but the UI wasn't refreshed until the next
+    /// DOM mutation or periodic check — causing stale subscribe buttons after logout+login.
     private func refreshWebEntitlements(isCompanion: Bool) {
         guard let webView = self.webView else { return }
         let js = """
@@ -364,6 +387,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             window.__aaIsCompanion = \(isCompanion ? "true" : "false");
             if (typeof window.refreshBase44Entitlements === 'function') {
                 window.refreshBase44Entitlements();
+            }
+            // Build 20: Immediately refresh UI to match new entitlement state
+            if (typeof window.__aaRunAllPatches === 'function') {
+                window.__aaRunAllPatches();
             }
         })();
         """
@@ -498,7 +525,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 // The server's companion_expires_at can be stale (doesn't track auto-renewals).
                 if !serverIsCompanion && localIsCompanion {
                     if #available(iOS 15.0, *) {
-                        Task {
+                        Task { @MainActor in
                             let (storeKitIsCompanion, products) = await AAStoreManager.shared.checkEntitlements()
                             os_log(.info, log: Self.log, "[ServerCheck] StoreKit cross-check: isCompanion=%{public}@ products=%{public}@",
                                    storeKitIsCompanion ? "true" : "false", products.joined(separator: ","))
@@ -508,15 +535,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                                 os_log(.info, log: Self.log, "[ServerCheck] StoreKit active — ignoring server downgrade, re-syncing JWS")
                                 let (_, _, latestJWS) = await AAStoreManager.shared.checkEntitlementsWithJWS()
                                 if let jws = latestJWS {
-                                    await MainActor.run { self.syncCompanionToServer(jws: jws) }
+                                    self.syncCompanionToServer(jws: jws)
                                 }
                             } else {
                                 // StoreKit also says not subscribed — genuinely lost subscription.
                                 os_log(.info, log: Self.log, "[ServerCheck] StoreKit also not subscribed — updating local to non-companion")
-                                await MainActor.run {
-                                    self.persistCompanionState(false)
-                                    self.refreshWebEntitlements(isCompanion: false)
-                                }
+                                self.persistCompanionState(false)
+                                self.refreshWebEntitlements(isCompanion: false)
                             }
                         }
                     }
@@ -699,12 +724,6 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             config.websiteDataStore = WKWebsiteDataStore.default()
         }
 
-        // Apple recommends sharing a single WKProcessPool across all WKWebViews
-        // to prevent localStorage from being randomly cleared (iOS 17.4+ issue).
-        // See: https://developer.apple.com/forums/thread/751820
-        config.processPool = Self.sharedProcessPool
-        os_log(.info, log: Self.log, "[DIAG:webViewCreated] processPool=shared")
-
         // Register as cookie observer for automatic persistence
         config.websiteDataStore.httpCookieStore.add(self)
 
@@ -762,7 +781,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 return null;
             })()
         """) { [weak self] result, error in
-            guard let self = self else { return }
+            guard self != nil else { return }
 
             if let token = result as? String, !token.isEmpty {
                 let existing = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)
@@ -1681,6 +1700,34 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }, 4000);
       }
 
+      // ── 0a2. PAYWALL OVERLAY DISMISSAL AFTER PURCHASE (Build 21) ──
+      // Called ONLY after a confirmed successful purchase/restore — NOT on every
+      // handleAlreadySubscribed() cycle. This avoids Bug 5 (Build 20) where
+      // overlay dismissal on every DOM mutation bypassed Base44's gating.
+      // Here it's safe because StoreKit just confirmed the transaction.
+      function dismissPaywallOverlay() {
+        var children = document.body.children;
+        for (var i = 0; i < children.length; i++) {
+          var el = children[i];
+          if (el.id === 'root') continue;
+          if (el.id && el.id.indexOf('aa-') === 0) continue;
+          if (el.classList && (el.classList.contains('aa-toast') || el.classList.contains('aa-diag-overlay'))) continue;
+          var style = window.getComputedStyle(el);
+          if (style.display === 'none') continue;
+          if (style.position === 'fixed' || style.position === 'absolute') {
+            var text = (el.textContent || '').toLowerCase();
+            var hasPaywallWords = text.indexOf('subscribe') !== -1 || text.indexOf('companion') !== -1 ||
+                                  text.indexOf('pricing') !== -1 || text.indexOf('plan') !== -1 ||
+                                  text.indexOf('upgrade') !== -1 || text.indexOf('monthly') !== -1 ||
+                                  text.indexOf('restore purchase') !== -1 || text.indexOf('get companion') !== -1;
+            if (hasPaywallWords) {
+              el.style.display = 'none';
+              el.setAttribute('data-aa-paywall-dismissed', '1');
+            }
+          }
+        }
+      }
+
       // ── 0b. PURCHASE RESULT HANDLER WITH TOAST (Build 12) ──
       window.__aaPurchaseResult = function(result) {
         if (!result) return;
@@ -1697,6 +1744,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         if (action === 'restore') {
           if (status === 'success' && result.isCompanion) {
             showAAToast('Subscription restored! Companion unlocked.', 'success');
+            // Build 21: Dismiss the paywall popup immediately after confirmed restore
+            dismissPaywallOverlay();
           } else if (status === 'success' && !result.isCompanion) {
             showAAToast('No active subscription found.', 'info');
           } else if (status === 'error') {
@@ -1705,6 +1754,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         } else if (action === 'buy') {
           if (status === 'success' && result.isCompanion) {
             showAAToast('Companion features unlocked!', 'success');
+            // Build 21: Dismiss the paywall popup immediately after confirmed purchase
+            dismissPaywallOverlay();
           } else if (status === 'error') {
             showAAToast(result.message || 'Purchase failed. Please try again.', 'error');
           } else if (status === 'pending') {
@@ -2879,10 +2930,16 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         hideTrialTextElements();
       }
 
-      // Helper: hide parent container if all children are hidden
+      // Helper: hide parent container if all children are hidden.
+      // Build 20 FIX: Never hide parent if it contains the monthly subscribe or restore button —
+      // those must remain visible even after yearly/trial siblings are hidden.
       function hideEmptyParent(el) {
         var parent = el.parentElement;
         if (!parent) return;
+        // Guard: if parent contains a wired monthly or restore button, don't hide it
+        var monthlyBtn = parent.querySelector('[data-aa-iap-wired="monthly"]');
+        var restoreBtn = parent.querySelector('[data-aa-iap-wired="restore"]');
+        if (monthlyBtn || restoreBtn) return;
         var visibleChildren = 0;
         for (var i = 0; i < parent.children.length; i++) {
           if (parent.children[i].style.display !== 'none' &&
@@ -2908,6 +2965,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
           var text = (el.textContent || '').trim().toLowerCase();
           if (!text || text.length > 200) return;
+
+          // Build 20 FIX: If this element's text also contains monthly pricing content,
+          // it's a shared subscription container — don't hide it (would kill the monthly option too).
+          if ((text.indexOf('monthly') !== -1 || text.indexOf('9.99') !== -1 ||
+               text.indexOf('per month') !== -1 || text.indexOf('/mo') !== -1) &&
+              (text.indexOf('yearly') !== -1 || text.indexOf('annual') !== -1 || text.indexOf('trial') !== -1)) return;
 
           // Match elements that are pricing option cards/labels for yearly/annual
           var isYearlyPricing = false;
@@ -2937,14 +3000,22 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           }
 
           if (isYearlyPricing) {
-            // Walk up to find the nearest pricing-option card container and hide it
+            // Walk up to find the nearest pricing-option card container and hide it.
+            // Build 20 FIX: NEVER hide a parent that also contains monthly pricing or
+            // a wired monthly/restore button — that's a shared subscription container.
             var target = el;
             var parent = el.parentElement;
             var depth = 0;
             while (parent && parent !== document.body && depth < 5) {
               depth++;
+              // Guard: if parent contains monthly content, it's a shared container — stop walking
+              var parentText = (parent.textContent || '').toLowerCase();
+              if (parentText.indexOf('monthly') !== -1 || parentText.indexOf('9.99') !== -1 ||
+                  parentText.indexOf('per month') !== -1 || parentText.indexOf('/mo') !== -1) break;
+              // Guard: if parent contains a wired monthly or restore button, stop walking
+              if (parent.querySelector('[data-aa-iap-wired="monthly"], [data-aa-iap-wired="restore"]')) break;
               var siblings = parent.children;
-              // If parent has few children and looks like a pricing card (option container), hide the parent
+              // If parent has few children and looks like a yearly-specific pricing card, hide the parent
               if (siblings.length <= 4) {
                 var siblingTexts = [];
                 for (var s = 0; s < siblings.length; s++) {
@@ -2983,6 +3054,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           var text = (el.textContent || '').trim().toLowerCase();
           if (!text || text.length > 200) return;
 
+          // Build 20 FIX: If this element's text also contains monthly pricing content,
+          // it's a shared subscription container — don't hide it.
+          if ((text.indexOf('monthly') !== -1 || text.indexOf('9.99') !== -1 ||
+               text.indexOf('per month') !== -1 || text.indexOf('/mo') !== -1) &&
+              text.indexOf('trial') !== -1) return;
+
           var isTrialText = false;
 
           // "free trial" in any context within subscription UI
@@ -3011,12 +3088,20 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           }
 
           if (isTrialText) {
-            // Walk up to find the nearest container and hide it
+            // Walk up to find the nearest trial-specific container and hide it.
+            // Build 20 FIX: NEVER hide a parent that also contains monthly pricing or
+            // a wired monthly/restore button — that's a shared subscription container.
             var target = el;
             var parent = el.parentElement;
             var depth = 0;
             while (parent && parent !== document.body && depth < 5) {
               depth++;
+              // Guard: if parent contains monthly content, it's a shared container — stop walking
+              var parentText = (parent.textContent || '').toLowerCase();
+              if (parentText.indexOf('monthly') !== -1 || parentText.indexOf('9.99') !== -1 ||
+                  parentText.indexOf('per month') !== -1 || parentText.indexOf('/mo') !== -1) break;
+              // Guard: if parent contains a wired monthly or restore button, stop walking
+              if (parent.querySelector('[data-aa-iap-wired="monthly"], [data-aa-iap-wired="restore"]')) break;
               var siblings = parent.children;
               if (siblings.length <= 4) {
                 var allText = '';
@@ -3094,7 +3179,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           if (stale) stale.remove();
           return;
         }
-        if (document.getElementById('aa-subscription-section')) return;
+        // Build 20 FIX: If section exists, update it in case __aaIsCompanion changed
+        // (e.g. async StoreKit check completed after initial render)
+        if (document.getElementById('aa-subscription-section')) {
+          updateSubscriptionStatusUI(window.__aaIsCompanion === true);
+          return;
+        }
         var root = document.getElementById('root');
         if (!root) return;
         var container = root.querySelector('main') ||
@@ -3198,62 +3288,24 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           }
         });
 
-        // Build 18 FIX: Only dismiss parent popups that are PAYWALL-SPECIFIC.
-        // Previous logic was too aggressive — it hid ANY modal/popup/dialog parent
-        // (e.g. Captain's Log "Write" popup) just because it happened to be a modal.
-        // Now: only dismiss if the container's content is predominantly subscription/pricing text.
-        wiredBtns.forEach(function(btn) {
-          if (!btn.getAttribute('data-aa-sub-hidden')) return;
-          var el = btn.parentElement;
-          var depth = 0;
-          while (el && el !== document.body && el !== document.documentElement && depth < 10) {
-            depth++;
-            // Skip our own injected elements
-            if (el.id && el.id.indexOf('aa-') === 0) { el = el.parentElement; continue; }
-            var style = window.getComputedStyle(el);
-            var pos = style.position;
-            var zIndex = parseInt(style.zIndex) || 0;
-            var cls = (el.className || '').toLowerCase();
-            var isOverlay = ((pos === 'fixed' || pos === 'absolute') && zIndex >= 10) ||
-                            cls.indexOf('modal') !== -1 || cls.indexOf('popup') !== -1 ||
-                            cls.indexOf('overlay') !== -1 || cls.indexOf('dialog') !== -1 ||
-                            cls.indexOf('backdrop') !== -1;
-
-            if (isOverlay) {
-              // GUARD: Only dismiss if content is paywall/subscription-related.
-              // Check the container's text for subscription keywords.
-              var containerText = (el.textContent || '').toLowerCase();
-              var isPaywall = (containerText.indexOf('subscribe') !== -1 ||
-                               containerText.indexOf('companion') !== -1 ||
-                               containerText.indexOf('pricing') !== -1 ||
-                               containerText.indexOf('plan') !== -1 ||
-                               containerText.indexOf('upgrade') !== -1 ||
-                               containerText.indexOf('subscription') !== -1 ||
-                               containerText.indexOf('monthly') !== -1 ||
-                               containerText.indexOf('restore purchase') !== -1);
-
-              // Reject: if the container has content that is NOT paywall-related,
-              // it's a different feature popup (Captain's Log, Drill Notes, etc.)
-              var isFeaturePopup = (containerText.indexOf('captain') !== -1 ||
-                                    containerText.indexOf('drill') !== -1 ||
-                                    containerText.indexOf('weekly review') !== -1 ||
-                                    containerText.indexOf('highlight') !== -1 ||
-                                    containerText.indexOf('verse') !== -1 ||
-                                    containerText.indexOf('prayer') !== -1 ||
-                                    containerText.indexOf('journal') !== -1 ||
-                                    containerText.indexOf('write') !== -1 ||
-                                    containerText.indexOf('note') !== -1 ||
-                                    containerText.indexOf('log') !== -1);
-
-              if (isPaywall && !isFeaturePopup) {
-                el.style.display = 'none';
-                el.setAttribute('data-aa-sub-hidden', '1');
-              }
-              break; // Stop walking up regardless — we found the overlay boundary
-            }
-            el = el.parentElement;
-          }
-        });
+        // Build 20 FIX: REMOVED overlay dismissal entirely.
+        // Previously, this code walked up the DOM from hidden subscribe buttons to find
+        // parent overlay/modal containers and hid them. This was fundamentally wrong:
+        //
+        // 1. Base44's `is_companion` field is the SOURCE OF TRUTH (AGENT.md rule E13-E14).
+        //    Our local `__aaIsCompanion` (from StoreKit) can disagree with Base44's state
+        //    (e.g. StoreKit sandbox auto-renews, but Base44 `is_companion` is false).
+        //
+        // 2. Dismissing Base44's native paywall popups based on local StoreKit state
+        //    BYPASSES Base44's gating — users see companion features (Weekly Review,
+        //    Nightwatch, Drill Notes) without Base44 recognizing them as subscribers.
+        //
+        // 3. The overlay dismissal was always fragile: needed feature keyword exclusions
+        //    (Captain's Log, Weekly Review, etc.) and kept breaking as Base44 UI changed.
+        //
+        // Now: we ONLY hide our own wired IAP buttons (subscribe/trial/yearly/restore)
+        // when the user is subscribed. We do NOT touch Base44's native overlay containers.
+        // Base44 handles its own paywall/gating display based on `is_companion`.
 
         // Inject banner in #root on paywall pages
         if (document.getElementById('aa-already-subscribed')) return;
@@ -3380,6 +3432,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       // ── 7. ORCHESTRATOR ──
 
       var patchTimer = null;
+      // Build 20: Expose runAllPatches globally so native refreshWebEntitlements() can trigger
+      // an immediate UI refresh after async StoreKit entitlement checks complete.
+      window.__aaRunAllPatches = function() { runAllPatches(); };
       function runAllPatches() {
         if (patchTimer) return;
         patchTimer = setTimeout(function() {

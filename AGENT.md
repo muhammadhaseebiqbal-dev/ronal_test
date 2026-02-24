@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone B — App Store submission preparation (Build 19)
+**Current Phase:** Milestone B — App Store submission preparation (Build 21)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -215,6 +215,25 @@ These features require an active Companion subscription. "Companion adds a perso
 ---
 
 ## Last Change Log
+
+**2026-02-24 — Raouf: Build 21 — Dismiss Paywall Overlay After Confirmed Purchase**
+- **Bug**: After successful StoreKit purchase, the Base44 paywall popup stays on screen. Build 20 removed overlay dismissal from `handleAlreadySubscribed()` (to fix Bug 5), but didn't add a replacement for the post-purchase case. Compounded in Xcode testing: Xcode-signed JWS can't be validated by the Worker → `reloadFromOrigin()` never fires → popup stays forever.
+- **Root cause**: `handleAlreadySubscribed()` only hides our wired IAP buttons, not the popup container. The Worker-triggered reload (which would clear the popup) fails for Xcode-signed JWS because Apple's JWKS doesn't contain Xcode test keys.
+- **Fix**: New `dismissPaywallOverlay()` JS function called from `__aaPurchaseResult` callback ONLY after a confirmed successful purchase or restore. Finds body-level fixed/absolute overlays containing paywall keywords (subscribe, companion, pricing, plan, etc.) and hides them. This is safe because it runs once after a confirmed StoreKit transaction — not on every `handleAlreadySubscribed()` cycle (which caused Bug 5).
+- **Warnings fixed (6)**: (1-2) Removed deprecated `WKProcessPool` (no effect on iOS 15+). (3-5) Fixed MainActor-isolated `Self.log` accessed from non-MainActor Task — added `@MainActor` to Task closure. (6) Fixed unused `self` in `syncTokenToUserDefaults` closure.
+- **Restore fix**: `restorePurchases()` now calls `AppStore.sync()` when no local entitlements found (was skipped in Build 20). Apple docs require this for new device/reinstall restore. Checks local first (no sign-in needed), falls back to sync (may show Apple ID prompt — correct per Apple docs since user tapped Restore).
+- Build number 20→21.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED — 0 warnings
+
+**2026-02-24 — Raouf: Build 20 — Fix Subscription Section + Entitlement + Restore + Remove Overlay Dismissal**
+- **Bug 1**: Subscription section disappeared → shared-container guards in hide functions.
+- **Bug 2**: Stale entitlement after logout+login → `refreshWebEntitlements()` calls `__aaRunAllPatches()`.
+- **Bug 3**: Restore showed Apple sign-in → check local entitlements first, skip `AppStore.sync()`.
+- **Bug 4**: Paywall blocked Weekly Review/Nightwatch keyboard for subscribed users → initially fixed with strong/weak paywall indicators.
+- **Bug 5**: Nightwatch/Drill sections accessible without subscription. Root cause: `handleAlreadySubscribed()` overlay dismissal code dismissed Base44's native paywall popups based on local StoreKit state (`__aaIsCompanion`). StoreKit sandbox subscriptions auto-renew (tied to Apple ID, not app account), so local state could be `true` while Base44's `is_companion` is `false`. This BYPASSED Base44's gating — violating rule E13-E14 (Base44 `is_companion` is source of truth).
+- **Fix 5**: REMOVED overlay dismissal entirely from `handleAlreadySubscribed()`. Now only hides our own wired IAP buttons when subscribed. Base44's native paywall/modal overlays are left untouched — Base44 handles its own gating based on `is_companion`. This fixes both Bug 4 and Bug 5.
+- Build number 19→20.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
 
 **2026-02-24 — Raouf: Build 19 — Hide Trial Text Elements + Acceptance Sheet Compliance**
 - **Gap**: Trial buttons were hidden but non-button trial text (labels, descriptions, pricing cards) could still appear in subscription/paywall UI.
@@ -452,6 +471,30 @@ These features require an active Companion subscription. "Companion adds a perso
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-24 (Australia/Sydney)
+- **Scope:** Build 21 — Dismiss Paywall Overlay After Confirmed Purchase
+- **Summary:** (1) After a successful StoreKit purchase, the Base44 paywall popup stayed on screen because Build 20 removed overlay dismissal from `handleAlreadySubscribed()` but didn't add a post-purchase replacement. Fix: new `dismissPaywallOverlay()` JS function called from `__aaPurchaseResult` callback ONLY after confirmed successful buy or restore. (2) Fixed 6 Xcode warnings: deprecated WKProcessPool, MainActor isolation, unused self. (3) Cross-referenced Apple docs — found `restorePurchases()` was missing `AppStore.sync()` fallback (App Store Review requirement). Fix: checks local entitlements first, falls back to `AppStore.sync()` if empty.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: New `dismissPaywallOverlay()` function (section 0a2), called from `__aaPurchaseResult` on buy success and restore success. Removed deprecated `WKProcessPool`. Fixed MainActor isolation warnings. Fixed unused `self` warning.
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Build number 20 → 21
+  - `AGENT.md` — Updated Current Phase, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
+- **Follow-ups:** Test on Xcode: (a) purchase → paywall popup dismisses immediately, (b) Nightwatch/Weekly Review still gated for non-subscribed users (Base44 handles this), (c) production flow: Worker validates real JWS → reload → fresh state
+
+**Raouf:**
+- **Date:** 2026-02-24 (Australia/Sydney)
+- **Scope:** Build 20 — Fix Subscription Section + Entitlement + Restore + Remove Overlay Dismissal
+- **Summary:** Five bugs fixed. (1) Subscription UI vanished — hide functions' `textContent` cascade hid shared containers. Fix: shared-container guards. (2) Stale "no subscription" after logout+login. Fix: `refreshWebEntitlements()` calls `__aaRunAllPatches()`. (3) Restore showed Apple sign-in. Fix: check local entitlements first. (4) Paywall overlay blocked Weekly Review keyboard/Nightwatch for subscribed users. (5) Nightwatch/Drill accessible without subscription — `handleAlreadySubscribed()` overlay dismissal was dismissing Base44's native paywall popups based on local StoreKit state, bypassing Base44's `is_companion` gating. StoreKit sandbox subscriptions auto-renew tied to Apple ID (not app account), so local `__aaIsCompanion = true` even when Base44's `is_companion = false`. Fix for bugs 4+5: REMOVED overlay dismissal entirely from `handleAlreadySubscribed()`. Now only hides our own wired IAP buttons. Base44's native paywall/modal overlays are untouched — Base44 handles its own gating per rule E13-E14.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Shared-container guards, walk-up stop-guards, `hideEmptyParent()` guard, `refreshWebEntitlements()` calls `__aaRunAllPatches()`, `injectSubscriptionStatus()` updates existing sections, `window.__aaRunAllPatches` global, `restorePurchases()` checks local entitlements first, REMOVED overlay dismissal from `handleAlreadySubscribed()`
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Build number 19 → 20
+  - `AGENT.md` — Updated Current Phase, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
+- **Follow-ups:** Test on device: (a) subscription section visible on Settings/More, (b) non-subscribed user sees Base44 paywall when accessing Nightwatch/Weekly Review/Drill Notes, (c) subscribed user sees companion features normally (Base44 gating), (d) Restore on non-subscribed = "No active subscription found" (no Apple sign-in), (e) Captain's Log popup works normally, (f) If Nightwatch is STILL accessible without subscription on web too, it's a Base44 platform issue — report to Roland
 
 **Raouf:**
 - **Date:** 2026-02-24 (Australia/Sydney)
