@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone B — App Store submission preparation (Build 16)
+**Current Phase:** Milestone B — App Store submission preparation (Build 18)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -161,6 +161,19 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 | 6 | Prayer List does not white-screen | ✅ FIXED (Build 6) |
 | 7 | **Log out button** in More/Settings that fully signs the user out, clears stored auth state, and returns to Login screen (so a different account can log in) | ✅ FIXED (Build 7) |
 
+## Companion Features (Gated Behind Paywall)
+
+These features require an active Companion subscription. "Companion adds a personal record of your walk":
+
+1. **Captain's Log** — Save journal entries and guided reflections
+2. **Drill Notes** — Save personal notes as you work through Battle Drills
+3. **Weekly Review** — Save weekly reflections and record spiritual growth
+4. **Highlights and Verse Bank** — Save verses and highlights to return to later
+
+**Gating mechanism:** TBD — need to verify whether Base44's web app already checks the `is_companion` user field to gate these features, or whether we need to inject JS-based gating from the iOS side. Test with a non-subscribed account: if you can access these features freely, iOS-side gating is needed.
+
+---
+
 ## Milestone B — Acceptance Criteria (Roland, 2026-02-23)
 
 **Launch Scope:** Companion Monthly only. Yearly removed from sale. Trial removed. No copy changes.
@@ -176,6 +189,20 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 ---
 
 ## Last Change Log
+
+**2026-02-24 — Raouf: Build 18 — Fix Subscribe Button, Remove Yearly Text, Fix Captain's Log Black Popup, Remove Duplicate Logout**
+- **Bug 1 (subscribe button)**: Button matching too narrow + `handleAlreadySubscribed()` stale hiding. Fix: broader patterns (upgrade/start now/choose plan) + companion match excludes feature names.
+- **Bug 2 (yearly text)**: `wireIAPButtons()` only hid yearly buttons, not pricing labels/cards. Fix: new `hideYearlyTextElements()` scans text elements for yearly/annual pricing and hides them.
+- **Bug 3 (Captain's Log black popup)**: `handleAlreadySubscribed()` overlay dismissal was too aggressive — hid ALL modals including Captain's Log. Fix: only dismiss containers whose text is subscription-related (not feature-related). Added stale `data-aa-sub-hidden` cleanup on navigation.
+- **Bug 4 (duplicate logout)**: Base44 renders its own logout alongside our red `#aa-logout-btn`. Fix: new `hideBase44NativeLogout()` hides non-red logout buttons on More/Settings.
+- Build number 17→18.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
+
+**2026-02-24 — Raouf: Build 17 — Fix localStorage SecurityError in WKWebView**
+- **Bug**: `logDiagnostics()` and `syncTokenToUserDefaults()` accessed `localStorage` via `evaluateJavaScript` before the WebView had navigated — at `about:blank`, `localStorage` throws `SecurityError: "The operation is insecure"`.
+- **Fix**: Added URL guard (`webView.url?.scheme == "https"`) to both methods. Skips localStorage access with informational log when page isn't loaded. No functional impact — delayed syncs (3s, 10s) already worked.
+- Build number 16→17.
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
 
 **2026-02-24 — Raouf: Build 15 — Fix Dead Buttons, Contradictory States, Paywall Popup Handling**
 - **Root cause**: `wireIAPButtons()` and `handleAlreadySubscribed()` searched only `#root`, but Base44 paywall popups render as React portals outside `#root` (directly on `document.body`). Buttons in popups were never found or wired.
@@ -400,6 +427,30 @@ Filter by subsystem `com.abideandanchor.app` category `WebView` to see:
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-24 (Australia/Sydney)
+- **Scope:** Build 18 — Fix Subscribe Button, Remove Yearly Text, Fix Captain's Log Black Popup, Remove Duplicate Logout
+- **Summary:** Four bugs fixed in one pass. (1) Subscribe button not working: broadened `wireIAPButtons()` matching to include generic subscribe actions (upgrade, start now, choose plan, start/join/become companion) and excluded companion feature names from the broad "companion" match so Captain's Log/Drill Notes/etc. links aren't caught. (2) Yearly pricing text: new `hideYearlyTextElements()` function scans non-button DOM elements for yearly/annual pricing text and hides them + parent pricing card containers; also hides "$79.99". (3) Captain's Log popup turning black: `handleAlreadySubscribed()` overlay dismissal was too aggressive — hid ANY parent modal/popup/dialog, catching the Captain's Log Write popup. Now scoped to only dismiss containers whose text content is subscription/paywall-related and NOT feature-related (captain, drill, write, note, log, etc.). Added stale `data-aa-sub-hidden` cleanup to `cleanupStalePatches()` for body-level portal elements on navigation. (4) Duplicate logout: new `hideBase44NativeLogout()` function finds Base44's native logout buttons on More/Settings that are not our red `#aa-logout-btn` and hides them.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Broader subscribe matching in `wireIAPButtons()`, new `hideYearlyTextElements()`, new `hideBase44NativeLogout()`, scoped overlay dismissal in `handleAlreadySubscribed()`, stale cleanup in `cleanupStalePatches()`, CSS for yearly/logout hiding
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Build number 17 → 18
+  - `AGENT.md` — Updated Current Phase, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
+- **Follow-ups:** Test on device: (a) subscribe button triggers Apple purchase sheet, (b) no "yearly"/"annual" text visible, (c) Captain's Log popup renders with white background/text, (d) only one red logout visible on More/Settings.
+
+**Raouf:**
+- **Date:** 2026-02-24 (Australia/Sydney)
+- **Scope:** Build 17 — Fix localStorage SecurityError in WKWebView
+- **Summary:** `logDiagnostics()` and `syncTokenToUserDefaults()` called `evaluateJavaScript` to access `localStorage` at `capacitorDidLoad` and `coldBoot` — before the WebView had navigated to `https://abideandanchor.app`. At this point the WebView is at `about:blank` with no valid origin, so `localStorage` throws `SecurityError: "The operation is insecure"`. Added a URL guard (`webView.url?.scheme == "https"`) to both methods — when the page hasn't loaded, the call is skipped with an informational log. No functional impact: the delayed syncs at 3s and 10s after `capacitorDidLoad` already work because the page is loaded by then. The `willEnterForeground` path also works because the page is already loaded on resume.
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: URL guard in `logDiagnostics()` (before localStorage evaluateJavaScript) and `syncTokenToUserDefaults()` (before localStorage evaluateJavaScript)
+  - `ios/App/App.xcodeproj/project.pbxproj` — MODIFIED: Build number 16 → 17
+  - `AGENT.md` — Updated Current Phase, Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — New entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
+- **Follow-ups:** None — this is a log-cleanliness fix with no behavioral changes.
 
 **Raouf:**
 - **Date:** 2026-02-24 (Australia/Sydney)

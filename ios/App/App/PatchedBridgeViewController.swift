@@ -743,6 +743,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     private func syncTokenToUserDefaults() {
         guard let webView = self.webView else { return }
 
+        // Guard: skip if page hasn't navigated yet — localStorage throws SecurityError at about:blank
+        guard let pageURL = webView.url, pageURL.scheme == "https" else {
+            os_log(.info, log: Self.log, "[TokenSync:UP] Skipped — page not yet loaded (url=%{public}@)",
+                   webView.url?.absoluteString ?? "nil")
+            return
+        }
+
         webView.evaluateJavaScript("""
             (function() {
                 var keys = ['base44_access_token', 'token', 'access_token', 'base44_auth_token'];
@@ -1064,6 +1071,14 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
 
         // Check localStorage for auth tokens via JS (presence only)
+        // Guard: skip if page hasn't navigated yet — localStorage throws SecurityError at about:blank
+        guard let pageURL = webView.url, pageURL.scheme == "https" else {
+            os_log(.info, log: Self.log,
+                   "[DIAG:authMarkers] localStorage: skipped (page not yet loaded, url=%{public}@)",
+                   webView.url?.absoluteString ?? "nil")
+            return
+        }
+
         webView.evaluateJavaScript("""
             (function() {
                 try {
@@ -1590,6 +1605,21 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           font-size: 15px;
           border-radius: 10px;
           margin: 8px 16px;
+        }
+
+        /* ── Build 18: Hide yearly/annual pricing elements via CSS ── */
+        [data-aa-yearly-hidden] {
+          display: none !important;
+        }
+        /* Hide Base44 native logout (non-red) */
+        [data-aa-native-logout-hidden] {
+          display: none !important;
+        }
+
+        /* ── Build 18: Ensure feature popup cards (Captain's Log, etc.) are NOT blacked out ── */
+        /* Override any stale data-aa-sub-hidden on non-paywall popups after navigation */
+        [data-aa-sub-hidden] {
+          /* This attribute may need to be cleaned on route change */
         }
       `;
       document.head.appendChild(style);
@@ -2263,6 +2293,16 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             });
           }
         }
+        // Build 18: Clean up stale data-aa-sub-hidden on non-paywall elements.
+        // When navigating away from the paywall to features (Captain's Log, etc.),
+        // previously-hidden overlay containers must be restored so feature popups work.
+        document.querySelectorAll('[data-aa-sub-hidden]').forEach(function(el) {
+          // Only clean elements outside #root (body-level portals that may be reused)
+          if (!el.closest('#root') && !el.id.match(/^aa-/)) {
+            el.style.display = '';
+            el.removeAttribute('data-aa-sub-hidden');
+          }
+        });
       }
 
       // ── 6b. DIAGNOSTICS OVERLAY (Build 6) ──
@@ -2763,11 +2803,24 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             if (text.indexOf('get companion') !== -1) {
               isMonthlySubscribe = true;
             }
+            // "start companion" / "become a companion" / "join companion"
+            if (text.indexOf('start companion') !== -1 || text.indexOf('become') !== -1 ||
+                text.indexOf('join companion') !== -1) {
+              isMonthlySubscribe = true;
+            }
             // "companion" in action context (not status/info text, not navigation)
             if (text.indexOf('companion') !== -1 &&
                 text.indexOf('active') === -1 && text.indexOf('recheck') === -1 &&
                 text.indexOf('subscription is') === -1 && text.indexOf('have an') === -1 &&
-                text.indexOf('status') === -1 && text.indexOf('unlock') === -1) {
+                text.indexOf('status') === -1 && text.indexOf('unlock') === -1 &&
+                text.indexOf('feature') === -1 && text.indexOf('captain') === -1 &&
+                text.indexOf('drill') === -1 && text.indexOf('review') === -1 &&
+                text.indexOf('highlight') === -1 && text.indexOf('verse') === -1) {
+              isMonthlySubscribe = true;
+            }
+            // Generic subscribe/upgrade actions (no "companion" needed)
+            if (text === 'upgrade' || text === 'upgrade now' || text === 'start now' ||
+                text === 'choose plan' || text === 'select plan') {
               isMonthlySubscribe = true;
             }
           }
@@ -2813,6 +2866,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             });
           }
         });
+
+        // Build 18: Hide "yearly"/"annual" text labels/descriptions outside of buttons.
+        // These are pricing text elements that Base44 renders (not action buttons).
+        hideYearlyTextElements();
       }
 
       // Helper: hide parent container if all children are hidden
@@ -2825,6 +2882,108 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
               parent.children[i].offsetHeight > 0) visibleChildren++;
         }
         if (visibleChildren === 0) parent.style.display = 'none';
+      }
+
+      // Build 18: Hide elements containing "yearly"/"annual" pricing text.
+      // Only targets non-button elements that display pricing info (labels, cards, options).
+      // Buttons are already handled by wireIAPButtons() classification.
+      function hideYearlyTextElements() {
+        // Target common pricing containers: divs, spans, li, p, label, small, h-tags
+        var candidates = document.querySelectorAll('div, span, li, p, label, small, h1, h2, h3, h4, h5, h6, td');
+        candidates.forEach(function(el) {
+          if (el.getAttribute('data-aa-yearly-hidden')) return;
+          // Skip our own injected UI
+          if (el.closest('#aa-logout-section, #aa-subscription-section, .aa-diag-overlay, .aa-toast, #aa-already-subscribed')) return;
+          // Skip elements already handled by wireIAPButtons
+          if (el.getAttribute('data-aa-iap-wired')) return;
+          // Skip if it contains interactive children (buttons, inputs) — might be a feature container
+          if (el.querySelector('button, input, textarea, select')) return;
+
+          var text = (el.textContent || '').trim().toLowerCase();
+          if (!text || text.length > 200) return;
+
+          // Match elements that are pricing option cards/labels for yearly/annual
+          var isYearlyPricing = false;
+
+          // "yearly" or "annual" combined with pricing context
+          if ((text.indexOf('yearly') !== -1 || text.indexOf('annual') !== -1) &&
+              (text.indexOf('$') !== -1 || text.indexOf('month') !== -1 ||
+               text.indexOf('year') !== -1 || text.indexOf('price') !== -1 ||
+               text.indexOf('plan') !== -1 || text.indexOf('subscribe') !== -1 ||
+               text.indexOf('/yr') !== -1 || text.indexOf('/year') !== -1 ||
+               text.indexOf('per year') !== -1 || text.indexOf('billed') !== -1)) {
+            isYearlyPricing = true;
+          }
+
+          // Standalone "Yearly" or "Annual" label (short text, likely a pricing option tab/label)
+          if (!isYearlyPricing && text.length <= 30) {
+            if (text === 'yearly' || text === 'annual' || text === 'yearly plan' ||
+                text === 'annual plan' || text === 'yearly subscription' ||
+                text === 'annual subscription') {
+              isYearlyPricing = true;
+            }
+          }
+
+          // "$79.99" — the yearly price (hide regardless of surrounding text)
+          if (text.indexOf('79.99') !== -1) {
+            isYearlyPricing = true;
+          }
+
+          if (isYearlyPricing) {
+            // Walk up to find the nearest pricing-option card container and hide it
+            var target = el;
+            var parent = el.parentElement;
+            var depth = 0;
+            while (parent && parent !== document.body && depth < 5) {
+              depth++;
+              var siblings = parent.children;
+              // If parent has few children and looks like a pricing card (option container), hide the parent
+              if (siblings.length <= 4) {
+                var siblingTexts = [];
+                for (var s = 0; s < siblings.length; s++) {
+                  siblingTexts.push((siblings[s].textContent || '').trim().toLowerCase());
+                }
+                var allText = siblingTexts.join(' ');
+                if ((allText.indexOf('yearly') !== -1 || allText.indexOf('annual') !== -1) &&
+                    (allText.indexOf('$') !== -1 || allText.indexOf('plan') !== -1 ||
+                     allText.indexOf('subscribe') !== -1)) {
+                  target = parent;
+                  break;
+                }
+              }
+              parent = parent.parentElement;
+            }
+            target.style.display = 'none';
+            target.setAttribute('data-aa-yearly-hidden', '1');
+          }
+        });
+      }
+
+      // Build 18: Hide the Base44 platform's own logout button (non-red one).
+      // Our injected #aa-logout-btn (red-styled) is the canonical logout.
+      function hideBase44NativeLogout() {
+        if (!isMoreOrSettingsRoute()) return;
+        // Find all buttons/links that say "log out" / "sign out" but are NOT our injected one
+        var allEls = document.querySelectorAll('button, a, [role="button"]');
+        allEls.forEach(function(el) {
+          if (el.getAttribute('data-aa-native-logout-hidden')) return;
+          // Skip our own injected logout
+          if (el.id === 'aa-logout-btn' || el.closest('#aa-logout-section, #aa-logout-confirm-overlay')) return;
+          var text = (el.textContent || '').trim().toLowerCase();
+          if (text === 'log out' || text === 'logout' || text === 'sign out' || text === 'signout') {
+            el.style.display = 'none';
+            el.setAttribute('data-aa-native-logout-hidden', '1');
+            // Also hide the parent if it's a menu item / list item wrapper
+            var parent = el.parentElement;
+            if (parent && parent.tagName !== 'BODY' && parent.tagName !== 'MAIN') {
+              var parentText = (parent.textContent || '').trim().toLowerCase();
+              if (parentText === text) {
+                parent.style.display = 'none';
+                parent.setAttribute('data-aa-native-logout-hidden', '1');
+              }
+            }
+          }
+        });
       }
 
       // ── 6f. SUBSCRIPTION STATUS UI (Build 12) ──
@@ -2960,34 +3119,58 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           }
         });
 
-        // Dismiss paywall popups/modals that are now empty of action buttons.
-        // Walk up from each hidden button to find overlay containers
-        // (fixed/absolute position with high z-index = modal/popup).
+        // Build 18 FIX: Only dismiss parent popups that are PAYWALL-SPECIFIC.
+        // Previous logic was too aggressive — it hid ANY modal/popup/dialog parent
+        // (e.g. Captain's Log "Write" popup) just because it happened to be a modal.
+        // Now: only dismiss if the container's content is predominantly subscription/pricing text.
         wiredBtns.forEach(function(btn) {
           if (!btn.getAttribute('data-aa-sub-hidden')) return;
           var el = btn.parentElement;
           var depth = 0;
-          while (el && el !== document.body && el !== document.documentElement && depth < 15) {
+          while (el && el !== document.body && el !== document.documentElement && depth < 10) {
             depth++;
             // Skip our own injected elements
             if (el.id && el.id.indexOf('aa-') === 0) { el = el.parentElement; continue; }
             var style = window.getComputedStyle(el);
             var pos = style.position;
             var zIndex = parseInt(style.zIndex) || 0;
-            // Detect overlay: fixed/absolute + high z-index + looks like a backdrop
-            if ((pos === 'fixed' || pos === 'absolute') && zIndex >= 10) {
-              el.style.display = 'none';
-              el.setAttribute('data-aa-sub-hidden', '1');
-              break;
-            }
-            // Also detect by class name patterns (modal, popup, overlay, dialog)
             var cls = (el.className || '').toLowerCase();
-            if (cls.indexOf('modal') !== -1 || cls.indexOf('popup') !== -1 ||
-                cls.indexOf('overlay') !== -1 || cls.indexOf('dialog') !== -1 ||
-                cls.indexOf('backdrop') !== -1) {
-              el.style.display = 'none';
-              el.setAttribute('data-aa-sub-hidden', '1');
-              break;
+            var isOverlay = ((pos === 'fixed' || pos === 'absolute') && zIndex >= 10) ||
+                            cls.indexOf('modal') !== -1 || cls.indexOf('popup') !== -1 ||
+                            cls.indexOf('overlay') !== -1 || cls.indexOf('dialog') !== -1 ||
+                            cls.indexOf('backdrop') !== -1;
+
+            if (isOverlay) {
+              // GUARD: Only dismiss if content is paywall/subscription-related.
+              // Check the container's text for subscription keywords.
+              var containerText = (el.textContent || '').toLowerCase();
+              var isPaywall = (containerText.indexOf('subscribe') !== -1 ||
+                               containerText.indexOf('companion') !== -1 ||
+                               containerText.indexOf('pricing') !== -1 ||
+                               containerText.indexOf('plan') !== -1 ||
+                               containerText.indexOf('upgrade') !== -1 ||
+                               containerText.indexOf('subscription') !== -1 ||
+                               containerText.indexOf('monthly') !== -1 ||
+                               containerText.indexOf('restore purchase') !== -1);
+
+              // Reject: if the container has content that is NOT paywall-related,
+              // it's a different feature popup (Captain's Log, Drill Notes, etc.)
+              var isFeaturePopup = (containerText.indexOf('captain') !== -1 ||
+                                    containerText.indexOf('drill') !== -1 ||
+                                    containerText.indexOf('weekly review') !== -1 ||
+                                    containerText.indexOf('highlight') !== -1 ||
+                                    containerText.indexOf('verse') !== -1 ||
+                                    containerText.indexOf('prayer') !== -1 ||
+                                    containerText.indexOf('journal') !== -1 ||
+                                    containerText.indexOf('write') !== -1 ||
+                                    containerText.indexOf('note') !== -1 ||
+                                    containerText.indexOf('log') !== -1);
+
+              if (isPaywall && !isFeaturePopup) {
+                el.style.display = 'none';
+                el.setAttribute('data-aa-sub-hidden', '1');
+              }
+              break; // Stop walking up regardless — we found the overlay boundary
             }
             el = el.parentElement;
           }
@@ -3129,6 +3312,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           interceptGoogleAuth();
           injectSubscriptionStatus();
           injectLogoutButton();
+          hideBase44NativeLogout();
           wireIAPButtons();
           handleAlreadySubscribed();
         }, 250);

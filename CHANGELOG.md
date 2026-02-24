@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-24 — Raouf: Build 18 — Fix Subscribe Button, Remove Yearly Text, Fix Captain's Log Black Popup, Remove Duplicate Logout
+
+**Bug 1 — Subscribe button not working**: Subscribe buttons could go unmatched if their text didn't contain "companion" or "subscribe". Also, `handleAlreadySubscribed()` was incorrectly hiding buttons when `window.__aaIsCompanion` was stale.
+
+- **Fix 1a — Broader subscribe button matching**: Added patterns for "start companion", "become", "join companion", "upgrade", "upgrade now", "start now", "choose plan", "select plan".
+- **Fix 1b — Companion match now excludes feature names**: When matching "companion" in action context, exclude text containing "captain", "drill", "review", "highlight", "verse", "feature" — these are Companion feature names, not subscribe actions.
+
+**Bug 2 — "Yearly" pricing text still visible**: `wireIAPButtons()` only hid yearly BUTTONS but Base44's UI also renders yearly pricing text in labels/cards/descriptions.
+
+- **Fix 2a — New `hideYearlyTextElements()` function**: Scans non-button elements (div, span, li, p, label, etc.) for yearly/annual pricing text and hides them. Matches "$79.99", "yearly plan", "annual subscription", etc. Walks up to find the nearest pricing card container for clean hiding.
+- **Fix 2b — CSS `!important` rule**: `[data-aa-yearly-hidden]` gets `display: none !important` to override any inline styles.
+
+**Bug 3 — Captain's Log popup renders black/blank**: `handleAlreadySubscribed()` walked up the DOM from hidden IAP buttons and hid ANY parent with `position: fixed/absolute + z-index >= 10` or class containing `modal/popup/overlay/dialog/backdrop`. The Captain's Log "Write" popup (which is a modal/dialog) was caught by this and hidden with `display: none`.
+
+- **Fix 3a — Paywall-scoped overlay dismissal**: Container is now only dismissed if its text content contains subscription keywords (subscribe, companion, pricing, plan, upgrade, monthly, restore purchase) AND does NOT contain feature keywords (captain, drill, weekly review, highlight, verse, prayer, journal, write, note, log).
+- **Fix 3b — Stale `data-aa-sub-hidden` cleanup**: `cleanupStalePatches()` now removes stale `data-aa-sub-hidden` + `display: none` from body-level portal elements on navigation, so feature popups are restored.
+
+**Bug 4 — Duplicate logout (two logout options)**: Base44 platform renders its own logout alongside our injected red-styled `#aa-logout-btn`.
+
+- **Fix 4a — New `hideBase44NativeLogout()` function**: On More/Settings pages, finds all buttons/links saying "log out"/"logout"/"sign out"/"signout" that are NOT our `#aa-logout-btn` and hides them. Also hides the parent wrapper if it's just a menu item.
+- **Fix 4b — Added to orchestrator**: Runs with every `runAllPatches()` cycle.
+
+- **Files changed**: `PatchedBridgeViewController.swift`, `project.pbxproj` (build 17→18)
+- **Verification**: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
+
+---
+
+### 2026-02-24 — Raouf: Build 17 — Fix localStorage SecurityError in WKWebView
+
+**Bug — localStorage "The operation is insecure" SecurityError**: `logDiagnostics()` and `syncTokenToUserDefaults()` used `evaluateJavaScript` to access `localStorage` before the WebView had navigated to `https://abideandanchor.app`. At `capacitorDidLoad` and `coldBoot`, the WebView is still at `about:blank` — no valid origin exists, so `localStorage` throws `SecurityError`.
+
+- **Fix — URL guard before localStorage access**: Both `logDiagnostics()` and `syncTokenToUserDefaults()` now check `webView.url?.scheme == "https"` before calling `evaluateJavaScript`. If the page hasn't loaded yet, the calls are skipped with an informational log message instead of triggering the error.
+- **Impact**: Eliminates noisy SecurityError logs at startup. Functional impact is nil — the delayed syncs (3s, 10s) already worked because the page is loaded by then. The `willEnterForeground` path also works because the page is already loaded on resume.
+- **Files changed**: `PatchedBridgeViewController.swift`, `project.pbxproj` (build 16→17)
+- **Verification**: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED
+
+---
+
 ### 2026-02-24 — Raouf: Build 16 — Fix Support Section Hijack + Fix Recheck Voiding Subscription
 
 **Bug 1 — Support section hijack**: Selecting the Support section redirected to the Apple purchase sheet. Root cause: `wireIAPButtons()` broad `indexOf('companion')` matching caught navigation links.
