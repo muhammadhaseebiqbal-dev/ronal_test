@@ -126,7 +126,7 @@ final class AAStoreManager {
             return ("success", false, [], nil, nil)
         } catch {
             os_log(.error, log: Self.log, "[Restore] AppStore.sync() failed: %{public}@", error.localizedDescription)
-            return ("success", false, [], nil, nil)
+            return ("error", false, [], "Restore failed: \(error.localizedDescription)", nil)
         }
     }
 
@@ -208,6 +208,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// Survives app restarts. Down-synced to web at document start.
     private static let companionDefaultsKey = "aa_is_companion"
 
+    /// Build 23: Flag set after logout to prevent StoreKit from re-setting companion state
+    /// before server confirms the new logged-in user's actual subscription status.
+    /// Cleared when checkCompanionOnServer() gets a response (the authoritative answer).
+    private static let awaitingServerConfirmKey = "aa_awaiting_server_confirm"
+
     /// Cloudflare Worker URL for cross-device Companion validation (Build 11).
     /// Deployed by Roland — 2026-02-18.
     private static let companionWorkerURL = "https://companion-validator.abideandanchor.workers.dev"
@@ -274,6 +279,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 self.sendPurchaseResult(payload)
 
                 if result.status == "success" {
+                    // Build 23: User just completed a purchase for THIS account — clear the
+                    // awaiting-server-confirm flag since this is a definitive action.
+                    UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+
                     self.persistCompanionState(result.isCompanion)
                     self.refreshWebEntitlements(isCompanion: result.isCompanion)
 
@@ -302,6 +311,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 if let msg = result.message { payload["message"] = msg }
 
                 self.sendPurchaseResult(payload)
+
+                // Build 23: User explicitly tapped Restore for THIS account — clear the flag.
+                UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+
                 self.persistCompanionState(result.isCompanion)
                 self.refreshWebEntitlements(isCompanion: result.isCompanion)
 
@@ -318,20 +331,46 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         case "recheckEntitlements":
             // Build 16: JS-triggered recheck — cross-verify server claim with local StoreKit.
             // Called when server says not-companion but user was previously companion.
+            // Build 22: Also triggered by checkLoginTransition() after login.
             Task { @MainActor in
+                let awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
                 let (storeKitIsCompanion, products) = await AAStoreManager.shared.checkEntitlements()
-                os_log(.info, log: Self.log, "[IAP:recheck] StoreKit isCompanion=%{public}@ products=%{public}@",
-                       storeKitIsCompanion ? "true" : "false", products.joined(separator: ","))
+                os_log(.info, log: Self.log, "[IAP:recheck] StoreKit isCompanion=%{public}@ products=%{public}@ awaitingConfirm=%{public}@",
+                       storeKitIsCompanion ? "true" : "false", products.joined(separator: ","),
+                       awaitingConfirm ? "true" : "false")
 
-                self.persistCompanionState(storeKitIsCompanion)
-                self.refreshWebEntitlements(isCompanion: storeKitIsCompanion)
-                self.pushEntitlementCheckToJS(isCompanion: storeKitIsCompanion, products: products)
+                if awaitingConfirm {
+                    // Build 23: Don't trust StoreKit alone after logout — trigger server check
+                    // which will clear the flag and set the authoritative state.
+                    // First sync token from localStorage to UserDefaults (may not have synced yet
+                    // after login), then try server check. If server check still has no token,
+                    // retry after 2s to give token sync time to complete.
+                    os_log(.info, log: Self.log, "[IAP:recheck] Awaiting server confirm — syncing token then triggering server check")
+                    self.refreshWebEntitlements(isCompanion: false)
+                    self.syncTokenToUserDefaults()
+                    // Delay slightly to let token sync complete, then check server
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        self?.checkCompanionOnServer()
+                        // Retry after 2 more seconds in case first attempt had no token yet
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                            guard let self = self else { return }
+                            if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
+                                os_log(.info, log: Self.log, "[IAP:recheck] Flag still set — retrying server check")
+                                self.checkCompanionOnServer()
+                            }
+                        }
+                    }
+                } else {
+                    self.persistCompanionState(storeKitIsCompanion)
+                    self.refreshWebEntitlements(isCompanion: storeKitIsCompanion)
+                    self.pushEntitlementCheckToJS(isCompanion: storeKitIsCompanion, products: products)
 
-                if storeKitIsCompanion {
-                    // StoreKit says active — re-sync fresh JWS to server to fix stale expiry
-                    let (_, _, latestJWS) = await AAStoreManager.shared.checkEntitlementsWithJWS()
-                    if let jws = latestJWS {
-                        self.syncCompanionToServer(jws: jws)
+                    if storeKitIsCompanion {
+                        // StoreKit says active — re-sync fresh JWS to server to fix stale expiry
+                        let (_, _, latestJWS) = await AAStoreManager.shared.checkEntitlementsWithJWS()
+                        if let jws = latestJWS {
+                            self.syncCompanionToServer(jws: jws)
+                        }
                     }
                 }
             }
@@ -513,6 +552,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             let serverIsCompanion = json["isCompanion"] as? Bool ?? false
             let localIsCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
 
+            // Build 23: Clear the awaiting-server-confirm flag — server has answered authoritatively
+            // for the currently logged-in user. StoreKit checks can now persist normally.
+            if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
+                UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+                os_log(.info, log: Self.log, "[ServerCheck] Cleared aa_awaiting_server_confirm — server responded")
+            }
+
             DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: nil) }
 
             if serverIsCompanion != localIsCompanion {
@@ -646,6 +692,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Clear companion subscription state (Build 10)
         UserDefaults.standard.removeObject(forKey: Self.companionDefaultsKey)
 
+        // Build 23: Set awaiting-server-confirm flag to prevent StoreKit from
+        // re-setting companion state before we know which user is logging in next.
+        UserDefaults.standard.set(true, forKey: Self.awaitingServerConfirmKey)
+        os_log(.info, log: Self.log, "[LOGOUT] Set aa_awaiting_server_confirm=true")
+
         logDiagnostics(event: "logout")
     }
 
@@ -660,11 +711,31 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         logDiagnostics(event: "coldBoot")
 
         // Check entitlements on cold boot and persist state
+        // Build 23: If awaiting server confirm (post-logout), skip persisting StoreKit result
+        // to prevent Apple ID entitlements from leaking into a different app account.
+        // HOWEVER: if aa_is_companion is already true in UserDefaults, it means a purchase
+        // or restore was completed for this account — the flag is stale and should be cleared.
         if #available(iOS 15.0, *) {
             Task { @MainActor in
+                var awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
+                let alreadyCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+
+                // Stale flag guard: if UserDefaults already says companion, the flag was set
+                // before a purchase/restore happened — clear it so we don't block the boot check.
+                if awaitingConfirm && alreadyCompanion {
+                    os_log(.info, log: Self.log, "[BOOT] Clearing stale awaiting flag — aa_is_companion already true")
+                    UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+                    awaitingConfirm = false
+                }
+
                 let (isCompanion, activeProducts) = await AAStoreManager.shared.checkEntitlements()
-                self.persistCompanionState(isCompanion)
-                self.pushEntitlementCheckToJS(isCompanion: isCompanion, products: activeProducts)
+                if awaitingConfirm {
+                    os_log(.info, log: Self.log, "[BOOT] Awaiting server confirm — skipping StoreKit persist (StoreKit=%{public}@)", isCompanion ? "true" : "false")
+                    self.pushEntitlementCheckToJS(isCompanion: false, products: [])
+                } else {
+                    self.persistCompanionState(isCompanion)
+                    self.pushEntitlementCheckToJS(isCompanion: isCompanion, products: activeProducts)
+                }
             }
         }
 
@@ -680,6 +751,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         guard #available(iOS 15.0, *) else { return }
         AAStoreManager.shared.startTransactionListener { [weak self] isCompanion in
             guard let self = self else { return }
+            // Build 23: Respect awaiting-server-confirm flag — don't let StoreKit
+            // transaction updates leak Apple ID entitlements into a different app account.
+            let awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
+            if awaitingConfirm {
+                os_log(.info, log: Self.log, "[TxnUpdate] Awaiting server confirm — ignoring StoreKit update (isCompanion=%{public}@)", isCompanion ? "true" : "false")
+                return
+            }
             self.persistCompanionState(isCompanion)
             self.refreshWebEntitlements(isCompanion: isCompanion)
             self.sendPurchaseResult([
@@ -707,6 +785,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        webView?.removeObserver(self, forKeyPath: "URL")
     }
 
     // MARK: – A) Ensure persistent data store
@@ -806,7 +885,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// Checks if UserDefaults has a stored token.
     private func hasTokenInUserDefaults() -> Bool {
         let token = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)
-        return token != nil && !(token!.isEmpty)
+        return token?.isEmpty == false
     }
 
     /// Gets the stored token length (for diagnostics — never log the token itself).
@@ -924,13 +1003,20 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
 
         // Re-check IAP entitlements on resume (catches renewals/expirations while backgrounded)
+        // Build 23: Respect awaiting-server-confirm flag on resume too.
         if #available(iOS 15.0, *) {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+                let awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
                 let (isCompanion, activeProducts) = await AAStoreManager.shared.checkEntitlements()
-                self.persistCompanionState(isCompanion)
-                self.refreshWebEntitlements(isCompanion: isCompanion)
-                self.pushEntitlementCheckToJS(isCompanion: isCompanion, products: activeProducts)
+                if awaitingConfirm {
+                    os_log(.info, log: Self.log, "[RESUME] Awaiting server confirm — skipping StoreKit persist (StoreKit=%{public}@)", isCompanion ? "true" : "false")
+                    self.pushEntitlementCheckToJS(isCompanion: false, products: [])
+                } else {
+                    self.persistCompanionState(isCompanion)
+                    self.refreshWebEntitlements(isCompanion: isCompanion)
+                    self.pushEntitlementCheckToJS(isCompanion: isCompanion, products: activeProducts)
+                }
             }
         }
 
@@ -1205,7 +1291,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "'", with: "\\'")
 
-        let isCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+        let isCompanionRaw = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+        let awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
+        // Build 23: If awaiting server confirm (post-logout), report false regardless of
+        // UserDefaults to prevent Apple ID entitlements from leaking into a new account.
+        let isCompanion = awaitingConfirm ? false : isCompanionRaw
 
         return """
         window.__aaNativeDiag = {
@@ -1219,6 +1309,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           hasNativeToken: \(hasNativeToken ? "true" : "false"),
           nativeTokenLen: \(nativeTokenLen),
           isCompanion: \(isCompanion ? "true" : "false"),
+          awaitingServerConfirm: \(awaitingConfirm ? "true" : "false"),
           workerConfigured: \(!Self.companionWorkerURL.contains("YOUR_SUBDOMAIN") ? "true" : "false")
         };
         // Build 10: IAP callback default + companion state
@@ -1549,7 +1640,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           top: calc(env(safe-area-inset-top, 44px) + 8px);
           left: 16px;
           right: 16px;
-          z-index: 99997;
+          z-index: 100000;
           padding: 16px 20px;
           border-radius: 14px;
           font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
@@ -1595,7 +1686,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           color: #9ca3af;
           margin: 0 0 12px 0;
         }
-        #aa-sub-recheck-btn {
+        #aa-sub-restore-btn {
           display: block;
           width: 100%;
           padding: 12px;
@@ -1610,8 +1701,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
           text-align: center;
         }
-        #aa-sub-recheck-btn:active { background: #e2e8f0; }
-        #aa-sub-recheck-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        #aa-sub-restore-btn:active { background: #e2e8f0; }
+        #aa-sub-restore-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
         /* ── Build 12: Already-subscribed banner on paywall ── */
         #aa-already-subscribed {
@@ -2813,8 +2904,15 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
           // Non-IAP context words — if present, skip classification entirely.
           // Prevents hijacking support/help/about/contact links and navigation items.
+          // Build 23: Expanded to catch FAQ-style and informational links like
+          // "How do I restore purchases", "Why Companion is paid", "Frequently Asked Questions".
           var nonIAPWords = ['support', 'help', 'contact', 'learn', 'about', 'faq',
-                             'terms', 'privacy', 'policy', 'manage', 'cancel', 'account'];
+                             'terms', 'privacy', 'policy', 'manage', 'cancel', 'account',
+                             'frequently', 'question', 'asked',
+                             'how do', 'how to', 'how does', 'how is',
+                             'what is', 'what are', 'why is', 'why do', 'why companion',
+                             'guide', 'info', 'detail', 'read more', 'learn more',
+                             'paid', 'pricing', 'cost', 'charge', 'billing'];
           var hasNonIAP = false;
           for (var w = 0; w < nonIAPWords.length; w++) {
             if (text.indexOf(nonIAPWords[w]) !== -1) { hasNonIAP = true; break; }
@@ -2952,6 +3050,54 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       // Only targets non-button elements that display pricing info (labels, cards, options).
       // Buttons are already handled by wireIAPButtons() classification.
       function hideYearlyTextElements() {
+        // Build 23: REWRITE elements that mention both monthly AND yearly (e.g. "Choose monthly or yearly")
+        // These can't be hidden (would kill the monthly option) — instead, remove the yearly reference.
+        var rewriteCandidates = document.querySelectorAll('div, span, li, p, label, small, h1, h2, h3, h4, h5, h6, td');
+        rewriteCandidates.forEach(function(el) {
+          if (el.getAttribute('data-aa-yearly-rewritten')) return;
+          if (el.closest('#aa-logout-section, #aa-subscription-section, .aa-diag-overlay, .aa-toast, #aa-already-subscribed')) return;
+          if (el.getAttribute('data-aa-iap-wired')) return;
+          var text = (el.textContent || '').trim();
+          if (!text || text.length > 200) return;
+          var lower = text.toLowerCase();
+          // Only target elements that mention BOTH monthly and yearly/annual
+          var hasMonthly = lower.indexOf('monthly') !== -1 || lower.indexOf('month') !== -1;
+          var hasYearly = lower.indexOf('yearly') !== -1 || lower.indexOf('annual') !== -1;
+          if (!hasMonthly || !hasYearly) return;
+          // Skip if element has children with their own text (only rewrite leaf-ish nodes)
+          if (el.children.length > 3) return;
+          // Rewrite: remove yearly/annual references AND strip "monthly" since it's redundant
+          // when yearly is removed (only one option remains). If only a bare verb remains
+          // (Choose, Select, Pick), hide the element — a plan-selector heading makes no sense
+          // with only one plan.
+          var newText = text;
+          // Strip "or yearly/annual" and "yearly/annual or" with optional plan/subscription
+          newText = newText.replace(/\\s*(?:or|\\/)\\s*(?:yearly|annual)\\s*(?:plan|subscription)?/gi, '');
+          newText = newText.replace(/(?:yearly|annual)\\s*(?:or|\\/)\\s*/gi, '');
+          // Strip standalone yearly/annual references that survived
+          newText = newText.replace(/\\s*(?:yearly|annual)\\s*(?:plan|subscription)?/gi, '');
+          // Strip "monthly" — only option left, redundant to say it
+          newText = newText.replace(/\\s*monthly\\s*/gi, ' ');
+          // Strip plan-selector verbs — "Choose", "Select", "Pick" are useless with one plan
+          // No word-boundary anchors — textContent can concatenate child nodes without spaces
+          // (e.g. "optionsChoose" from <span>options</span><span>Choose</span>)
+          newText = newText.replace(/choose/gi, '');
+          newText = newText.replace(/select/gi, '');
+          newText = newText.replace(/pick/gi, '');
+          // Clean up double spaces, trailing punctuation, and trim
+          newText = newText.replace(/\\s{2,}/g, ' ').replace(/[.:\\-]\\s*$/g, '').trim();
+          if (newText !== text) {
+            if (!newText || newText.length <= 2) {
+              el.style.display = 'none';
+            } else {
+              newText = newText.replace(/\\.$/g, '');
+              newText += ':';
+              el.textContent = newText;
+            }
+            el.setAttribute('data-aa-yearly-rewritten', '1');
+          }
+        });
+
         // Target common pricing containers: divs, spans, li, p, label, small, h-tags
         var candidates = document.querySelectorAll('div, span, li, p, label, small, h1, h2, h3, h4, h5, h6, td');
         candidates.forEach(function(el) {
@@ -3150,9 +3296,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         });
       }
 
-      // ── 6f. SUBSCRIPTION STATUS UI (Build 12) ──
+      // ── 6f. SUBSCRIPTION STATUS UI (Build 12, updated Build 23) ──
       // Visible "Companion Active" / "Free" indicator on More/Settings page.
-      // "Recheck Subscription" button calls __aaCheckCompanion() for cross-device sync.
+      // "Restore Purchases" button calls native StoreKit restore via aaPurchase handler.
 
       function updateSubscriptionStatusUI(isCompanion) {
         var statusEl = document.getElementById('aa-sub-status-text');
@@ -3215,33 +3361,40 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         detail.textContent = isCompanion ? 'Your Companion Monthly subscription is active.' : 'Subscribe monthly to unlock Companion features.';
         section.appendChild(detail);
 
-        var recheckBtn = document.createElement('button');
-        recheckBtn.id = 'aa-sub-recheck-btn';
-        recheckBtn.textContent = 'Recheck Subscription';
-        recheckBtn.addEventListener('click', function(e) {
+        var restoreBtn = document.createElement('button');
+        restoreBtn.id = 'aa-sub-restore-btn';
+        restoreBtn.textContent = 'Restore Purchases';
+        restoreBtn.addEventListener('click', function(e) {
           e.preventDefault();
-          recheckBtn.disabled = true;
-          recheckBtn.textContent = 'Checking...';
-          var p = (typeof window.__aaCheckCompanion === 'function')
-            ? window.__aaCheckCompanion()
-            : Promise.resolve({ isCompanion: window.__aaIsCompanion });
-          p.then(function(data) {
-            window.__aaIsCompanion = data.isCompanion === true;
-            updateSubscriptionStatusUI(data.isCompanion === true);
-            recheckBtn.disabled = false;
-            recheckBtn.textContent = 'Recheck Subscription';
-            if (data.isCompanion) {
-              showAAToast('Companion subscription confirmed!', 'success');
-            } else {
-              showAAToast('No active subscription found.', 'info');
+          restoreBtn.disabled = true;
+          restoreBtn.textContent = 'Restoring...';
+          // Build 23: Wire to native StoreKit restore instead of server check.
+          // The native restore handler provides proper toast feedback.
+          window.addEventListener('aa:iap', function onRestore(ev) {
+            window.removeEventListener('aa:iap', onRestore);
+            restoreBtn.disabled = false;
+            restoreBtn.textContent = 'Restore Purchases';
+            var d = ev.detail || {};
+            if (d.isCompanion) {
+              updateSubscriptionStatusUI(true);
             }
-          }).catch(function() {
-            recheckBtn.disabled = false;
-            recheckBtn.textContent = 'Recheck Subscription';
-            showAAToast('Could not check subscription. Try again.', 'error');
-          });
+          }, { once: true });
+          // Timeout fallback in case native handler doesn't fire
+          setTimeout(function() {
+            if (restoreBtn.disabled) {
+              restoreBtn.disabled = false;
+              restoreBtn.textContent = 'Restore Purchases';
+            }
+          }, 15000);
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
+            window.webkit.messageHandlers.aaPurchase.postMessage({ action: 'restore' });
+          } else {
+            restoreBtn.disabled = false;
+            restoreBtn.textContent = 'Restore Purchases';
+            showAAToast('Restore not available. Try again later.', 'error');
+          }
         });
-        section.appendChild(recheckBtn);
+        section.appendChild(restoreBtn);
 
         var logoutSection = document.getElementById('aa-logout-section');
         if (logoutSection) {
@@ -3491,18 +3644,24 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
       // Periodic checks (blank screen + prayer routes + IAP button wiring) — every 3s for first 30s
       var blankCheckCount = 0;
+      var __aaBlankCheckInterval = null;
       function scheduleBlankChecks() {
+        // Build 23: Cancel previous interval to prevent overlapping checks on rapid navigation
+        if (__aaBlankCheckInterval) clearInterval(__aaBlankCheckInterval);
         blankCheckCount = 0;
         blankConsecutiveHits = 0;
         prayerBlankHits = 0;
-        var interval = setInterval(function() {
+        __aaBlankCheckInterval = setInterval(function() {
           blankCheckCount++;
           detectBlankScreen();
           monitorPrayerRoutes();
           // Build 15: Also check for new IAP buttons (catches late-appearing popups)
           wireIAPButtons();
           handleAlreadySubscribed();
-          if (blankCheckCount >= 10) clearInterval(interval);
+          if (blankCheckCount >= 10) {
+            clearInterval(__aaBlankCheckInterval);
+            __aaBlankCheckInterval = null;
+          }
         }, 3000);
       }
 

@@ -4,6 +4,60 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-25 — Raouf: Build 23 — Fix All Build 14 Rejection Failures
+
+**Context:** Roland tested Build 14 via TestFlight and rejected it with 8 FAIL items. Builds 15-22 fixed many issues locally but never shipped. Build 23 addresses the 3 remaining gaps in the committed code.
+
+**Fix 1 — "Choose monthly or yearly" text rewritten (A2/A3):** `hideYearlyTextElements()` correctly avoided hiding shared containers that mention both "monthly" and "yearly", but left the yearly reference visible. Added a text-rewriting step that runs before the hide logic: elements with both monthly+yearly text get all plan-selection language stripped — "yearly", "annual", "monthly", and selector verbs ("Choose", "Select", "Pick"). Result: "Companion optionsChoose monthly or yearly" → "Companion options:" — clean header with colon, no redundant plan-selector text. Uses no word-boundary anchors (textContent concatenates child nodes without spaces). Elements reduced to 2 chars or less are hidden entirely.
+
+**Fix 2 — "Restore Purchases" replaces "Recheck Subscription" on Settings (D9-D12/E14):** The Settings page button previously called `__aaCheckCompanion()` (server check) which showed stale cached "confirmed" toasts even offline. Replaced with a proper "Restore Purchases" button (`#aa-sub-restore-btn`) that calls native StoreKit restore via `aaPurchase` message handler with `{ action: 'restore' }`. The native handler already provides correct toast feedback (restored/nothing found/error). This satisfies Apple's App Store requirement for a Restore Purchases button.
+
+**Fix 3 — Prevent entitlement state leakage across accounts (E13/E14/B5):** StoreKit entitlements are tied to Apple ID, not app account. After logout, `viewDidLoad()` StoreKit check would re-set `aa_is_companion = true` based on the Apple ID, causing "Companion Active" to show for a different app account that isn't subscribed.
+- Added `aa_awaiting_server_confirm` UserDefaults flag
+- Set in `performFullLogout()` after clearing companion state
+- In `viewDidLoad()`: if flag is set, skip persisting StoreKit result
+- In `buildNativeDiagJS()`: if flag is set, report `isCompanion = false` regardless of UserDefaults
+- In `recheckEntitlements` handler: if flag is set, trigger server check instead of persisting StoreKit
+- In `checkCompanionOnServer()`: clear the flag when server responds (authoritative answer for current user)
+- Result: after logout → login as different user → shows "Free" until server confirms actual `is_companion`
+
+**Fix 4 — Build number:** 14 → 23 (both Debug and Release in project.pbxproj).
+
+**Fix 6 — Informational links hijacked by IAP button classifier (bug):** `wireIAPButtons()` was too aggressive — three types of misclassification:
+- "Frequently Asked Questions" — `'faq'` was in the exclusion list but the actual text was "frequently asked questions" (no "faq" substring). Hit the broad "companion"/"subscribe" matcher → wired as monthly purchase.
+- "How do I restore purchases" — `'how does'` was in the exclusion list but text was "how do i..." (no match). Contained "restore" + "purchase" → wired as restore button → triggered `AppStore.sync()`.
+- "Why Companion is paid" — no exclusion match. Contained "companion" → hit the broad companion matcher → wired as monthly purchase → triggered Apple payment sheet.
+Expanded the non-IAP exclusion list with: `'how do'`, `'how to'`, `'how is'`, `'what are'`, `'why is'`, `'why do'`, `'why companion'`, `'paid'`, `'pricing'`, `'cost'`, `'charge'`, `'billing'`, plus the earlier FAQ words.
+
+**Fix 7 — Subscription reset on cold reboot (stuck `aa_awaiting_server_confirm` flag):** The Build 23 `awaitingServerConfirmKey` flag could get permanently stuck:
+1. `performFullLogout()` sets flag + clears auth token from UserDefaults
+2. `checkLoginTransition()` fires `recheckEntitlements` → sees flag → calls `checkCompanionOnServer()`
+3. But `checkCompanionOnServer()` needs the auth token (just cleared!) → bails at guard → **flag never cleared**
+4. New token is in localStorage but `syncTokenToUserDefaults()` hasn't run yet
+5. Cold reboot → `viewDidLoad()` → flag still `true` → StoreKit result ignored → `isCompanion: false` → subscription appears lost
+
+Three-part fix:
+- **Purchase/restore handlers**: Clear the flag immediately on successful buy or restore (these are definitive actions for THIS account)
+- **`viewDidLoad()` stale guard**: If `aa_is_companion` is already `true` in UserDefaults but the flag is set, the flag is stale (a purchase happened after the logout that set it) — clear it
+- **`recheckEntitlements` token race**: After login transition, sync token from localStorage to UserDefaults first, then try server check after 1s delay, retry after 3s if flag still set
+
+**Fix 8 — Transaction listener and foreground resume bypass awaiting flag (leakage):** Two more code paths were persisting StoreKit entitlements without checking `aa_awaiting_server_confirm`:
+- `startIAPTransactionListener()` callback — StoreKit renewal/update events would call `persistCompanionState(true)` and `refreshWebEntitlements(isCompanion: true)` unconditionally
+- `handleWillEnterForeground()` entitlement recheck — coming back from background would re-check StoreKit and persist the result unconditionally
+Both now check the flag and skip persisting / push `isCompanion: false` to JS when the flag is set. All 8 `persistCompanionState()` call sites are now flag-safe.
+
+**Code hygiene fixes (5):**
+1. Added `webView?.removeObserver(self, forKeyPath: "URL")` to `deinit` — was missing KVO cleanup
+2. `AppStore.sync()` failure now returns `"error"` status with message instead of misleading `"success"` with `isCompanion: false` — user sees proper error toast instead of "No subscription found"
+3. Replaced `token != nil && !(token!.isEmpty)` with idiomatic `token?.isEmpty == false`
+4. `scheduleBlankChecks()` now cancels previous interval before creating a new one — prevents overlapping setIntervals on rapid SPA navigation
+5. Toast z-index raised from 99997 to 100000 — now renders above logout confirm (99998) and diagnostics overlay (99999)
+
+- **Files changed**: `PatchedBridgeViewController.swift`, `project.pbxproj`, `AGENT.md`, `CHANGELOG.md`
+- **Verification**: lint ✅, test ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅
+
+---
+
 ### 2026-02-24 — Raouf: Build 22 — Fix Subscription State Lost After Logout + Login
 
 **Bug — Subscription disappears after logout + login**: After logging out and logging back in, the subscription state is lost. The user sees subscribe/paywall buttons as if they're not subscribed, and must tap Restore Purchases to recover.

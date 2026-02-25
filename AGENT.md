@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone B — App Store submission preparation (Build 22)
+**Current Phase:** Milestone B — App Store submission preparation (Build 23)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
