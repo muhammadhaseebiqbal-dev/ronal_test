@@ -188,7 +188,7 @@ These features require an active Companion subscription. "Companion adds a perso
 ### B. Entitlement Consistency
 | # | Criterion | Status |
 |---|-----------|--------|
-| 4 | If user is subscribed, app must not show subscribe buttons or paywall options anywhere | ✅ Build 15+18: `handleAlreadySubscribed()` body-wide search + popup dismissal |
+| 4 | If user is subscribed, app must not show subscribe buttons or paywall options anywhere | ✅ Build 15+21: `handleAlreadySubscribed()` body-wide search hides wired paywall actions; `dismissPaywallOverlay()` runs only after confirmed purchase/restore |
 | 5 | App must never show contradictory states (e.g. "active subscription" + Subscribe buttons) | ✅ Build 15+18: All subscribe/trial/restore buttons hidden when subscribed |
 
 ### C. Purchase Flow
@@ -215,6 +215,29 @@ These features require an active Companion subscription. "Companion adds a perso
 ---
 
 ## Last Change Log
+
+**2026-02-25 — Raouf: Cross-account leakage + logout/login subscription hardening (Build 23.2)**
+- **Scope:** Fresh focused audit of cross-account leakage and logout→login subscription stability.
+- **Findings:** Core protections were present (`aa_awaiting_server_confirm`, login-transition recheck, StoreKit gating guards), but one edge case remained: if server confirmation failed after logout→login, the awaiting flag could stay set and keep subscription false indefinitely.
+- **Fixes:**
+  1. Added same-account-safe fallback: store last logout token subject (`sub`) and allow local StoreKit fallback only when the new login token subject matches the logout subject.
+  2. Added `extractTokenSubject()`, `resolveAwaitingConfirmFallbackIfSafe()`, and centralized `clearAwaitingServerConfirmState(reason:)`.
+  3. Applied fallback when server check errors/invalid responses and after retry windows in `recheckEntitlements`.
+  4. Stored logout token subject before clearing token in `performFullLogout()`.
+  5. Centralized awaiting-flag clears (purchase success, restore success, server response, stale boot flag) to also clear logout-subject state + refresh user script.
+- **Files changed:** `ios/App/App/PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** `npm run lint` ✅, `npm test` ✅ (42/42), `xcodebuild -project App.xcodeproj -scheme App -configuration Release -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO build` ✅ `BUILD SUCCEEDED`
+- **Follow-ups:** Device test matrix: (a) same-account logout→login with worker offline should recover via safe fallback, (b) cross-account logout→login with worker offline must remain locked until server confirmation.
+
+**2026-02-25 — Raouf: Milestone B fresh code audit + consistency fixes**
+- **Scope:** Full fresh audit of all 14 Milestone B acceptance items against current Swift/Worker code, plus mismatch remediation.
+- **Summary:** Verified implementation coverage for A1-A3, B4-B5, C6-C8, D9-D12, E13-E14. Fixed one real config mismatch and one trial-text edge case:
+  1. `project.pbxproj` target-level bundle IDs were still `com.abideandanchor.test` in Debug + Release (overriding xcconfig). Corrected both to `com.abideandanchor.app`.
+  2. Added trial-text rewrite pass in `hideTrialTextElements()` to strip "trial/free trial" from shared monthly+trial labels without hiding monthly containers.
+  3. Corrected Milestone B item B4 wording to match actual code path (no blanket popup dismissal in `handleAlreadySubscribed()`; one-time dismissal happens only after confirmed purchase/restore).
+- **Files changed:** `ios/App/App.xcodeproj/project.pbxproj`, `ios/App/App/PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** `npm run lint` ✅, `npm test` ✅ (42/42), `npm run verify:ios` ✅, bundle ID grep in pbxproj ✅ (`com.abideandanchor.app` in Debug+Release)
+- **Follow-ups:** Run one physical-device pass for the 14-item sheet to confirm UI copy removals on all paywall variants.
 
 **2026-02-25 — Raouf: Build 23, Fix 14 — Logout→login token sync race condition**
 - **Bug**: Logging out and back into the same account voids the subscription. The `recheckEntitlements` handler (triggered on login transition) called `syncTokenToUserDefaults()` fire-and-forget, then waited 1s before calling `checkCompanionOnServer()`. But `syncTokenToUserDefaults()` is async (evaluateJavaScript callback) and the 1s delay was not guaranteed to be enough. If the token hadn't synced to UserDefaults, `checkCompanionOnServer()` bailed at its guard → `aa_awaiting_server_confirm` flag was never cleared → subscription stuck at false.

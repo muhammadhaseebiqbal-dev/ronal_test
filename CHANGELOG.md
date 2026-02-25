@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-25 — Raouf: Cross-Account Leakage + Logout/Login Subscription Hardening (Build 23.2)
+
+**Scope:** Deep audit of cross-account leakage and logout→login subscription recovery paths.
+
+**Issue found:** If server confirmation failed after logout→login, `aa_awaiting_server_confirm` could remain set, keeping subscription state forced to false longer than intended.
+
+**Fix 1 — Same-account-safe fallback:** Added a guarded fallback that restores local StoreKit state only when the post-login token subject matches the logged-out token subject.
+- Added `aa_last_logout_sub` state in UserDefaults.
+- Added `extractTokenSubject()` JWT payload parser (`sub`, with fallbacks).
+- Added `resolveAwaitingConfirmFallbackIfSafe()` to perform StoreKit fallback only for same-account re-login.
+
+**Fix 2 — Centralized awaiting-state clearing:** Added `clearAwaitingServerConfirmState(reason:)` and replaced scattered flag resets so all clear paths now:
+- clear `aa_awaiting_server_confirm`
+- clear `aa_last_logout_sub`
+- refresh atDocumentStart script injection when needed
+
+**Fix 3 — Hooked fallback into failure paths:**
+- `checkCompanionOnServer()` now evaluates safe fallback on network error and invalid response.
+- `recheckEntitlements` retry path now evaluates safe fallback if the flag remains set after retries.
+
+**Fix 4 — Capture logout identity before token clear:** `performFullLogout()` now stores logout token subject before clearing native token state.
+
+- **Files changed:** `ios/App/App/PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, tests ✅ (42/42), xcodebuild (no-sign, simulator) ✅ BUILD SUCCEEDED
+
+### 2026-02-25 — Raouf: Milestone B Fresh Code Audit + Consistency Fixes
+
+**Scope:** Performed a fresh code-first audit of all 14 Milestone B acceptance criteria against current implementation (Swift StoreKit bridge + injected JS + Cloudflare Worker), then fixed mismatches found.
+
+**Fix 1 — Bundle ID mismatch in target-level build settings:** `project.pbxproj` still had `PRODUCT_BUNDLE_IDENTIFIER = com.abideandanchor.test` in both Debug and Release target configs, which can override xcconfig and break App Store/TestFlight alignment. Updated both target-level values to `com.abideandanchor.app`.
+
+**Fix 2 — Trial wording edge case in shared monthly+trial labels (A2 hardening):** `hideTrialTextElements()` skipped hiding shared containers containing both monthly and trial text (to avoid hiding the monthly option), which could leave trial wording visible in some paywall variants. Added a rewrite pass that strips trial/free-trial phrases from shared monthly+trial text nodes before hide logic runs.
+
+**Fix 3 — AGENT acceptance-sheet wording corrected (B4):** Updated Milestone B item #4 wording to match actual behavior: `handleAlreadySubscribed()` hides wired paywall actions body-wide; popup dismissal is intentionally one-time and only after confirmed purchase/restore via `dismissPaywallOverlay()`.
+
+**Fresh audit result — 14 Milestone B criteria:**
+- **A1, A2, A3 (Subscription UI):** PASS — monthly-only purchasable IDs + yearly/trial button hiding + yearly/trial text suppression are implemented.
+- **B4, B5 (Entitlement consistency):** PASS — subscribed flow hides wired subscribe/trial/yearly/restore actions; contradictory states mitigated via patch cycle + subscription status UI updates.
+- **C6, C7, C8 (Purchase flow):** PASS — non-subscribed monthly purchase wiring, immediate unlock path (`reloadFromOrigin()` after sync), persistence in `aa_is_companion`.
+- **D9, D10, D11, D12 (Restore flow):** PASS — explicit restore UI/button, clear toasts for restored/nothing/error/info, state refresh path present.
+- **E13, E14 (Source of truth):** PASS — Worker validates JWS and sets Base44 `is_companion`; native logic avoids duplicate feature-gating bypass and refreshes web state after sync.
+
+- **Files changed:** `ios/App/App.xcodeproj/project.pbxproj`, `ios/App/App/PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), verify:ios ✅
+
 ### 2026-02-25 — Raouf: Build 23 — Fix All Build 14 Rejection Failures
 
 **Context:** Roland tested Build 14 via TestFlight and rejected it with 8 FAIL items. Builds 15-22 fixed many issues locally but never shipped. Build 23 addresses the 3 remaining gaps in the committed code.

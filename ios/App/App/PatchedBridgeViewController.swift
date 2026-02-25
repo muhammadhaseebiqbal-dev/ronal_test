@@ -213,6 +213,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// Cleared when checkCompanionOnServer() gets a response (the authoritative answer).
     private static let awaitingServerConfirmKey = "aa_awaiting_server_confirm"
 
+    /// Build 23.2: Subject (`sub`) from the token that was active at logout.
+    /// Used to safely decide whether fallback to local StoreKit is allowed if server
+    /// confirmation fails after logout -> login (same account only).
+    private static let lastLogoutTokenSubjectKey = "aa_last_logout_sub"
+
     /// Cloudflare Worker URL for cross-device Companion validation (Build 11).
     /// Deployed by Roland — 2026-02-18.
     private static let companionWorkerURL = "https://companion-validator.abideandanchor.workers.dev"
@@ -281,7 +286,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 if result.status == "success" {
                     // Build 23: User just completed a purchase for THIS account — clear the
                     // awaiting-server-confirm flag since this is a definitive action.
-                    UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+                    self.clearAwaitingServerConfirmState(reason: "purchase-success")
 
                     self.persistCompanionState(result.isCompanion)
                     self.refreshWebEntitlements(isCompanion: result.isCompanion)
@@ -332,7 +337,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                     // Build 23: Only clear flag + persist when restore finds an active subscription.
                     // Prevents voiding an existing subscription when restore returns false
                     // (e.g. different Apple ID, expired, etc.)
-                    UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+                    self.clearAwaitingServerConfirmState(reason: "restore-success")
                     self.persistCompanionState(true)
                     self.refreshWebEntitlements(isCompanion: true)
 
@@ -377,6 +382,14 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                                 if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
                                     os_log(.info, log: Self.log, "[IAP:recheck] Flag still set after 3s — retrying server check")
                                     self.checkCompanionOnServer()
+                                    // Build 23.2: If server still doesn't respond, try same-account-safe fallback.
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                                        guard let self = self else { return }
+                                        if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
+                                            os_log(.info, log: Self.log, "[IAP:recheck] Flag still set after retry — evaluating safe fallback")
+                                            self.resolveAwaitingConfirmFallbackIfSafe()
+                                        }
+                                    }
                                 }
                             }
                         } else {
@@ -394,8 +407,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                                         os_log(.info, log: Self.log, "[IAP:recheck] Still no token after retry — clearing awaiting flag to unblock")
                                         // Clear flag so user isn't stuck in limbo. StoreKit checks will
                                         // work normally, and next navigation will trigger another check.
-                                        UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
-                                        self.refreshNativeDiagUserScript()
+                                        self.clearAwaitingServerConfirmState(reason: "token-sync-failed")
                                     }
                                 }
                             }
@@ -646,8 +658,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
             // Clear awaiting flag — server has answered
             if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
-                UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
-                DispatchQueue.main.async { self.refreshNativeDiagUserScript() }
+                self.clearAwaitingServerConfirmState(reason: "server-answered-await")
             }
 
             return serverIsCompanion
@@ -701,11 +712,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             if let error = error {
                 os_log(.error, log: Self.log, "[ServerCheck] Error: %{public}@", error.localizedDescription)
                 DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: 0, error: error.localizedDescription) }
+                self.resolveAwaitingConfirmFallbackIfSafe()
                 return
             }
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: "Invalid response") }
+                self.resolveAwaitingConfirmFallbackIfSafe()
                 return
             }
 
@@ -715,10 +728,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             // Build 23: Clear the awaiting-server-confirm flag — server has answered authoritatively
             // for the currently logged-in user. StoreKit checks can now persist normally.
             if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
-                UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
-                os_log(.info, log: Self.log, "[ServerCheck] Cleared aa_awaiting_server_confirm — server responded")
-                // Refresh WKUserScript so subsequent page loads inject correct state
-                DispatchQueue.main.async { self.refreshNativeDiagUserScript() }
+                self.clearAwaitingServerConfirmState(reason: "server-answered")
             }
 
             DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: nil) }
@@ -848,6 +858,18 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             }
         }
 
+        // Build 23.2: Remember which account was logged out (token subject) so we can
+        // safely allow same-account fallback if server confirmation is temporarily unavailable.
+        if let currentToken = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey),
+           let subject = extractTokenSubject(currentToken),
+           !subject.isEmpty {
+            UserDefaults.standard.set(subject, forKey: Self.lastLogoutTokenSubjectKey)
+            os_log(.info, log: Self.log, "[LOGOUT] Saved last logout token subject")
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.lastLogoutTokenSubjectKey)
+            os_log(.info, log: Self.log, "[LOGOUT] No token subject available")
+        }
+
         // Clear token from UserDefaults (native persistence layer)
         clearTokenFromUserDefaults()
 
@@ -904,7 +926,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 // before a purchase/restore happened — clear it so we don't block the boot check.
                 if awaitingConfirm && alreadyCompanion {
                     os_log(.info, log: Self.log, "[BOOT] Clearing stale awaiting flag — aa_is_companion already true")
-                    UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+                    self.clearAwaitingServerConfirmState(reason: "stale-flag-boot")
                     awaitingConfirm = false
                 }
 
@@ -1139,6 +1161,76 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// Gets the stored token length (for diagnostics — never log the token itself).
     private func tokenLengthInUserDefaults() -> Int {
         return UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)?.count ?? 0
+    }
+
+    /// Decodes JWT payload and returns a stable user subject identifier when available.
+    /// Used only for same-account safety checks; token signature validation is not required here.
+    private func extractTokenSubject(_ token: String) -> String? {
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = payload.count % 4
+        if remainder > 0 {
+            payload += String(repeating: "=", count: 4 - remainder)
+        }
+
+        guard let payloadData = Data(base64Encoded: payload),
+              let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else {
+            return nil
+        }
+
+        return (json["sub"] as? String) ??
+               (json["user_id"] as? String) ??
+               (json["uid"] as? String)
+    }
+
+    /// Clears awaiting-server-confirm state and refreshes atDocumentStart script injection.
+    private func clearAwaitingServerConfirmState(reason: String) {
+        let defaults = UserDefaults.standard
+        let hadFlag = defaults.bool(forKey: Self.awaitingServerConfirmKey)
+        defaults.set(false, forKey: Self.awaitingServerConfirmKey)
+        defaults.removeObject(forKey: Self.lastLogoutTokenSubjectKey)
+        os_log(.info, log: Self.log, "[AwaitingConfirm] Cleared (%{public}@), hadFlag=%{public}@",
+               reason, hadFlag ? "true" : "false")
+        if hadFlag {
+            DispatchQueue.main.async { self.refreshNativeDiagUserScript() }
+        }
+    }
+
+    /// If server confirmation is unavailable, allow StoreKit fallback ONLY when the
+    /// post-login token subject matches the subject from the just-logged-out account.
+    /// This prevents cross-account leakage while avoiding same-account false downgrades.
+    private func resolveAwaitingConfirmFallbackIfSafe() {
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: Self.awaitingServerConfirmKey) else { return }
+
+        guard let currentToken = defaults.string(forKey: Self.tokenDefaultsKey),
+              !currentToken.isEmpty,
+              let currentSubject = extractTokenSubject(currentToken),
+              let logoutSubject = defaults.string(forKey: Self.lastLogoutTokenSubjectKey),
+              !logoutSubject.isEmpty else {
+            os_log(.info, log: Self.log, "[AwaitingConfirm] Safe fallback skipped — subject unavailable")
+            return
+        }
+
+        guard currentSubject == logoutSubject else {
+            os_log(.info, log: Self.log, "[AwaitingConfirm] Safe fallback blocked — account changed")
+            return
+        }
+
+        guard #available(iOS 15.0, *) else { return }
+        Task { @MainActor in
+            let (isCompanion, products) = await AAStoreManager.shared.checkEntitlements()
+            os_log(.info, log: Self.log, "[AwaitingConfirm] Safe fallback applied for same account (isCompanion=%{public}@)",
+                   isCompanion ? "true" : "false")
+            self.clearAwaitingServerConfirmState(reason: "same-account-safe-fallback")
+            self.persistCompanionState(isCompanion)
+            self.refreshWebEntitlements(isCompanion: isCompanion)
+            self.pushEntitlementCheckToJS(isCompanion: isCompanion, products: products)
+        }
     }
 
     // MARK: – B) Cookie bridging
@@ -3472,6 +3564,40 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       // Only targets non-button elements (labels, descriptions, cards).
       // Trial buttons are already hidden by wireIAPButtons() classification.
       function hideTrialTextElements() {
+        // Build 23.1: Rewrite shared monthly+trial labels so trial wording is removed
+        // without hiding the monthly pricing container.
+        var rewriteCandidates = document.querySelectorAll('div, span, li, p, label, small, h1, h2, h3, h4, h5, h6, td');
+        rewriteCandidates.forEach(function(el) {
+          if (el.getAttribute('data-aa-trial-rewritten')) return;
+          if (el.closest('#aa-logout-section, #aa-subscription-section, .aa-diag-overlay, .aa-toast, #aa-already-subscribed')) return;
+          if (el.getAttribute('data-aa-iap-wired')) return;
+          if (el.children.length > 3) return;
+          var text = (el.textContent || '').trim();
+          if (!text || text.length > 200) return;
+          var lower = text.toLowerCase();
+          var hasMonthly = lower.indexOf('monthly') !== -1 || lower.indexOf('month') !== -1 ||
+                           lower.indexOf('/mo') !== -1 || lower.indexOf('per month') !== -1 || lower.indexOf('9.99') !== -1;
+          var hasTrial = lower.indexOf('trial') !== -1;
+          if (!hasMonthly || !hasTrial) return;
+
+          var newText = text;
+          newText = newText.replace(/free\\s*trial/gi, '');
+          newText = newText.replace(/start\\s*(?:a\\s*)?(?:free\\s*)?trial/gi, '');
+          newText = newText.replace(/(?:7|14|30)[-\\s]*day\\s*trial/gi, '');
+          newText = newText.replace(/trial\\s*period/gi, '');
+          newText = newText.replace(/trial/gi, '');
+          newText = newText.replace(/\\s{2,}/g, ' ').replace(/[,:;\\-]\\s*$/g, '').trim();
+
+          if (newText !== text) {
+            if (!newText || newText.length <= 2) {
+              el.style.display = 'none';
+            } else {
+              el.textContent = newText;
+            }
+            el.setAttribute('data-aa-trial-rewritten', '1');
+          }
+        });
+
         var candidates = document.querySelectorAll('div, span, li, p, label, small, h1, h2, h3, h4, h5, h6, td');
         candidates.forEach(function(el) {
           if (el.getAttribute('data-aa-trial-hidden')) return;
