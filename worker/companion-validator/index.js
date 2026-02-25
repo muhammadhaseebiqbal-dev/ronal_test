@@ -12,6 +12,7 @@
 
 const BASE44_APP_ID = '69586539f13402a151c12aa3';
 const BASE44_API_BASE = `https://base44.app/api/apps/${BASE44_APP_ID}`;
+const EXPECTED_BUNDLE_ID = 'com.abideandanchor.app';
 
 const COMPANION_PRODUCT_IDS = new Set([
   'com.abideandanchor.companion.monthly',
@@ -177,6 +178,19 @@ async function handleValidateReceipt(request, origin) {
   const expirationDate = payload.expiresDate || payload.expirationDate;
   const revocationDate = payload.revocationDate;
   const environment = payload.environment;
+  const bundleId = payload.bundleId || payload.bid || payload.appBundleId || null;
+
+  // Reject receipts that do not belong to this app bundle.
+  // This prevents accepting a valid Apple-signed transaction from a different app.
+  if (!bundleId || bundleId !== EXPECTED_BUNDLE_ID) {
+    return jsonResponse(
+      {
+        error: `Invalid bundleId: ${bundleId || 'missing'}`,
+      },
+      400,
+      origin
+    );
+  }
 
   // Reject if not a companion product
   if (!COMPANION_PRODUCT_IDS.has(productId)) {

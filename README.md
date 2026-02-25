@@ -2,9 +2,9 @@
 
 ## 🎯 Summary
 
-This repository contains the **production-ready fix** for the iOS onboarding bug where the app was stuck on the final onboarding screen.
+This repository contains the production iOS wrapper and runtime patch layer for Abide & Anchor, including auth/session stability and Companion subscription hardening.
 
-**Status:** ✅ Ready for device testing
+**Status:** Production-ready, with current regression coverage and iOS validation workflows.
 
 ---
 
@@ -40,7 +40,7 @@ npm install
 ### Step 2: Verify the Build (Optional)
 ```bash
 npm run lint      # Should show 0 errors
-npm run test      # Should show 37/37 passing
+npm run test      # Should show 42/42 passing
 npm run build     # Should succeed
 npm run verify:ios  # Should show all green checks
 ```
@@ -76,7 +76,7 @@ Raouf_Minimum/
 │   ├── context/AuthContext.jsx  # Auth provider
 │   ├── lib/app-params.js        # Config (THE FIX IS HERE)
 │   └── main.jsx                 # Entry point
-├── tests/                       # 37 unit tests
+├── tests/                       # 42 unit tests
 ├── scripts/verify-ios-build.js  # Build checker
 ├── docs/
 │   ├── ARCHITECTURE.md
@@ -115,7 +115,7 @@ All automated checks passed:
 | Check | Result |
 |-------|--------|
 | Lint | ✅ 0 errors |
-| Tests | ✅ 37/37 passing |
+| Tests | ✅ 42/42 passing |
 | Build | ✅ Success |
 | iOS Verify | ✅ App ID baked in |
 | Real Endpoint | ✅ Returns JSON |

@@ -216,6 +216,30 @@ These features require an active Companion subscription. "Companion adds a perso
 
 ## Last Change Log
 
+**2026-02-25 — Raouf: Full audit hardening + downgrade-safety fixes**
+- **Scope:** Fresh full-code audit for 14-item subscription behavior, cross-account safety, worker verification hardening, and repository standards.
+- **Fixes:**
+  1. Prevented false UI downgrade to `Free` on non-success IAP callbacks by only sending `isCompanion` to JS when outcomes are definitive (buy success / restore success).
+  2. Tightened `wireIAPButtons()` monthly classifier: removed broad `"become"` match; now only `"become companion"` / `"become a companion"` qualifies.
+  3. Worker security hardening: `POST /validate-receipt` now validates `bundleId == com.abideandanchor.app`.
+  4. Added missing professional docs: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`.
+  5. CI now includes `npm run build` so regressions are caught before merge.
+  6. README updated to current project scope and current test count (42/42).
+- **Files changed:** `ios/App/App/PatchedBridgeViewController.swift`, `worker/companion-validator/index.js`, `.github/workflows/ci.yml`, `README.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** `npm run lint` ✅, `npm test` ✅ (42/42), `npm run build` ✅, `xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Debug -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17,OS=26.2' CODE_SIGNING_ALLOWED=NO build` ✅ `BUILD SUCCEEDED`
+
+**2026-02-25 — Raouf: Build 23.3 — Fix logout→login void when server returns false**
+- **Scope:** Targeted fix for user-reported case where logout/login still voided subscription.
+- **Root cause:** In `checkCompanionOnServer()`, when `aa_awaiting_server_confirm` was true and server returned `isCompanion=false`, local state was often also false (cleared on logout), so no reconciliation happened. This silently accepted false and could leave users voided.
+- **Fixes:**
+  1. Added `wasAwaitingConfirm` handling in `checkCompanionOnServer()` and explicit branch for `awaiting + server false`.
+  2. `resolveAwaitingConfirmFallbackIfSafe()` now supports `clearIfNotApplied` and clears awaiting state when fallback cannot be safely applied.
+  3. Error/invalid-response server paths now call safe fallback with clear-on-no-match to avoid indefinite false lock.
+  4. Recheck retry tail now also uses clear-on-no-match fallback.
+- **Files changed:** `ios/App/App/PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** `npm run lint` ✅, `npm test` ✅ (42/42), `xcodebuild -project App.xcodeproj -scheme App -configuration Release -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO build` ✅
+- **Follow-ups:** Device verify same-account logout/login with server false path now recovers (or cleanly clears awaiting state without indefinite false lock).
+
 **2026-02-25 — Raouf: Cross-account leakage + logout/login subscription hardening (Build 23.2)**
 - **Scope:** Fresh focused audit of cross-account leakage and logout→login subscription stability.
 - **Findings:** Core protections were present (`aa_awaiting_server_confirm`, login-transition recheck, StoreKit gating guards), but one edge case remained: if server confirmation failed after logout→login, the awaiting flag could stay set and keep subscription false indefinitely.

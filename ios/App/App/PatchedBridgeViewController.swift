@@ -278,7 +278,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 let result = await AAStoreManager.shared.purchase(productId: productId)
                 var payload: [String: Any] = ["status": result.status, "action": "buy"]
                 if let pid = result.productId { payload["productId"] = pid }
-                payload["isCompanion"] = result.isCompanion
+                // Only include isCompanion on confirmed success.
+                // Sending false on cancelled/pending/error can incorrectly flip UI to "Free".
+                if result.status == "success" {
+                    payload["isCompanion"] = result.isCompanion
+                }
                 if let msg = result.message { payload["message"] = msg }
 
                 self.sendPurchaseResult(payload)
@@ -323,9 +327,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 let result = await AAStoreManager.shared.restorePurchases()
                 var payload: [String: Any] = [
                     "status": result.status,
-                    "isCompanion": result.isCompanion,
                     "action": "restore"
                 ]
+                // Only include isCompanion when restore confirms an active subscription.
+                // This avoids false UI downgrades when "nothing to restore" is returned.
+                if result.isCompanion {
+                    payload["isCompanion"] = true
+                }
                 if !result.restoredProducts.isEmpty {
                     payload["productId"] = result.restoredProducts.first ?? ""
                 }
@@ -387,7 +395,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                                         guard let self = self else { return }
                                         if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
                                             os_log(.info, log: Self.log, "[IAP:recheck] Flag still set after retry — evaluating safe fallback")
-                                            self.resolveAwaitingConfirmFallbackIfSafe()
+                                            self.resolveAwaitingConfirmFallbackIfSafe(clearIfNotApplied: true)
                                         }
                                     }
                                 }
@@ -712,26 +720,32 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             if let error = error {
                 os_log(.error, log: Self.log, "[ServerCheck] Error: %{public}@", error.localizedDescription)
                 DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: 0, error: error.localizedDescription) }
-                self.resolveAwaitingConfirmFallbackIfSafe()
+                self.resolveAwaitingConfirmFallbackIfSafe(clearIfNotApplied: true)
                 return
             }
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: "Invalid response") }
-                self.resolveAwaitingConfirmFallbackIfSafe()
+                self.resolveAwaitingConfirmFallbackIfSafe(clearIfNotApplied: true)
                 return
             }
 
             let serverIsCompanion = json["isCompanion"] as? Bool ?? false
             let localIsCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
-
-            // Build 23: Clear the awaiting-server-confirm flag — server has answered authoritatively
-            // for the currently logged-in user. StoreKit checks can now persist normally.
-            if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
-                self.clearAwaitingServerConfirmState(reason: "server-answered")
-            }
+            let wasAwaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
 
             DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: nil) }
+
+            // Build 23.3: Awaiting-confirm + server false can otherwise lock user in false state
+            // after logout->login (local was intentionally cleared on logout). Evaluate guarded
+            // same-account fallback before normal reconciliation.
+            if wasAwaitingConfirm {
+                if serverIsCompanion {
+                    self.clearAwaitingServerConfirmState(reason: "server-answered-companion-true")
+                } else {
+                    self.resolveAwaitingConfirmFallbackIfSafe(clearIfNotApplied: true)
+                }
+            }
 
             if serverIsCompanion != localIsCompanion {
                 os_log(.info, log: Self.log, "[ServerCheck] Server companion=%{public}@ differs from local=%{public}@ — checking StoreKit",
@@ -1203,7 +1217,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// If server confirmation is unavailable, allow StoreKit fallback ONLY when the
     /// post-login token subject matches the subject from the just-logged-out account.
     /// This prevents cross-account leakage while avoiding same-account false downgrades.
-    private func resolveAwaitingConfirmFallbackIfSafe() {
+    private func resolveAwaitingConfirmFallbackIfSafe(clearIfNotApplied: Bool = false) {
         let defaults = UserDefaults.standard
         guard defaults.bool(forKey: Self.awaitingServerConfirmKey) else { return }
 
@@ -1213,11 +1227,17 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
               let logoutSubject = defaults.string(forKey: Self.lastLogoutTokenSubjectKey),
               !logoutSubject.isEmpty else {
             os_log(.info, log: Self.log, "[AwaitingConfirm] Safe fallback skipped — subject unavailable")
+            if clearIfNotApplied {
+                self.clearAwaitingServerConfirmState(reason: "safe-fallback-unavailable")
+            }
             return
         }
 
         guard currentSubject == logoutSubject else {
             os_log(.info, log: Self.log, "[AwaitingConfirm] Safe fallback blocked — account changed")
+            if clearIfNotApplied {
+                self.clearAwaitingServerConfirmState(reason: "safe-fallback-account-changed")
+            }
             return
         }
 
@@ -3314,7 +3334,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
               isMonthlySubscribe = true;
             }
             // "start companion" / "become a companion" / "join companion"
-            if (text.indexOf('start companion') !== -1 || text.indexOf('become') !== -1 ||
+            if (text.indexOf('start companion') !== -1 ||
+                text.indexOf('become companion') !== -1 ||
+                text.indexOf('become a companion') !== -1 ||
                 text.indexOf('join companion') !== -1) {
               isMonthlySubscribe = true;
             }

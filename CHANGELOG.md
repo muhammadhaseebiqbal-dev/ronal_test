@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-25 — Raouf: Full Audit Hardening + Subscription/UI Downgrade Fixes
+
+**Scope:** Fresh code audit of the 14-item subscription flow, cross-account safety paths, worker validation, CI checks, and repository standards docs.
+
+**Fix 1 — Prevent false UI downgrades on buy/restore callbacks:** In native IAP message handling, `isCompanion: false` was being sent to JS on non-success outcomes (buy cancelled/pending/error, restore with nothing found). JS then ran `updateSubscriptionStatusUI(false)`, which could incorrectly flip Settings to `Free` even when persisted entitlement stayed true.
+- Buy payload now includes `isCompanion` only on confirmed `status == "success"`.
+- Restore payload now includes `isCompanion` only when restore confirms an active subscription.
+
+**Fix 2 — Tighten monthly-button classifier:** `wireIAPButtons()` matched any text containing `"become"`, which could miswire non-purchase UI. Matching is now constrained to `"become companion"` / `"become a companion"` phrases.
+
+**Fix 3 — Worker receipt hardening:** Added strict `bundleId` validation in `POST /validate-receipt`:
+- rejects missing or mismatched bundle IDs
+- expected bundle is `com.abideandanchor.app`
+
+**Fix 4 — Repo quality and CI completeness:**
+- Added `CONTRIBUTING.md`
+- Added `CODE_OF_CONDUCT.md`
+- CI now runs `npm run build` in addition to lint + tests
+- README refreshed for current scope and test counts (42/42)
+
+- **Files changed:** `ios/App/App/PatchedBridgeViewController.swift`, `worker/companion-validator/index.js`, `.github/workflows/ci.yml`, `README.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, tests ✅ (42/42), build ✅, xcodebuild simulator no-sign ✅ `BUILD SUCCEEDED`
+
+### 2026-02-25 — Raouf: Build 23.3 — Fix Logout/Login Void on Server False Path
+
+**Issue:** User-reported: logout→login could still void subscription. In `checkCompanionOnServer()`, when `aa_awaiting_server_confirm=true` and server returned `isCompanion=false`, local was often also false (cleared on logout), so the reconcile branch did nothing and false state persisted.
+
+**Fix 1 — Awaiting-confirm false-path handling in server check:**
+- Added `wasAwaitingConfirm` capture in `checkCompanionOnServer()`.
+- If awaiting + `serverIsCompanion == false`, now explicitly runs guarded same-account fallback flow instead of silently accepting false.
+- If awaiting + `serverIsCompanion == true`, clears awaiting state via centralized helper.
+
+**Fix 2 — Safe fallback now clears when not applicable:**
+- `resolveAwaitingConfirmFallbackIfSafe(clearIfNotApplied:)` now clears awaiting state when fallback cannot be safely applied (missing subject, account mismatch), preventing indefinite lock.
+
+**Fix 3 — Error/invalid-response paths hardened:**
+- Server error and invalid response branches now invoke safe fallback with clear-on-no-match.
+- Recheck retry tail also uses clear-on-no-match fallback.
+
+- **Files changed:** `ios/App/App/PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, tests ✅ (42/42), xcodebuild no-sign ✅ BUILD SUCCEEDED
+
 ### 2026-02-25 — Raouf: Cross-Account Leakage + Logout/Login Subscription Hardening (Build 23.2)
 
 **Scope:** Deep audit of cross-account leakage and logout→login subscription recovery paths.
