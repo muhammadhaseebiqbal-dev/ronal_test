@@ -299,6 +299,22 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
         case "restore":
             Task { @MainActor in
+                // Build 23: Check network reachability before restore.
+                // StoreKit's Transaction.currentEntitlements works offline from cache,
+                // but we need the server to confirm is_companion (E14). If offline,
+                // tell the user to connect instead of showing fake "confirmed" from cache.
+                let isOnline = await self.canReachServer()
+                if !isOnline {
+                    // NOTE: Do NOT send isCompanion in the payload — prevents JS from
+                    // calling updateSubscriptionStatusUI(false) which would void the UI.
+                    self.sendPurchaseResult([
+                        "status": "info",
+                        "action": "restore",
+                        "message": "Please connect to the internet to restore your subscription."
+                    ])
+                    return
+                }
+
                 let result = await AAStoreManager.shared.restorePurchases()
                 var payload: [String: Any] = [
                     "status": result.status,
@@ -312,20 +328,23 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
                 self.sendPurchaseResult(payload)
 
-                // Build 23: User explicitly tapped Restore for THIS account — clear the flag.
-                UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+                if result.isCompanion {
+                    // Build 23: Only clear flag + persist when restore finds an active subscription.
+                    // Prevents voiding an existing subscription when restore returns false
+                    // (e.g. different Apple ID, expired, etc.)
+                    UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+                    self.persistCompanionState(true)
+                    self.refreshWebEntitlements(isCompanion: true)
 
-                self.persistCompanionState(result.isCompanion)
-                self.refreshWebEntitlements(isCompanion: result.isCompanion)
-
-                // Build 11: Sync to server for cross-device unlock
-                if result.isCompanion, let jws = result.jws {
-                    self.syncCompanionToServer(jws: jws)
-                    // Web refresh happens inside syncCompanionToServer on 200 OK
-                } else if result.isCompanion {
-                    // Build 13: No JWS available — refresh web directly so Base44 re-fetches /User/me
-                    self.triggerWebRefreshAfterPurchase()
+                    // Build 11: Sync to server for cross-device unlock
+                    if let jws = result.jws {
+                        self.syncCompanionToServer(jws: jws)
+                    } else {
+                        self.triggerWebRefreshAfterPurchase()
+                    }
                 }
+                // If !result.isCompanion: do NOT persist false or clear flag.
+                // The user's existing subscription state is preserved.
             }
 
         case "recheckEntitlements":
@@ -340,23 +359,45 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                        awaitingConfirm ? "true" : "false")
 
                 if awaitingConfirm {
-                    // Build 23: Don't trust StoreKit alone after logout — trigger server check
+                    // Build 23 Fix 14: Don't trust StoreKit alone after logout — trigger server check
                     // which will clear the flag and set the authoritative state.
-                    // First sync token from localStorage to UserDefaults (may not have synced yet
-                    // after login), then try server check. If server check still has no token,
-                    // retry after 2s to give token sync time to complete.
+                    // IMPORTANT: syncTokenToUserDefaults is async (evaluateJavaScript callback).
+                    // We MUST wait for it to complete before calling checkCompanionOnServer(),
+                    // otherwise the server check bails immediately (no token in UserDefaults).
                     os_log(.info, log: Self.log, "[IAP:recheck] Awaiting server confirm — syncing token then triggering server check")
                     self.refreshWebEntitlements(isCompanion: false)
-                    self.syncTokenToUserDefaults()
-                    // Delay slightly to let token sync complete, then check server
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                        self?.checkCompanionOnServer()
-                        // Retry after 2 more seconds in case first attempt had no token yet
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                            guard let self = self else { return }
-                            if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
-                                os_log(.info, log: Self.log, "[IAP:recheck] Flag still set — retrying server check")
-                                self.checkCompanionOnServer()
+                    self.syncTokenToUserDefaults { [weak self] tokenFound in
+                        guard let self = self else { return }
+                        if tokenFound {
+                            os_log(.info, log: Self.log, "[IAP:recheck] Token synced — calling checkCompanionOnServer")
+                            self.checkCompanionOnServer()
+                            // Safety retry: if server check failed/timed out, try once more
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                                guard let self = self else { return }
+                                if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
+                                    os_log(.info, log: Self.log, "[IAP:recheck] Flag still set after 3s — retrying server check")
+                                    self.checkCompanionOnServer()
+                                }
+                            }
+                        } else {
+                            os_log(.info, log: Self.log, "[IAP:recheck] No token found — retrying sync in 2s")
+                            // Token may not be in localStorage yet (login page still loading).
+                            // Retry once after 2s.
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                                guard let self = self else { return }
+                                self.syncTokenToUserDefaults { [weak self] retryFound in
+                                    guard let self = self else { return }
+                                    if retryFound {
+                                        os_log(.info, log: Self.log, "[IAP:recheck] Token found on retry — calling checkCompanionOnServer")
+                                        self.checkCompanionOnServer()
+                                    } else {
+                                        os_log(.info, log: Self.log, "[IAP:recheck] Still no token after retry — clearing awaiting flag to unblock")
+                                        // Clear flag so user isn't stuck in limbo. StoreKit checks will
+                                        // work normally, and next navigation will trigger another check.
+                                        UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+                                        self.refreshNativeDiagUserScript()
+                                    }
+                                }
                             }
                         }
                     }
@@ -497,6 +538,125 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }.resume()
     }
 
+    /// Build 23: Quick reachability check — HEAD request to worker with 3s timeout.
+    /// Returns true if server responds (any status code), false if network error.
+    private func canReachServer() async -> Bool {
+        let workerURL = Self.companionWorkerURL
+        guard !workerURL.contains("YOUR_SUBDOMAIN"),
+              let url = URL(string: "\(workerURL)/check-companion") else {
+            return false
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 3
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            os_log(.info, log: Self.log, "[Reachability] Server responded with %d", statusCode)
+            return statusCode > 0
+        } catch {
+            os_log(.info, log: Self.log, "[Reachability] Server unreachable: %{public}@", error.localizedDescription)
+            return false
+        }
+    }
+
+    /// Build 23: Async version of syncCompanionToServer that waits for the result.
+    /// Returns true if server confirmed (200 OK), false if network error or auth failure.
+    /// Used by Restore flow to ensure server confirmation before claiming success (E14).
+    private func syncCompanionToServerAndWait(jws: String?) async -> Bool {
+        guard let jws = jws else {
+            // No JWS — try a direct server check instead
+            return await checkCompanionOnServerAndWait()
+        }
+
+        guard let authToken = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey),
+              !authToken.isEmpty else {
+            os_log(.info, log: Self.log, "[ServerSync:await] No auth token — cannot verify with server")
+            return false
+        }
+
+        let workerURL = Self.companionWorkerURL
+        guard !workerURL.contains("YOUR_SUBDOMAIN"),
+              let url = URL(string: "\(workerURL)/validate-receipt") else {
+            os_log(.info, log: Self.log, "[ServerSync:await] Worker URL not configured")
+            return false
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 10
+
+        let body: [String: String] = ["jws": jws, "authToken": authToken]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
+            return false
+        }
+        request.httpBody = bodyData
+
+        os_log(.info, log: Self.log, "[ServerSync:await] Posting JWS to Worker...")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if let responseStr = String(data: data, encoding: .utf8) {
+                os_log(.info, log: Self.log, "[ServerSync:await] Response %d: %{public}@", statusCode, responseStr)
+            }
+            DispatchQueue.main.async {
+                self.pushWorkerResponseToJS(endpoint: "/validate-receipt", statusCode: statusCode, error: nil)
+            }
+            return statusCode == 200
+        } catch {
+            os_log(.error, log: Self.log, "[ServerSync:await] Network error: %{public}@", error.localizedDescription)
+            DispatchQueue.main.async {
+                self.pushWorkerResponseToJS(endpoint: "/validate-receipt", statusCode: 0, error: error.localizedDescription)
+            }
+            return false
+        }
+    }
+
+    /// Build 23: Async check-companion that returns true if server says companion.
+    /// Fallback when no JWS is available for restore.
+    private func checkCompanionOnServerAndWait() async -> Bool {
+        guard let authToken = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey),
+              !authToken.isEmpty else {
+            return false
+        }
+
+        let workerURL = Self.companionWorkerURL
+        guard !workerURL.contains("YOUR_SUBDOMAIN"),
+              let url = URL(string: "\(workerURL)/check-companion") else {
+            return false
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return false
+            }
+            let serverIsCompanion = json["isCompanion"] as? Bool ?? false
+            os_log(.info, log: Self.log, "[ServerCheck:await] Status %d, isCompanion=%{public}@", statusCode, serverIsCompanion ? "true" : "false")
+
+            // Clear awaiting flag — server has answered
+            if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
+                UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
+                DispatchQueue.main.async { self.refreshNativeDiagUserScript() }
+            }
+
+            return serverIsCompanion
+        } catch {
+            os_log(.error, log: Self.log, "[ServerCheck:await] Network error: %{public}@", error.localizedDescription)
+            return false
+        }
+    }
+
     /// Forces the WebView to reload so the Base44 React app re-fetches /User/me
     /// and immediately reflects the updated Companion subscription status.
     /// Uses native WKWebView.reloadFromOrigin() (Apple docs: "performs end-to-end
@@ -557,6 +717,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
                 UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
                 os_log(.info, log: Self.log, "[ServerCheck] Cleared aa_awaiting_server_confirm — server responded")
+                // Refresh WKUserScript so subsequent page loads inject correct state
+                DispatchQueue.main.async { self.refreshNativeDiagUserScript() }
             }
 
             DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: nil) }
@@ -697,6 +859,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         UserDefaults.standard.set(true, forKey: Self.awaitingServerConfirmKey)
         os_log(.info, log: Self.log, "[LOGOUT] Set aa_awaiting_server_confirm=true")
 
+        // Build 23: Refresh the WKUserScript so the atDocumentStart injection
+        // uses updated state (isCompanion=false, hasNativeToken=false).
+        // Without this, the script captured at boot still injects the old values
+        // on every new page load — causing __aaIsCompanion=true to leak to /login.
+        refreshNativeDiagUserScript()
+
         logDiagnostics(event: "logout")
     }
 
@@ -719,6 +887,18 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             Task { @MainActor in
                 var awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
                 let alreadyCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+                let hasToken = self.hasTokenInUserDefaults()
+
+                // Build 23: If no auth token, skip persisting NEW StoreKit results (the Apple ID
+                // subscription might belong to a different app account). But still USE the existing
+                // aa_is_companion from UserDefaults — it was verified by a previous session's
+                // StoreKit check and is trustworthy. This prevents cold boot from voiding
+                // subscriptions when the token hasn't been synced from localStorage yet.
+                if !hasToken {
+                    os_log(.info, log: Self.log, "[BOOT] No auth token — using existing UserDefaults state (aa_is_companion=%{public}@), skipping StoreKit persist", alreadyCompanion ? "true" : "false")
+                    self.pushEntitlementCheckToJS(isCompanion: alreadyCompanion, products: [])
+                    return
+                }
 
                 // Stale flag guard: if UserDefaults already says companion, the flag was set
                 // before a purchase/restore happened — clear it so we don't block the boot check.
@@ -751,6 +931,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         guard #available(iOS 15.0, *) else { return }
         AAStoreManager.shared.startTransactionListener { [weak self] isCompanion in
             guard let self = self else { return }
+            // Build 23: No auth token means no logged-in user — ignore transaction updates.
+            if !self.hasTokenInUserDefaults() {
+                os_log(.info, log: Self.log, "[TxnUpdate] No auth token — ignoring StoreKit update (no logged-in user)")
+                return
+            }
             // Build 23: Respect awaiting-server-confirm flag — don't let StoreKit
             // transaction updates leak Apple ID entitlements into a different app account.
             let awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
@@ -781,6 +966,53 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 os_log(.error, log: Self.log, "[DIAG:nativeInject] failed: %{public}@", error.localizedDescription)
             }
         }
+    }
+
+    /// Build 23: Replaces the atDocumentStart WKUserScript with a freshly-built version.
+    /// Must be called after logout (or any state change) so that subsequent page loads
+    /// inject the correct __aaIsCompanion / hasNativeToken values. Without this, the
+    /// script captured at boot keeps injecting stale state on every navigation.
+    private func refreshNativeDiagUserScript() {
+        guard let webView = self.webView else { return }
+        let controller = webView.configuration.userContentController
+
+        // WKUserContentController has no API to remove a specific script,
+        // so we must remove all and re-add them.
+        controller.removeAllUserScripts()
+
+        // Re-add native diagnostics (now with updated state)
+        let nativeDiagScript = WKUserScript(
+            source: buildNativeDiagJS(),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        controller.addUserScript(nativeDiagScript)
+
+        // Re-add IAP bridge
+        let iapBridgeScript = WKUserScript(
+            source: Self.iapBridgeJS,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        controller.addUserScript(iapBridgeScript)
+
+        // Re-add CSS injection
+        let cssScript = WKUserScript(
+            source: Self.cssInjection,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        )
+        controller.addUserScript(cssScript)
+
+        // Re-add main JS patches
+        let jsScript = WKUserScript(
+            source: Self.jsInjection,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        )
+        controller.addUserScript(jsScript)
+
+        os_log(.info, log: Self.log, "[LOGOUT] Refreshed WKUserScripts with updated state (isCompanion will be false)")
     }
 
     deinit {
@@ -839,12 +1071,23 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// Reads auth token from localStorage (via JS evaluation) and saves to UserDefaults.
     /// Called after page load and on foreground resume.
     private func syncTokenToUserDefaults() {
-        guard let webView = self.webView else { return }
+        syncTokenToUserDefaults(completion: nil)
+    }
+
+    /// Syncs auth token from localStorage to UserDefaults.
+    /// The optional completion handler is called on the main thread with `true` if a token
+    /// was found and saved (or already present), `false` otherwise.
+    private func syncTokenToUserDefaults(completion: ((Bool) -> Void)?) {
+        guard let webView = self.webView else {
+            completion?(false)
+            return
+        }
 
         // Guard: skip if page hasn't navigated yet — localStorage throws SecurityError at about:blank
         guard let pageURL = webView.url, pageURL.scheme == "https" else {
             os_log(.info, log: Self.log, "[TokenSync:UP] Skipped — page not yet loaded (url=%{public}@)",
                    webView.url?.absoluteString ?? "nil")
+            completion?(false)
             return
         }
 
@@ -860,7 +1103,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 return null;
             })()
         """) { [weak self] result, error in
-            guard self != nil else { return }
+            guard self != nil else {
+                completion?(false)
+                return
+            }
 
             if let token = result as? String, !token.isEmpty {
                 let existing = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)
@@ -870,8 +1116,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 } else {
                     os_log(.info, log: Self.log, "[TokenSync:UP] UserDefaults already has current token (len=%d)", token.count)
                 }
+                completion?(true)
             } else {
                 os_log(.info, log: Self.log, "[TokenSync:UP] No token found in localStorage")
+                completion?(false)
             }
         }
     }
@@ -1003,10 +1251,21 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
 
         // Re-check IAP entitlements on resume (catches renewals/expirations while backgrounded)
-        // Build 23: Respect awaiting-server-confirm flag on resume too.
+        // Build 23: Respect awaiting-server-confirm flag AND no-token guard on resume too.
         if #available(iOS 15.0, *) {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+                let hasToken = self.hasTokenInUserDefaults()
+
+                // Build 23: No auth token — skip persisting NEW StoreKit results but use existing
+                // UserDefaults state. Token may not be synced from localStorage yet.
+                if !hasToken {
+                    let existingCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+                    os_log(.info, log: Self.log, "[RESUME] No auth token — using existing state (aa_is_companion=%{public}@), skipping StoreKit persist", existingCompanion ? "true" : "false")
+                    self.pushEntitlementCheckToJS(isCompanion: existingCompanion, products: [])
+                    return
+                }
+
                 let awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
                 let (isCompanion, activeProducts) = await AAStoreManager.shared.checkEntitlements()
                 if awaitingConfirm {
@@ -1293,8 +1552,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
         let isCompanionRaw = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
         let awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
-        // Build 23: If awaiting server confirm (post-logout), report false regardless of
-        // UserDefaults to prevent Apple ID entitlements from leaking into a new account.
+        // Build 23: Report false if awaiting server confirm (post-logout).
+        // NOTE: We trust isCompanionRaw from UserDefaults even without a token, because it was
+        // already verified by a previous StoreKit check. The no-token guard only prevents NEW
+        // StoreKit results from persisting — it should NOT override already-persisted state.
+        // (Removing the !hasNativeToken guard here fixes cold boot voiding subscriptions when
+        // the token hasn't been synced from localStorage to UserDefaults yet.)
         let isCompanion = awaitingConfirm ? false : isCompanionRaw
 
         return """
@@ -1838,9 +2101,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             // Build 21: Dismiss the paywall popup immediately after confirmed restore
             dismissPaywallOverlay();
           } else if (status === 'success' && !result.isCompanion) {
-            showAAToast('No active subscription found.', 'info');
+            showAAToast(result.message || 'No active subscription found.', 'info');
           } else if (status === 'error') {
             showAAToast(result.message || 'Restore failed. Please try again.', 'error');
+          } else if (status === 'info') {
+            showAAToast(result.message || 'Unable to restore right now.', 'info');
           }
         } else if (action === 'buy') {
           if (status === 'success' && result.isCompanion) {
@@ -3008,13 +3273,33 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
           if (isRestore) {
             btn.setAttribute('data-aa-iap-wired', 'restore');
+            var origRestoreText = btn.textContent;
             btn.addEventListener('click', function(e) {
               e.preventDefault();
               e.stopPropagation();
+              if (btn.disabled) return;
+              btn.disabled = true;
+              btn.textContent = 'Restoring...';
+              // Listen for result to reset button
+              window.addEventListener('aa:iap', function onResult(ev) {
+                window.removeEventListener('aa:iap', onResult);
+                btn.disabled = false;
+                btn.textContent = origRestoreText;
+              }, { once: true });
+              // Timeout fallback
+              setTimeout(function() {
+                if (btn.disabled) {
+                  btn.disabled = false;
+                  btn.textContent = origRestoreText;
+                }
+              }, 15000);
               if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
                 window.webkit.messageHandlers.aaPurchase.postMessage({
                   action: 'restore'
                 });
+              } else {
+                btn.disabled = false;
+                btn.textContent = origRestoreText;
               }
             });
           }

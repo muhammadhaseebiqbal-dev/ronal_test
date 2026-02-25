@@ -216,6 +216,12 @@ These features require an active Companion subscription. "Companion adds a perso
 
 ## Last Change Log
 
+**2026-02-25 — Raouf: Build 23, Fix 14 — Logout→login token sync race condition**
+- **Bug**: Logging out and back into the same account voids the subscription. The `recheckEntitlements` handler (triggered on login transition) called `syncTokenToUserDefaults()` fire-and-forget, then waited 1s before calling `checkCompanionOnServer()`. But `syncTokenToUserDefaults()` is async (evaluateJavaScript callback) and the 1s delay was not guaranteed to be enough. If the token hadn't synced to UserDefaults, `checkCompanionOnServer()` bailed at its guard → `aa_awaiting_server_confirm` flag was never cleared → subscription stuck at false.
+- **Fix**: Added `completion: ((Bool) -> Void)?` callback to `syncTokenToUserDefaults()`. The `recheckEntitlements` awaiting path now waits for the callback before calling `checkCompanionOnServer()` — eliminates the race entirely. Includes retry logic: if token not found (login page still loading), retries sync after 2s; if still not found, clears the awaiting flag to avoid stuck state.
+- Files changed: `PatchedBridgeViewController.swift`, `CHANGELOG.md`, `AGENT.md`
+- Verification: lint ✅, test 42/42 ✅, build ✅, cap sync ✅, xcodebuild (no-sign) ✅ BUILD SUCCEEDED — 0 warnings
+
 **2026-02-24 — Raouf: Build 22 — Fix Subscription State Lost After Logout + Login**
 - **Bug**: After logout and re-login, subscription state is lost — user has to manually tap Restore. Subscription works fine until logout, then disappears after login.
 - **Root cause**: `performFullLogout()` clears `aa_is_companion` from UserDefaults. On login page reload, WKUserScript reads `UserDefaults.bool(forKey: companionDefaultsKey)` → `false` → sets `window.__aaIsCompanion = false`. After login, SPA navigates to dashboard but nothing re-checks StoreKit entitlements. `viewDidLoad()` only runs once on cold boot. `handleWillEnterForeground()` only fires on app resume from background. So `window.__aaIsCompanion` stays `false` indefinitely.

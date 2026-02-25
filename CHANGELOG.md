@@ -46,6 +46,42 @@ Three-part fix:
 - `handleWillEnterForeground()` entitlement recheck — coming back from background would re-check StoreKit and persist the result unconditionally
 Both now check the flag and skip persisting / push `isCompanion: false` to JS when the flag is set. All 8 `persistCompanionState()` call sites are now flag-safe.
 
+**Fix 9 — White screen on cold boot (StoreKit persists without logged-in user):** When no user is logged in (no auth token in UserDefaults), StoreKit still reports `aa_is_companion=true` based on the Apple ID's subscription. This caused `__aaIsCompanion=true` to be injected into JS while Base44 returned 403 "must be logged in", creating a contradiction that left the app on a white screen.
+- **`viewDidLoad()` StoreKit check**: Added no-token guard — if no auth token, skip StoreKit persist entirely and push `isCompanion: false` to JS
+- **`handleWillEnterForeground()` resume check**: Same no-token guard — no auth token means no user context for StoreKit results
+- **`startIAPTransactionListener()` callback**: Same no-token guard — ignore StoreKit transaction updates when no user is logged in
+- **`buildNativeDiagJS()`**: If `!hasNativeToken`, force `isCompanion = false` regardless of UserDefaults — prevents stale state injection
+- All four paths now require an auth token before StoreKit entitlements influence app state
+
+**Fix 10 — Stale WKUserScript injects old `__aaIsCompanion` after logout (root cause of cross-account leakage):** The `buildNativeDiagJS()` script is captured as a `WKUserScript` at cold boot and fires at `.atDocumentStart` on every page load. After logout, UserDefaults was cleared but the WKUserScript still contained the old `__aaIsCompanion = true` from boot time — so when the WebView navigated to `/login`, it injected stale companion state into the new page context. Added `refreshNativeDiagUserScript()` that removes all user scripts and re-adds them with fresh state. Called from `performFullLogout()` after clearing UserDefaults and from `checkCompanionOnServer()` when the awaiting flag is cleared (so subsequent page loads get the server-confirmed state).
+
+**Fix 11 — Cold boot voids subscription (no-token guard too aggressive):** The Fix 9 no-token guards in `buildNativeDiagJS()`, `viewDidLoad()`, and foreground resume all forced `isCompanion=false` when no auth token was in UserDefaults. But the token is synced from localStorage→UserDefaults asynchronously — on cold boot it may not have synced yet. This caused the existing `aa_is_companion=true` (already verified by a previous StoreKit check) to be overridden with false, voiding the subscription on every cold boot.
+- **`buildNativeDiagJS()`**: Removed `!hasNativeToken` condition — now only the `awaitingConfirm` flag forces false. The `aa_is_companion` value in UserDefaults was already verified by a previous StoreKit check and is trustworthy.
+- **`viewDidLoad()` no-token path**: Instead of pushing `isCompanion: false`, now pushes `alreadyCompanion` (the existing UserDefaults value). Skips persisting NEW StoreKit results but preserves existing state.
+- **Foreground resume no-token path**: Same fix — uses existing `aa_is_companion` from UserDefaults instead of forcing false.
+- **Transaction listener**: Keeps the no-token guard (correct — transaction updates without a user context should be ignored silently).
+- **Key insight**: The no-token guard should prevent persisting NEW StoreKit results (cross-account protection), not override ALREADY-PERSISTED state (breaks cold boot). After logout, `aa_is_companion` is cleared in UserDefaults, so the existing value is already `false` — no conflict.
+
+**Fix 12 — Restore shows fake "confirmed" in airplane mode (E14):** `restorePurchases()` checks StoreKit's `Transaction.currentEntitlements` first — this is a local cache that works offline. In airplane mode, it found the Apple ID's cached subscription and immediately returned "Subscription restored! Companion unlocked." without ever contacting the server. This violated E14 (Base44 `is_companion` is source of truth).
+- Restore flow now checks **network reachability first** via `canReachServer()` — a HEAD request to the Worker with 3s timeout.
+- **Offline:** Immediately shows "Please connect to the internet to restore your subscription." — does NOT touch StoreKit or persist state.
+- **Online:** Proceeds with restore as before (StoreKit check + server sync + toast).
+- This is simpler and faster than the previous approach (which awaited server confirmation inline, causing the button to hang for 10+ seconds on slow connections and breaking the Settings page).
+- JS toast handler now uses custom message from native when available (falls back to default).
+
+**Fix 13 — Restore Purchases voids existing subscription:** The restore handler unconditionally called `persistCompanionState(result.isCompanion)` and `UserDefaults.set(false, forKey: awaitingServerConfirmKey)` regardless of the restore result. When `restorePurchases()` returned `isCompanion: false` (different Apple ID, expired, etc.), this wrote `false` over the existing `true` — voiding the subscription. Also, the offline path sent `isCompanion: false` in the JS payload, causing `updateSubscriptionStatusUI(false)` to flip the Settings UI to "Free".
+- **Restore success (`isCompanion: true`):** Clear awaiting flag, persist true, refresh UI, sync to server (unchanged behavior).
+- **Restore found nothing (`isCompanion: false`):** Do NOT persist, do NOT clear awaiting flag. Existing subscription state preserved.
+- **Offline path:** Sends `status: 'info'` WITHOUT `isCompanion` field — JS handler shows toast but does NOT call `updateSubscriptionStatusUI()` (the `result.isCompanion !== undefined` guard skips it).
+- Added `status: 'info'` handler in JS `__aaPurchaseResult` for offline restore toast.
+
+**Fix 14 — Logout→login voids subscription (token sync race condition):** The `recheckEntitlements` handler (triggered after login transition) called `syncTokenToUserDefaults()` fire-and-forget, then used `DispatchQueue.main.asyncAfter(deadline: .now() + 1.0)` to call `checkCompanionOnServer()`. But `syncTokenToUserDefaults()` is async (evaluateJavaScript callback) — the 1s delay was a guess, not a guarantee the token had been saved to UserDefaults. If the token wasn't there yet, `checkCompanionOnServer()` bailed at its token guard → the `aa_awaiting_server_confirm` flag was never cleared → subscription stayed at false.
+- Added `completion` callback parameter to `syncTokenToUserDefaults()` — original no-arg version still works (calls with `nil` completion)
+- `recheckEntitlements` awaiting path now uses the callback: waits for token sync to confirm success, THEN calls `checkCompanionOnServer()`
+- If token found: immediate server check + 3s safety retry if flag still set
+- If token not found (login page still loading): 2s delay, retry sync, if found then server check, if still not found then clear flag to avoid stuck state
+- Eliminates the race condition entirely — no more arbitrary timing delays
+
 **Code hygiene fixes (5):**
 1. Added `webView?.removeObserver(self, forKeyPath: "URL")` to `deinit` — was missing KVO cleanup
 2. `AppStore.sync()` failure now returns `"error"` status with message instead of misleading `"success"` with `isCompanion: false` — user sees proper error toast instead of "No subscription found"
