@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-27 — Raouf: Full IAP Flow Audit (Purchase + Restore + Worker End-to-End Trace)
+
+**Traced complete IAP purchase, restore, and Worker validation flows end-to-end. Found 2 significant gaps, fixed both.**
+
+**Purchase flow traced (button tap → unlock):**
+1. User taps Subscribe Monthly → `aaPurchase` handler → `AAStoreManager.shared.purchase()`
+2. StoreKit 2 `product.purchase()` → Apple sheet → `.success(.verified(tx))` → `tx.finish()`
+3. JWS extracted from `result.jwsRepresentation`
+4. `persistCompanionState(true)` + `refreshWebEntitlements(isCompanion: true)` for immediate UI
+5. `syncTokenToUserDefaults` → `syncCompanionToServer(jws:)` → Worker `POST /validate-receipt`
+6. Worker verifies x5c chain → validates payload → `PATCH /entities/Users/{id}` → `is_companion: true`
+7. `triggerWebRefreshAfterPurchase()` → `reloadFromOrigin()` → Base44 re-fetches `/User/me`
+
+**Restore flow traced (button tap → result):**
+1. User taps Restore Purchases → `aaRestorePurchases` handler
+2. `AppStore.sync()` → `AAStoreManager.shared.checkEntitlements()` → `Transaction.currentEntitlement(for:)`
+3. Found verified → JWS extracted → toast "Subscription restored!" → sync to server
+4. Not found → toast "No active subscription found"
+
+**Worker validation traced (request → Base44 update):**
+- x5c chain: extract → parse → fingerprint root → verify chain signatures → check OIDs → import leaf key → verify JWS signature
+- Payload: decode → check environment=Production → check bundleId → check productId in allowlist → check not revoked → check not expired
+- Base44: `GET /entities/Users?filter[0]` by auth token subject → `PATCH /entities/Users/{id}` with companion fields
+- **No runtime failures found** — all field names, cert chain steps, CORS, environment checks match Apple's specs
+
+**Issue 1 (SIGNIFICANT) — Ask to Buy / background transaction updates never sync JWS to server:**
+- `startTransactionListener` listened for `Transaction.updates` (Ask to Buy approvals, renewals, refunds) but the callback was `(Bool) -> Void` — no JWS passed
+- Result: Ask to Buy approved → local `aa_is_companion = true` → but Base44 server never updated → `is_companion` stays `false` on server → web gating broken
+- **Fix:** Changed callback to `(Bool, String?) -> Void`, pass `result.jwsRepresentation`, and call `syncCompanionToServer(jws:)` when companion is true
+
+**Issue 2 (Important) — Early purchase within first 3s may miss auth token for server sync:**
+- `syncTokenToUserDefaults` happens on a 3s periodic timer after navigation. If user purchases before first sync, `syncCompanionToServer` has no token → fire-and-forget silently fails
+- **Fix:** Added explicit `syncTokenToUserDefaults` call immediately before `syncCompanionToServer` in both purchase and restore flows
+
+- **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+---
+
 ### 2026-02-27 — Raouf: Subscription Flow Audit (Leakage, Logout→Login, Cold Boot)
 
 **Full audit of 3 subscription scenarios — 2 iOS fixes applied.**

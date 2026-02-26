@@ -33,17 +33,19 @@ final class AAStoreManager {
 
     /// Starts listening for transaction updates (renewals, refunds, revocations).
     /// The callback is invoked on the main actor with the updated companion state.
-    func startTransactionListener(onUpdate: @escaping (Bool) -> Void) {
+    func startTransactionListener(onUpdate: @escaping (Bool, String?) -> Void) {
         transactionListener?.cancel()
         transactionListener = Task(priority: .background) {
             for await result in Transaction.updates {
                 if case .verified(let transaction) = result {
                     await transaction.finish()
-                    os_log(.info, log: Self.log, "[TxnUpdate] productId=%{public}@ revoked=%{public}@",
+                    let jwsString = result.jwsRepresentation
+                    os_log(.info, log: Self.log, "[TxnUpdate] productId=%{public}@ revoked=%{public}@ hasJWS=%{public}@",
                            transaction.productID,
-                           transaction.revocationDate != nil ? "YES" : "NO")
+                           transaction.revocationDate != nil ? "YES" : "NO",
+                           jwsString.isEmpty ? "false" : "true")
                     let (isCompanion, _) = await self.checkEntitlements()
-                    await MainActor.run { onUpdate(isCompanion) }
+                    await MainActor.run { onUpdate(isCompanion, jwsString.isEmpty ? nil : jwsString) }
                 }
             }
         }
@@ -296,8 +298,15 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                     self.refreshWebEntitlements(isCompanion: result.isCompanion)
 
                     // Build 11: Sync to server for cross-device unlock
+                    // Build 25 audit fix: Ensure token is synced from localStorage → UserDefaults
+                    // BEFORE calling syncCompanionToServer. If the user purchases within the first
+                    // 3s of page load, the delayed token sync may not have fired yet, causing
+                    // syncCompanionToServer to silently skip (no token → no server update).
                     if let jws = result.jws {
-                        self.syncCompanionToServer(jws: jws)
+                        self.syncTokenToUserDefaults { [weak self] _ in
+                            guard let self = self else { return }
+                            self.syncCompanionToServer(jws: jws)
+                        }
                         // Web refresh happens inside syncCompanionToServer on 200 OK
                     } else {
                         // Build 13: No JWS available — refresh web directly so Base44 re-fetches /User/me
@@ -350,8 +359,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                     self.refreshWebEntitlements(isCompanion: true)
 
                     // Build 11: Sync to server for cross-device unlock
+                    // Build 25 audit fix: Ensure token synced before server call (same as purchase)
                     if let jws = result.jws {
-                        self.syncCompanionToServer(jws: jws)
+                        self.syncTokenToUserDefaults { [weak self] _ in
+                            guard let self = self else { return }
+                            self.syncCompanionToServer(jws: jws)
+                        }
                     } else {
                         self.triggerWebRefreshAfterPurchase()
                     }
@@ -1110,7 +1123,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// Updates entitlement state and notifies web when changes occur.
     private func startIAPTransactionListener() {
         guard #available(iOS 15.0, *) else { return }
-        AAStoreManager.shared.startTransactionListener { [weak self] isCompanion in
+        AAStoreManager.shared.startTransactionListener { [weak self] isCompanion, jws in
             guard let self = self else { return }
             // Build 23: No auth token means no logged-in user — ignore transaction updates.
             if !self.hasTokenInUserDefaults() {
@@ -1131,6 +1144,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 "isCompanion": isCompanion,
                 "source": "transactionUpdate"
             ])
+            // Build 25 audit fix: Sync JWS to server for transaction updates
+            // (Ask to Buy approvals, renewals, etc.) — previously the listener
+            // did not capture the JWS, so Base44 was never updated for these events.
+            if isCompanion, let jws = jws {
+                os_log(.info, log: Self.log, "[TxnUpdate] Syncing JWS to server for transaction update")
+                self.syncCompanionToServer(jws: jws)
+            }
         }
     }
 

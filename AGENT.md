@@ -216,11 +216,12 @@ These features require an active Companion subscription. "Companion adds a perso
 
 ## Last Change Log
 
-**2026-02-27 — Raouf: Subscription flow audit (leakage, logout→login, cold boot) + iOS fixes**
-- **Scope:** Full audit of 3 subscription scenarios: cross-account leakage, logout→login subscription loss, cold boot persistence.
-- **Scenario 1 (cross-account leakage):** SAFE — server-first check correctly prevents Account B from inheriting Account A's subscription. Fixed 2 edges: (A) removed temporary UI flash of companion status to wrong account (line 428), (B) double token-sync failure now persists `false` instead of StoreKit result (lines 443-448 — was the last remaining leakage path).
-- **Scenario 2 (logout→login same account):** SAFE — subscription restores automatically via server-first check (`checkCompanionOnServerAndWait` returns `true` for same account). No manual Restore needed.
-- **Scenario 3 (cold boot):** SAFE — `aa_is_companion` persists in UserDefaults, token restored from UserDefaults to localStorage, StoreKit confirms on boot, server confirms in parallel.
+**2026-02-27 — Raouf: Full IAP flow audit + 3 iOS fixes**
+- **Scope:** End-to-end IAP flow audit (purchase + restore + Worker validation), plus 3 subscription scenario audit (leakage, logout→login, cold boot).
+- **IAP flow audit fix 1 (Ask to Buy gap):** Transaction listener (`Transaction.updates`) now captures JWS and syncs to server. Previously, Ask to Buy approvals and background renewals were never posted to the Worker — Base44 backend was never updated for these events.
+- **IAP flow audit fix 2 (early purchase token):** Purchase and restore flows now call `syncTokenToUserDefaults` before `syncCompanionToServer`. If user purchased within first 3s of page load, the token may not have been in UserDefaults yet, causing the server sync to silently skip.
+- **Subscription audit fixes (from earlier):** (A) removed UI flash to wrong account (line 428), (B) token-sync failure now persists `false` (lines 443-448).
+- **Worker confirmed correct:** All field names, cert chain steps, CORS, environment checks verified against Apple's official specs. No runtime failures found.
 - **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
 - **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
 
@@ -573,6 +574,17 @@ These features require an active Companion subscription. "Companion adds a perso
   - `CHANGELOG.md` — Updated entry
 - **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release (no-sign) ✅ BUILD SUCCEEDED
 - **Follow-ups:** Roland must deploy Worker via `cd worker/companion-validator && wrangler deploy`. Proof video before any new TestFlight build.
+
+**Raouf:**
+- **Date:** 2026-02-27 (Australia/Sydney)
+- **Scope:** Full IAP flow audit + iOS fixes
+- **Summary:** Traced complete purchase and restore flows end-to-end (button tap → StoreKit → Worker → Base44 → web refresh). Found 2 additional issues: (1) Transaction listener (`Transaction.updates`) did not capture JWS or sync to server — Ask to Buy approvals and background renewals never updated Base44 backend. Fixed by passing JWS through callback and calling `syncCompanionToServer`. (2) Early purchase (within 3s of page load) could miss token in UserDefaults, causing `syncCompanionToServer` to silently skip. Fixed by calling `syncTokenToUserDefaults` before server sync in both purchase and restore flows. Worker validation confirmed correct (field names, cert chain, CORS, environment checks).
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Transaction listener now passes JWS + syncs to server; purchase/restore flows sync token before server call
+  - `AGENT.md` — Updated Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — Updated entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release (no-sign) ✅ BUILD SUCCEEDED
+- **Follow-ups:** Roland must deploy Worker. Proof video before TestFlight build.
 
 **Raouf:**
 - **Date:** 2026-02-24 (Australia/Sydney)
