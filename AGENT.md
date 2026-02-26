@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone B — App Store submission preparation (Build 25)
+**Current Phase:** Milestone B — App Store submission preparation (Build 25, Worker x5c rewrite + monthly-only)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -215,6 +215,27 @@ These features require an active Companion subscription. "Companion adds a perso
 ---
 
 ## Last Change Log
+
+**2026-02-27 — Raouf: Subscription flow audit (leakage, logout→login, cold boot) + iOS fixes**
+- **Scope:** Full audit of 3 subscription scenarios: cross-account leakage, logout→login subscription loss, cold boot persistence.
+- **Scenario 1 (cross-account leakage):** SAFE — server-first check correctly prevents Account B from inheriting Account A's subscription. Fixed 2 edges: (A) removed temporary UI flash of companion status to wrong account (line 428), (B) double token-sync failure now persists `false` instead of StoreKit result (lines 443-448 — was the last remaining leakage path).
+- **Scenario 2 (logout→login same account):** SAFE — subscription restores automatically via server-first check (`checkCompanionOnServerAndWait` returns `true` for same account). No manual Restore needed.
+- **Scenario 3 (cold boot):** SAFE — `aa_is_companion` persists in UserDefaults, token restored from UserDefaults to localStorage, StoreKit confirms on boot, server confirms in parallel.
+- **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+**2026-02-27 — Raouf: Worker security audit + x5c rewrite + monthly-only**
+- **Scope:** (1) Rewrite JWS verification from incorrect JWKS/kid to x5c certificate chain. (2) Remove yearly product ID. (3) Full security audit — 5 issues found and fixed.
+- **Critical fix (x5c):** Old Worker used JWKS/`kid` matching, but StoreKit 2 on-device JWS uses `x5c` certificate chain. Old code would have failed with "JWS header missing kid". Rewrote to proper x5c chain validation matching Apple's `@apple/app-store-server-library`.
+- **Audit fix 1 (CRITICAL — Sandbox bypass):** Added environment check — only `Production` JWS accepted. Previously Sandbox JWS (valid Apple signatures) could grant production `is_companion: true`.
+- **Audit fix 2 (CRITICAL — CORS):** CORS origin reflection replaced with allowlist (`abideandanchor.app`, `capacitor://localhost`, `localhost` dev). Previously any website could make credentialed cross-origin requests.
+- **Audit fix 3 (expiresDate guard):** `expiresDate === 0` no longer bypasses expiry check. Now rejects missing/zero/NaN expiry dates for subscription products.
+- **Audit fix 4 (OID structural check):** OID verification now checks `tag(0x06) + length + value` triple instead of raw byte scan. Prevents theoretical false positives from coincidental byte sequences.
+- **Audit fix 5 (hash derivation):** JWS signature hash now derived from leaf curve (`P-256 → SHA-256`, `P-384 → SHA-384`) instead of hardcoded `SHA-256`.
+- **Monthly-only:** `COMPANION_PRODUCT_IDS` = monthly only.
+- **Files changed:** `worker/companion-validator/index.js`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:** Roland must deploy Worker via `cd worker/companion-validator && wrangler deploy`. Proof video before any new TestFlight build.
 
 **2026-02-26 — Raouf: Build 25 — Fix account leakage (server-first entitlement check)**
 - **Scope:** Fix account leakage introduced by Build 24's approach of keeping `aa_is_companion` across logout.
@@ -540,6 +561,18 @@ These features require an active Companion subscription. "Companion adds a perso
 - Verification: lint ✅ test ✅ (42/42) build ✅
 
 ## Update Log
+
+**Raouf:**
+- **Date:** 2026-02-27 (Australia/Sydney)
+- **Scope:** Subscription flow audit (leakage, logout→login, cold boot) + Worker security audit + x5c rewrite
+- **Summary:** (1) Subscription flow audit: traced 3 scenarios end-to-end — cross-account leakage (SAFE, fixed 2 edges), logout→login same account (SAFE, restores automatically), cold boot persistence (SAFE). Fixed: removed temporary companion UI flash to wrong account (line 428), double token-sync failure now persists `false` not StoreKit (lines 443-448). (2) Worker x5c rewrite from broken JWKS/kid. (3) Worker security audit: 5 fixes (Sandbox bypass, CORS allowlist, expiresDate guard, OID structural check, curve-derived hash).
+- **Files Changed:**
+  - `ios/App/App/PatchedBridgeViewController.swift` — MODIFIED: Fixed UI flash on cross-account login (line 428), fixed token-sync failure leakage path (lines 443-448)
+  - `worker/companion-validator/index.js` — REWRITTEN: x5c verification, CORS allowlist, environment check, expiry guard, OID structural check, curve-derived hash
+  - `AGENT.md` — Updated Last Change Log, this Update Log entry
+  - `CHANGELOG.md` — Updated entry
+- **Verification:** npm run lint ✅, npm run test 42/42 ✅, npm run build ✅, npx cap sync ios ✅, xcodebuild Release (no-sign) ✅ BUILD SUCCEEDED
+- **Follow-ups:** Roland must deploy Worker via `cd worker/companion-validator && wrangler deploy`. Proof video before any new TestFlight build.
 
 **Raouf:**
 - **Date:** 2026-02-24 (Australia/Sydney)

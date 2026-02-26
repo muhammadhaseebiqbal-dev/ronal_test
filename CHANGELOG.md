@@ -4,6 +4,95 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-27 — Raouf: Subscription Flow Audit (Leakage, Logout→Login, Cold Boot)
+
+**Full audit of 3 subscription scenarios — 2 iOS fixes applied.**
+
+**Scenario 1 — Cross-account leakage (Account A subscribes, Account B logs in, same Apple ID):**
+- **Verdict: SAFE.** Server-first check (`performServerFirstEntitlementCheck`) correctly prevents Account B from inheriting Account A's subscription. `checkCompanionOnServerAndWait()` returns `false` for Account B → `persistCompanionState(false)`.
+- **Fix A (line 428):** Removed `refreshWebEntitlements(isCompanion: storeKitIsCompanion)` that caused a temporary 1-5s companion UI flash to the wrong account while waiting for server response. StoreKit result is Apple ID-scoped, not account-scoped.
+- **Fix B (lines 443-448):** Double token-sync failure (both initial + 2s retry fail) previously fell back to `persistCompanionState(storeKitIsCompanion)` — persisting `true` locally for the wrong account. **This was the last remaining leakage path.** Now persists `false` on token failure. User can tap Restore Purchases once token syncs.
+
+**Scenario 2 — Sign out → same account sign in (subscription lost?):**
+- **Verdict: SAFE.** Subscription restores automatically. `performFullLogout()` clears `aa_is_companion = false` → login triggers `recheckEntitlements` → `syncTokenToUserDefaults` gets fresh token → `checkCompanionOnServerAndWait()` returns `true` for same account → `persistCompanionState(true)` + `triggerWebRefreshAfterPurchase()`. No manual Restore needed.
+- **Edge:** Worker down (10s timeout) → subscription appears lost until foreground resume (StoreKit check at `handleWillEnterForeground` line 1588 corrects it). Acceptable — network dependency is inherent.
+
+**Scenario 3 — Subscription survives cold boot (force-kill + relaunch):**
+- **Verdict: SAFE.** `aa_is_companion = true` persists in UserDefaults → `buildNativeDiagJS()` injects `window.__aaIsCompanion = true` at `.atDocumentStart` → token restored from UserDefaults to localStorage → StoreKit Task confirms → `checkCompanionOnServer()` confirms in parallel. Zero user interaction needed.
+
+- **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+---
+
+### 2026-02-27 — Raouf: Worker Security Audit + x5c Certificate Chain Rewrite + Monthly-Only
+
+**Roland's Option A — Receipt verification via existing Cloudflare Worker, monthly only for launch.**
+
+**CRITICAL FIX — JWS verification was using wrong method:**
+- Old Worker used `appleid.apple.com/auth/keys` (JWKS) with `kid` matching from the JWS header
+- Apple StoreKit 2 on-device `Transaction.jwsRepresentation` embeds an **x5c certificate chain** (leaf, intermediate, root) in the JWS header — it does NOT include a `kid`
+- The old code would have **failed in production** with "JWS header missing kid"
+- Discovered by cross-referencing Apple's official `@apple/app-store-server-library` source code
+
+**Rewrite — x5c certificate chain verification (matches Apple's official library):**
+- Removed all JWKS/kid code: `fetchAppleJWKS()`, `cachedJWKS`, `APPLE_JWKS_URL`, old `verifyAppleJWS()`
+- Added minimal ASN.1 DER parser (`parseDER`, `parseDERChildren`, `parseDERTime`)
+- Added X.509 certificate parser (`parseCertificate` — extracts tbsBytes, signatureBytes, spkiBytes, notBefore, notAfter)
+- Added certificate chain validator (`validateAppleCertChain`):
+  1. Root cert (x5c[2]) fingerprint verified against Apple Root CA G3 SHA-256: `63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179`
+  2. Chain signatures verified: root self-signed, intermediate signed by root, leaf signed by intermediate
+  3. Certificate date validity checked (60s clock skew tolerance)
+  4. Apple-specific OID verification: leaf must contain `1.2.840.113635.100.6.11.1`, intermediate must contain `1.2.840.113635.100.6.2.1`
+- Added DER ECDSA → IEEE P1363 signature format conversion (Web Crypto requires IEEE format)
+- Added elliptic curve detection from SPKI (P-256 vs P-384)
+- JWS signature verified using leaf certificate's public key (ES256)
+
+**Change — Monthly-only product allowlist:**
+- `COMPANION_PRODUCT_IDS` now contains only `com.abideandanchor.companion.monthly`
+- `POST /validate-receipt` rejects yearly with `400 Unknown product`
+
+**Fix — Apple payload field names:**
+- Uses Apple's canonical `JWSTransactionDecodedPayload` field names: `productId` (not `productID`), `expiresDate` (UNIX ms, not `expirationDate`), `bundleId`
+
+**Verified existing Option A flow (no iOS wrapper changes needed):**
+1. User taps Subscribe Monthly → StoreKit 2 purchase → Apple returns JWS
+2. `syncCompanionToServer(jws:)` POSTs `{ "jws": "<Apple-signed-JWS>", "authToken": "<Base44-bearer-token>" }` to `POST /validate-receipt`
+3. Worker extracts x5c certificate chain from JWS header → validates chain → verifies JWS signature with leaf key
+4. Worker validates: bundleId == `com.abideandanchor.app`, productId in allowlist, not revoked, not expired
+5. Worker calls Base44 API: `PATCH /entities/Users/{id}` with `{ is_companion: true, companion_product_id, companion_expires_at, companion_environment }`
+6. Worker returns `{ isCompanion: true, productId, expiresAt }` (200)
+7. iOS wrapper calls `triggerWebRefreshAfterPurchase()` → `reloadFromOrigin()` → Base44 re-fetches `/User/me` → gating follows `is_companion`
+
+**Security checks:**
+- x5c certificate chain cryptographic verification (Apple Root CA G3 → intermediate → leaf)
+- Apple Root CA G3 fingerprint pinning (SHA-256)
+- Apple-specific OID verification (prevents non-Apple certificates)
+- Certificate date validity checking
+- ES256 JWS signature verification using leaf public key
+- Bundle ID validation (`com.abideandanchor.app`)
+- Product ID allowlist (monthly only)
+- Revocation date rejection
+- Expiry date rejection
+- Base44 auth token required (Bearer)
+- CORS origin allowlist (not open reflection)
+
+**Full security audit — 5 issues found and fixed:**
+
+| # | Issue | Severity | Fix |
+|---|-------|----------|-----|
+| 1 | Sandbox JWS accepted — grants production `is_companion: true` | **Critical** | Added `environment !== 'Production'` rejection before all other checks |
+| 2 | CORS origin reflection — any website gets credentialed access | **Critical** | Replaced open reflection with `ALLOWED_ORIGINS` allowlist (`abideandanchor.app`, `capacitor://localhost`, `localhost` dev) |
+| 3 | `expiresDate === 0` bypasses expiry check (falsy guard) | Important | Now rejects `undefined`, `null`, `0` as missing; also checks `isNaN(expMs)` |
+| 4 | OID check is raw byte scan (potential false positives) | Important | Now checks structural `tag(0x06) + length + value` triple |
+| 5 | `hash: 'SHA-256'` hardcoded independent of leaf curve | Important | Now derives hash from detected curve: `P-256 → SHA-256`, `P-384 → SHA-384` |
+
+- **Files changed:** `worker/companion-validator/index.js`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+- **Deployment:** Roland must run `cd worker/companion-validator && wrangler deploy` to push changes to production
+
+---
+
 ### 2026-02-26 — Raouf: Build 25 — Fix Account Leakage (Server-First Entitlement Check)
 
 **Bug — Account leakage after Build 24 fix:** Build 24 kept `aa_is_companion` across logout to prevent same-account voiding. This introduced a new problem: when Account A has a subscription and Account B logs in on the same device (same Apple ID), the `recheckEntitlements` non-awaiting path trusts StoreKit (which is tied to Apple ID, not Base44 account), syncs the JWS to the server with Account B's auth token, and the Worker sets `is_companion=true` on Account B — free subscription.

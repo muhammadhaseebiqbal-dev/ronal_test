@@ -424,8 +424,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                     // StoreKit result is used ONLY as a local hint for immediate UI while waiting
                     // for the server response, then corrected by the server result.
 
-                    // Show immediate UI hint based on StoreKit (may be corrected by server below)
-                    self.refreshWebEntitlements(isCompanion: storeKitIsCompanion)
+                    // Build 25 audit fix: Do NOT show StoreKit hint while waiting for server.
+                    // StoreKit is tied to Apple ID, not Base44 account — showing its result
+                    // causes a temporary companion UI flash for Account B (different account,
+                    // same Apple ID). Wait for the server to tell us the truth.
+                    // Previous: self.refreshWebEntitlements(isCompanion: storeKitIsCompanion)
 
                     // Sync auth token from localStorage → UserDefaults (needed for server call)
                     self.syncTokenToUserDefaults { [weak self] tokenFound in
@@ -440,12 +443,15 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                                     if retryFound {
                                         self.performServerFirstEntitlementCheck(storeKitProducts: products)
                                     } else {
-                                        // Can't reach server without token — fall back to StoreKit locally
-                                        // but do NOT sync to server (prevents leakage)
-                                        os_log(.info, log: Self.log, "[IAP:recheck] No token after retry — using StoreKit locally only")
-                                        self.persistCompanionState(storeKitIsCompanion)
-                                        self.refreshWebEntitlements(isCompanion: storeKitIsCompanion)
-                                        self.pushEntitlementCheckToJS(isCompanion: storeKitIsCompanion, products: products)
+                                        // Build 25 audit fix: Can't reach server without token.
+                                        // Persist FALSE, not StoreKit result. StoreKit is tied to
+                                        // Apple ID, which may belong to a different Base44 account.
+                                        // Persisting StoreKit=true here was the last leakage path.
+                                        // User can tap "Restore Purchases" to recover once token syncs.
+                                        os_log(.info, log: Self.log, "[IAP:recheck] No token after retry — persisting false (safety)")
+                                        self.persistCompanionState(false)
+                                        self.refreshWebEntitlements(isCompanion: false)
+                                        self.pushEntitlementCheckToJS(isCompanion: false, products: products)
                                     }
                                 }
                             }
