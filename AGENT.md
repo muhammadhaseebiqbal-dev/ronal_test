@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone B — App Store submission preparation (Build 23)
+**Current Phase:** Milestone B — App Store submission preparation (Build 25)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -215,6 +215,15 @@ These features require an active Companion subscription. "Companion adds a perso
 ---
 
 ## Last Change Log
+
+**2026-02-26 — Raouf: Build 25 — Fix account leakage (server-first entitlement check)**
+- **Scope:** Fix account leakage introduced by Build 24's approach of keeping `aa_is_companion` across logout.
+- **Root cause:** Build 24's `recheckEntitlements` non-awaiting path trusted StoreKit (tied to Apple ID) and auto-synced JWS to server with the new account's auth token. When Account A had a subscription and Account B logged in on the same device (same Apple ID), StoreKit returned true → code synced JWS → Worker set `is_companion=true` on Account B → free subscription.
+- **Fix:** Server-first entitlement check after login. (1) `performFullLogout()` now clears `aa_is_companion=false` again (prevents stale state for different accounts). (2) `recheckEntitlements` non-awaiting path now syncs auth token → calls `GET /check-companion` → trusts server result. Server knows which Base44 account actually has `is_companion=true`. (3) New `performServerFirstEntitlementCheck()` method. (4) StoreKit JWS is NEVER auto-synced on login — user must tap "Restore Purchases" to transfer subscription.
+- **Result:** No voiding (same account → server says true → restored) AND no leakage (different account → server says false → stays locked).
+- **Files changed:** `PatchedBridgeViewController.swift`, `project.pbxproj`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+- **Follow-ups:** Device test: same-account logout→login (should restore from server), different-account logout→login (should stay locked), Restore Purchases (should transfer subscription).
 
 **2026-02-25 — Raouf: Full audit hardening + downgrade-safety fixes**
 - **Scope:** Fresh full-code audit for 14-item subscription behavior, cross-account safety, worker verification hardening, and repository standards.

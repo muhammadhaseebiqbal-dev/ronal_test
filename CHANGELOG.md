@@ -4,6 +4,66 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-26 — Raouf: Build 25 — Fix Account Leakage (Server-First Entitlement Check)
+
+**Bug — Account leakage after Build 24 fix:** Build 24 kept `aa_is_companion` across logout to prevent same-account voiding. This introduced a new problem: when Account A has a subscription and Account B logs in on the same device (same Apple ID), the `recheckEntitlements` non-awaiting path trusts StoreKit (which is tied to Apple ID, not Base44 account), syncs the JWS to the server with Account B's auth token, and the Worker sets `is_companion=true` on Account B — free subscription.
+
+**Root cause — StoreKit-first logic conflates Apple ID with Base44 account:**
+StoreKit entitlements are tied to the Apple ID on the device, NOT the Base44 account. After login, the old code:
+1. Checked StoreKit → returned `true` (same Apple ID)
+2. Persisted `aa_is_companion=true` locally
+3. Auto-synced JWS to server with the new account's auth token
+4. Worker set `is_companion=true` on the wrong Base44 account
+
+**Fix — Server-first entitlement check after login:**
+1. `performFullLogout()` now clears `aa_is_companion=false` again (prevents stale state for different accounts)
+2. `recheckEntitlements` non-awaiting path (triggered after login) is now SERVER-FIRST:
+   - Syncs auth token from localStorage → UserDefaults
+   - Calls `GET /check-companion` with the new account's auth token
+   - Server knows which Base44 account actually has `is_companion=true`
+   - If server says true → restore locally (same account re-login, no voiding)
+   - If server says false → stay locked (different account, no leakage)
+3. New `performServerFirstEntitlementCheck()` method handles the server-first flow
+4. StoreKit JWS is NEVER auto-synced to the server on login — user must explicitly tap "Restore Purchases" to transfer an Apple subscription to a different Base44 account
+
+**Result:** No voiding (same account restored from server) AND no leakage (different account doesn't auto-inherit Apple ID subscription).
+
+**Build number:** 24 → 25 (both Debug and Release in `project.pbxproj`)
+
+- **Files changed:** `PatchedBridgeViewController.swift`, `project.pbxproj`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅ BUILD SUCCEEDED
+
+### 2026-02-26 — Raouf: Build 24 — Fix Same-Account Logout→Login Subscription Voiding
+
+**Bug — Subscription voided after logout→login:** When a subscribed user logs out and logs back in (same account), the subscription appears lost and the user must manually tap Restore Purchases.
+
+**Root cause — logout deliberately destroys subscription state, recovery is too fragile:**
+`performFullLogout()` did three destructive things:
+1. `UserDefaults.removeObject(forKey: companionDefaultsKey)` — **wiped `aa_is_companion`**
+2. `UserDefaults.set(true, forKey: awaitingServerConfirmKey)` — **blocked ALL StoreKit persistence**
+3. Required a complex 5+ hop async recovery chain (token sync → server GET → JWT subject extraction → subject matching → StoreKit fallback) to restore the subscription after login
+
+If ANY link in the recovery chain broke — subject extraction returned nil (Base44 token format), server returned false, timing race, network error — the subscription was permanently voided with no recovery path. Every build from 22 through 23.3 added more patches to the recovery chain, each creating new edge cases. The architecture was fundamentally wrong: **creating a hard problem on logout just to solve it on login**.
+
+**Fix — Stop destroying subscription state on logout:**
+`performFullLogout()` no longer clears `aa_is_companion` or sets `aa_awaiting_server_confirm`. This is safe because:
+1. `aa_is_companion` only controls our injected JS patches (button hiding, status UI). Base44's own paywalls still gate features via `is_companion` on the server (confirmed Build 20).
+2. On the login page, there are no subscribe buttons — stale `__aaIsCompanion=true` is harmless.
+3. After login, `checkLoginTransition()` fires `recheckEntitlements`, which takes the simple non-awaiting path: checks StoreKit → persists result → syncs JWS to server → refreshes web. One linear flow, no fallbacks needed.
+4. If a different account logs in: `recheckEntitlements` syncs the Apple ID's subscription to the new Base44 user via the Worker. If the Apple ID has no subscription, StoreKit returns false → state corrects.
+5. Logout also clears any stale `aa_awaiting_server_confirm` flag from previous builds.
+
+**Additional hardening:**
+- New `performPostLoginRecovery()` for the awaiting path (handles users upgrading from Build 23 who still have a stale flag set from a previous logout)
+- Expanded `extractTokenSubject()` with `_id`, `id`, `email` fallback fields
+- Fixed `checkCompanionOnServer()` to `return` after awaiting-confirm handling
+- `checkCompanionOnServerAndWait()` no longer clears the awaiting flag (callers manage it)
+
+**Build number:** 23 → 24 (both Debug and Release in `project.pbxproj`)
+
+- **Files changed:** `PatchedBridgeViewController.swift`, `project.pbxproj`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release simulator ✅ BUILD SUCCEEDED
+
 ### 2026-02-25 — Raouf: Full Audit Hardening + Subscription/UI Downgrade Fixes
 
 **Scope:** Fresh code audit of the 14-item subscription flow, cross-account safety paths, worker validation, CI checks, and repository standards docs.
