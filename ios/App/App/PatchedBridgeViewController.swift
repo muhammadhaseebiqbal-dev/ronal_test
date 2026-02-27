@@ -220,6 +220,13 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// confirmation fails after logout -> login (same account only).
     private static let lastLogoutTokenSubjectKey = "aa_last_logout_sub"
 
+    /// Build 27: User-namespaced entitlement cache keys.
+    /// Instead of a device-global `aa_is_companion` boolean, entitlement state is stored
+    /// per-user as `aa_companion_{userId}`. This prevents logout from wiping entitlement
+    /// detection and eliminates cross-account leakage.
+    private static let activeUserIdKey = "aa_active_user_id"
+    private static let companionKeyPrefix = "aa_companion_"
+
     /// Cloudflare Worker URL for cross-device Companion validation (Build 11).
     /// Deployed by Roland — 2026-02-18.
     private static let companionWorkerURL = "https://companion-validator.abideandanchor.workers.dev"
@@ -277,6 +284,19 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 return
             }
             Task { @MainActor in
+                // Build 27: Check network reachability before purchase.
+                // Prevents showing Apple purchase sheet when offline — the sheet
+                // would appear and then fail, confusing the user.
+                let isOnline = await self.canReachServer()
+                if !isOnline {
+                    os_log(.info, log: Self.log, "[IAP:buy] Offline — blocking purchase attempt")
+                    self.sendPurchaseResult([
+                        "status": "error",
+                        "action": "buy",
+                        "message": "Please connect to the internet to subscribe."
+                    ])
+                    return
+                }
                 let result = await AAStoreManager.shared.purchase(productId: productId)
                 var payload: [String: Any] = ["status": result.status, "action": "buy"]
                 if let pid = result.productId { payload["productId"] = pid }
@@ -334,143 +354,131 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 }
 
                 let result = await AAStoreManager.shared.restorePurchases()
-                var payload: [String: Any] = [
-                    "status": result.status,
-                    "action": "restore"
-                ]
-                // Only include isCompanion when restore confirms an active subscription.
-                // This avoids false UI downgrades when "nothing to restore" is returned.
-                if result.isCompanion {
-                    payload["isCompanion"] = true
+
+                if !result.isCompanion {
+                    // StoreKit found nothing — send result directly (no server check needed)
+                    var payload: [String: Any] = [
+                        "status": result.status,
+                        "action": "restore"
+                    ]
+                    if let msg = result.message { payload["message"] = msg }
+                    self.sendPurchaseResult(payload)
+                    // Do NOT persist false or clear flag — preserve existing state.
+                    return
                 }
-                if !result.restoredProducts.isEmpty {
-                    payload["productId"] = result.restoredProducts.first ?? ""
-                }
-                if let msg = result.message { payload["message"] = msg }
 
-                self.sendPurchaseResult(payload)
+                // StoreKit found an active subscription on this Apple ID.
+                // Build 27 FIX: Do NOT send isCompanion:true to JS yet — must verify
+                // this subscription belongs to the current Base44 account first.
+                // Otherwise JS calls updateSubscriptionStatusUI(true) immediately.
+                self.clearAwaitingServerConfirmState(reason: "restore-storekit-active")
 
-                if result.isCompanion {
-                    // Build 23: Only clear flag + persist when restore finds an active subscription.
-                    // Prevents voiding an existing subscription when restore returns false
-                    // (e.g. different Apple ID, expired, etc.)
-                    self.clearAwaitingServerConfirmState(reason: "restore-success")
-                    self.persistCompanionState(true)
-                    self.refreshWebEntitlements(isCompanion: true)
+                // Sync token so we can identify the user + call server
+                self.syncTokenToUserDefaults { [weak self] tokenFound in
+                    guard let self = self else { return }
+                    self.updateActiveUserId()
 
-                    // Build 11: Sync to server for cross-device unlock
-                    // Build 25 audit fix: Ensure token synced before server call (same as purchase)
-                    if let jws = result.jws {
-                        self.syncTokenToUserDefaults { [weak self] _ in
-                            guard let self = self else { return }
-                            self.syncCompanionToServer(jws: jws)
+                    Task { @MainActor in
+                        let serverIsCompanion = await self.checkCompanionOnServerAndWait()
+                        os_log(.info, log: Self.log, "[IAP:restore] StoreKit=true Server=%{public}@",
+                               serverIsCompanion ? "true" : "false")
+
+                        if serverIsCompanion {
+                            // Server confirms this Base44 account is companion — unlock
+                            self.persistCompanionState(true)
+                            self.refreshWebEntitlements(isCompanion: true)
+                            self.sendPurchaseResult([
+                                "status": "success",
+                                "action": "restore",
+                                "isCompanion": true
+                            ])
+                            self.triggerWebRefreshAfterPurchase()
+                        } else {
+                            // Server says no. Check namespaced cache — same user re-linking?
+                            let cached = self.readCompanionStateForCurrentUser()
+                            if cached.isCompanion, cached.userId != nil, let jws = result.jws {
+                                os_log(.info, log: Self.log, "[IAP:restore] Cache hit for same user — syncing JWS to re-link")
+                                self.persistCompanionState(true)
+                                self.refreshWebEntitlements(isCompanion: true)
+                                self.syncCompanionToServer(jws: jws)
+                                self.sendPurchaseResult([
+                                    "status": "success",
+                                    "action": "restore",
+                                    "isCompanion": true
+                                ])
+                            } else {
+                                // Different account — do NOT transfer the subscription.
+                                os_log(.info, log: Self.log, "[IAP:restore] StoreKit active but server says no — subscription belongs to different account")
+                                self.sendPurchaseResult([
+                                    "status": "info",
+                                    "action": "restore",
+                                    "message": "This subscription is linked to a different account. Please log in with the account that originally purchased the subscription."
+                                ])
+                            }
                         }
-                    } else {
-                        self.triggerWebRefreshAfterPurchase()
                     }
                 }
-                // If !result.isCompanion: do NOT persist false or clear flag.
-                // The user's existing subscription state is preserved.
             }
 
         case "recheckEntitlements":
-            // Build 16: JS-triggered recheck — cross-verify server claim with local StoreKit.
-            // Called when server says not-companion but user was previously companion.
-            // Build 22: Also triggered by checkLoginTransition() after login.
+            // Build 27 FIX: Server-first entitlement resolution with namespaced cache.
+            //
+            // Called by JS checkLoginTransition() after login, or by __aaCheckCompanion.
+            //
+            // Strategy:
+            //   1. Check namespaced cache (instant, same-account re-login)
+            //   2. Sync token → ask server (authoritative for Base44 account)
+            //   3. StoreKit ONLY trusted for same-account (server true OR cache hit)
+            //   4. StoreKit alone does NOT grant companion (prevents cross-account leakage)
             Task { @MainActor in
-                let awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
-                let (storeKitIsCompanion, products) = await AAStoreManager.shared.checkEntitlements()
-                os_log(.info, log: Self.log, "[IAP:recheck] StoreKit isCompanion=%{public}@ products=%{public}@ awaitingConfirm=%{public}@",
-                       storeKitIsCompanion ? "true" : "false", products.joined(separator: ","),
-                       awaitingConfirm ? "true" : "false")
+                // Clear any stale awaiting flag from older builds
+                if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
+                    self.clearAwaitingServerConfirmState(reason: "recheck-cleanup")
+                }
 
-                if awaitingConfirm {
-                    // Build 24: Simplified post-login recovery. Previous approach was fragile:
-                    // sync token → checkCompanionOnServer → resolveAwaitingFallback → subject match.
-                    // Too many async hops, too many failure points (subject extraction, server timing, etc.).
-                    //
-                    // New approach: Check StoreKit directly. If active subscription exists, sync the
-                    // JWS to the server. The Worker uses the Bearer auth token (not Apple ID) to
-                    // identify the Base44 user, so this is safe for ANY account — no subject matching needed.
-                    // If StoreKit is not active, fall back to a server check for cross-device subscriptions.
-                    os_log(.info, log: Self.log, "[IAP:recheck] Awaiting server confirm — direct StoreKit+server recovery")
-                    self.refreshWebEntitlements(isCompanion: false)
-
-                    // Step 1: Sync auth token from localStorage → UserDefaults (needed for server calls)
-                    self.syncTokenToUserDefaults { [weak self] tokenFound in
-                        guard let self = self else { return }
-                        guard tokenFound else {
-                            // Token not in localStorage yet (page may still be loading). Retry once.
-                            os_log(.info, log: Self.log, "[IAP:recheck] No token — retrying sync in 2s")
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                                guard let self = self else { return }
-                                self.syncTokenToUserDefaults { [weak self] retryFound in
-                                    guard let self = self else { return }
-                                    if retryFound {
-                                        self.performPostLoginRecovery()
-                                    } else {
-                                        os_log(.info, log: Self.log, "[IAP:recheck] Still no token — clearing flag")
-                                        self.clearAwaitingServerConfirmState(reason: "token-sync-failed")
-                                    }
-                                }
-                            }
-                            return
-                        }
-                        // Step 2: Token synced — run the recovery
-                        self.performPostLoginRecovery()
+                // Step 1: Sync token first — we need user identity for everything
+                self.syncTokenWithRetries(delays: [1.0, 3.0, 5.0]) { [weak self] tokenFound in
+                    guard let self = self else { return }
+                    guard tokenFound else {
+                        os_log(.info, log: Self.log, "[IAP:recheck] No token — leaving current state for periodic recovery")
+                        return
                     }
-                } else {
-                    // Build 24 fix 2: SERVER-FIRST after login.
-                    //
-                    // Previous approach trusted StoreKit and auto-synced JWS to server.
-                    // Problem: StoreKit is tied to Apple ID, NOT Base44 account. If Account A
-                    // has a subscription and Account B logs in on the same device (same Apple ID),
-                    // StoreKit returns true → code syncs JWS with Account B's auth token →
-                    // Worker sets is_companion=true on Account B → free subscription (LEAKAGE).
-                    //
-                    // New approach: Ask the SERVER first. The server knows which Base44 account
-                    // actually has is_companion=true.
-                    // - Same account re-login: server says true → restore immediately. No voiding.
-                    // - Different account: server says false → stay locked. No leakage.
-                    //   User can explicitly tap "Restore Purchases" to transfer the subscription.
-                    //
-                    // StoreKit result is used ONLY as a local hint for immediate UI while waiting
-                    // for the server response, then corrected by the server result.
+                    self.updateActiveUserId()
 
-                    // Build 25 audit fix: Do NOT show StoreKit hint while waiting for server.
-                    // StoreKit is tied to Apple ID, not Base44 account — showing its result
-                    // causes a temporary companion UI flash for Account B (different account,
-                    // same Apple ID). Wait for the server to tell us the truth.
-                    // Previous: self.refreshWebEntitlements(isCompanion: storeKitIsCompanion)
+                    // Step 2: Check namespaced cache — instant same-account re-login
+                    let cached = self.readCompanionStateForCurrentUser()
+                    if cached.isCompanion, cached.userId != nil {
+                        os_log(.info, log: Self.log, "[IAP:recheck] Namespaced cache hit (userId=%{public}@) — immediate unlock",
+                               cached.userId ?? "?")
+                        self.persistCompanionState(true)
+                        self.refreshWebEntitlements(isCompanion: true)
+                        // Background server confirm
+                        self.checkCompanionOnServer()
+                        return
+                    }
 
-                    // Sync auth token from localStorage → UserDefaults (needed for server call)
-                    self.syncTokenToUserDefaults { [weak self] tokenFound in
-                        guard let self = self else { return }
-                        guard tokenFound else {
-                            // Token not synced yet — retry once after 2s (page may still be loading)
-                            os_log(.info, log: Self.log, "[IAP:recheck] No token — retrying sync in 2s")
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                                guard let self = self else { return }
-                                self.syncTokenToUserDefaults { [weak self] retryFound in
-                                    guard let self = self else { return }
-                                    if retryFound {
-                                        self.performServerFirstEntitlementCheck(storeKitProducts: products)
-                                    } else {
-                                        // Build 25 audit fix: Can't reach server without token.
-                                        // Persist FALSE, not StoreKit result. StoreKit is tied to
-                                        // Apple ID, which may belong to a different Base44 account.
-                                        // Persisting StoreKit=true here was the last leakage path.
-                                        // User can tap "Restore Purchases" to recover once token syncs.
-                                        os_log(.info, log: Self.log, "[IAP:recheck] No token after retry — persisting false (safety)")
-                                        self.persistCompanionState(false)
-                                        self.refreshWebEntitlements(isCompanion: false)
-                                        self.pushEntitlementCheckToJS(isCompanion: false, products: products)
-                                    }
-                                }
-                            }
-                            return
+                    // Step 3: Ask server — authoritative for this Base44 account
+                    Task { @MainActor in
+                        let serverIsCompanion = await self.checkCompanionOnServerAndWait()
+                        let (storeKitIsCompanion, products, _) = await AAStoreManager.shared.checkEntitlementsWithJWS()
+                        os_log(.info, log: Self.log, "[IAP:recheck] Server=%{public}@ StoreKit=%{public}@",
+                               serverIsCompanion ? "true" : "false",
+                               storeKitIsCompanion ? "true" : "false")
+
+                        if serverIsCompanion {
+                            // Server confirms this Base44 account is companion
+                            self.persistCompanionState(true)
+                            self.refreshWebEntitlements(isCompanion: true)
+                            self.pushEntitlementCheckToJS(isCompanion: true, products: products)
+                            self.triggerWebRefreshAfterPurchase()
+                        } else {
+                            // Server says no — do NOT trust StoreKit alone (could be
+                            // different Apple ID's subscription). User must tap
+                            // "Restore Purchases" to link StoreKit to this account.
+                            self.persistCompanionState(false)
+                            self.refreshWebEntitlements(isCompanion: false)
+                            self.pushEntitlementCheckToJS(isCompanion: false, products: products)
                         }
-                        self.performServerFirstEntitlementCheck(storeKitProducts: products)
                     }
                 }
             }
@@ -509,9 +517,85 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     }
 
     /// Persists the Companion subscription state in UserDefaults.
+    /// Build 27: Routes through namespaced storage when activeUserIdKey is available.
+    /// Writes to BOTH `aa_companion_{userId}` AND legacy `aa_is_companion` (write-through
+    /// for existing JS injection via `window.__aaIsCompanion` and `buildNativeDiagJS`).
     private func persistCompanionState(_ isCompanion: Bool) {
-        UserDefaults.standard.set(isCompanion, forKey: Self.companionDefaultsKey)
-        os_log(.info, log: Self.log, "[IAP] Persisted aa_is_companion=%{public}@", isCompanion ? "true" : "false")
+        let defaults = UserDefaults.standard
+        // Always write legacy key (write-through for JS injection compatibility)
+        defaults.set(isCompanion, forKey: Self.companionDefaultsKey)
+
+        // Build 27: Also write to user-namespaced key if we know the active user
+        if let userId = defaults.string(forKey: Self.activeUserIdKey), !userId.isEmpty {
+            let namespacedKey = Self.companionKeyForUser(userId)
+            defaults.set(isCompanion, forKey: namespacedKey)
+            os_log(.info, log: Self.log, "[IAP] Persisted %{public}@=%{public}@ + legacy aa_is_companion=%{public}@",
+                   namespacedKey, isCompanion ? "true" : "false", isCompanion ? "true" : "false")
+        } else {
+            os_log(.info, log: Self.log, "[IAP] Persisted aa_is_companion=%{public}@ (no active userId for namespace)",
+                   isCompanion ? "true" : "false")
+        }
+    }
+
+    // MARK: – Build 27: User-Namespaced Entitlement Helpers
+
+    /// Returns the UserDefaults key for a specific user's companion state.
+    private static func companionKeyForUser(_ userId: String) -> String {
+        return "\(companionKeyPrefix)\(userId)"
+    }
+
+    /// Extracts user ID from the current auth token and saves it as the active user.
+    /// Called after every successful token sync to ensure namespaced reads/writes
+    /// target the correct user.
+    private func updateActiveUserId() {
+        guard let token = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey),
+              !token.isEmpty else {
+            return
+        }
+        updateActiveUserId(fromToken: token)
+    }
+
+    /// Extracts user ID from a specific token and saves it as the active user.
+    private func updateActiveUserId(fromToken token: String) {
+        guard let subject = extractTokenSubject(token), !subject.isEmpty else {
+            os_log(.info, log: Self.log, "[UserNS] Could not extract userId from token — activeUserId unchanged")
+            return
+        }
+        let existing = UserDefaults.standard.string(forKey: Self.activeUserIdKey)
+        if existing != subject {
+            UserDefaults.standard.set(subject, forKey: Self.activeUserIdKey)
+            os_log(.info, log: Self.log, "[UserNS] Updated activeUserId (changed=%{public}@)",
+                   existing != nil ? "true" : "first-set")
+        }
+    }
+
+    /// Reads the companion state for the currently active user.
+    /// Returns the namespaced value if available, falls back to legacy `aa_is_companion`
+    /// for migration from pre-Build 27 installs.
+    private func readCompanionStateForCurrentUser() -> (isCompanion: Bool, userId: String?) {
+        let defaults = UserDefaults.standard
+        guard let userId = defaults.string(forKey: Self.activeUserIdKey), !userId.isEmpty else {
+            // No active user ID — fall back to legacy key (migration path)
+            let legacy = defaults.bool(forKey: Self.companionDefaultsKey)
+            os_log(.info, log: Self.log, "[UserNS] No activeUserId — falling back to legacy aa_is_companion=%{public}@",
+                   legacy ? "true" : "false")
+            return (legacy, nil)
+        }
+        let namespacedKey = Self.companionKeyForUser(userId)
+        if defaults.object(forKey: namespacedKey) != nil {
+            let value = defaults.bool(forKey: namespacedKey)
+            return (value, userId)
+        }
+        // Namespaced key doesn't exist yet — fall back to legacy (first run after upgrade)
+        let legacy = defaults.bool(forKey: Self.companionDefaultsKey)
+        os_log(.info, log: Self.log, "[UserNS] No namespaced key for user — falling back to legacy aa_is_companion=%{public}@",
+               legacy ? "true" : "false")
+        return (legacy, userId)
+    }
+
+    /// Reads a specific user's companion state.
+    private func readCompanionStateForUser(_ userId: String) -> Bool {
+        return UserDefaults.standard.bool(forKey: Self.companionKeyForUser(userId))
     }
 
     /// Triggers web-side entitlement refresh after purchase/restore.
@@ -559,96 +643,61 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                    latestJWS != nil ? "true" : "false",
                    products.joined(separator: ","))
 
-            if storeKitIsCompanion {
-                // Apple ID on this device has an active subscription.
-                // Sync the JWS to the server — the Worker validates the Apple JWS AND uses
-                // the Bearer auth token to PATCH is_companion=true on the CORRECT Base44 user.
-                // This is safe for ANY account (same or different) because the auth token
-                // identifies the user, not the Apple ID.
-                if let jws = latestJWS {
-                    os_log(.info, log: Self.log, "[PostLoginRecovery] Syncing JWS to server for current user")
-                    let serverConfirmed = await self.syncCompanionToServerAndWait(jws: jws)
-                    os_log(.info, log: Self.log, "[PostLoginRecovery] Server sync result: %{public}@",
-                           serverConfirmed ? "confirmed" : "failed")
-
-                    self.clearAwaitingServerConfirmState(reason: serverConfirmed ? "login-server-sync-ok" : "login-server-sync-failed")
-                    self.persistCompanionState(true)
-                    self.refreshWebEntitlements(isCompanion: true)
-                    self.pushEntitlementCheckToJS(isCompanion: true, products: products)
-
-                    if serverConfirmed {
-                        // Server updated is_companion=true — reload page so Base44 re-fetches /User/me
-                        self.triggerWebRefreshAfterPurchase()
-                    }
-                } else {
-                    // StoreKit active but no JWS available — trust StoreKit locally,
-                    // then try a server check to see if is_companion is already true.
-                    os_log(.info, log: Self.log, "[PostLoginRecovery] StoreKit active but no JWS — checking server")
-                    let serverIsCompanion = await self.checkCompanionOnServerAndWait()
-                    self.clearAwaitingServerConfirmState(reason: "login-storekit-active-no-jws")
-                    self.persistCompanionState(true)
-                    self.refreshWebEntitlements(isCompanion: true)
-                    self.pushEntitlementCheckToJS(isCompanion: true, products: products)
-                    if serverIsCompanion {
-                        self.triggerWebRefreshAfterPurchase()
-                    }
-                }
-            } else {
-                // StoreKit says no active subscription on this Apple ID.
-                // Check the server — the subscription may have been purchased on another device.
-                os_log(.info, log: Self.log, "[PostLoginRecovery] StoreKit not active — checking server for cross-device subscription")
-                let serverIsCompanion = await self.checkCompanionOnServerAndWait()
-                os_log(.info, log: Self.log, "[PostLoginRecovery] Server says companion=%{public}@",
-                       serverIsCompanion ? "true" : "false")
-
-                self.clearAwaitingServerConfirmState(reason: serverIsCompanion ? "login-server-companion" : "login-no-subscription")
-                if serverIsCompanion {
-                    self.persistCompanionState(true)
-                    self.refreshWebEntitlements(isCompanion: true)
-                    self.triggerWebRefreshAfterPurchase()
-                } else {
-                    // Genuinely no subscription — leave as non-companion.
-                    // aa_is_companion is already cleared from logout, just refresh web.
-                    self.refreshWebEntitlements(isCompanion: false)
-                }
-                self.pushEntitlementCheckToJS(isCompanion: serverIsCompanion, products: products)
-            }
-        }
-    }
-
-    // MARK: – Build 24 fix 2: Server-First Entitlement Check After Login
-
-    /// Called after login when no awaiting flag is set (normal path).
-    /// Asks the SERVER which Base44 account has is_companion=true.
-    /// This prevents account leakage: StoreKit is tied to Apple ID (shared across accounts),
-    /// but the server knows which specific Base44 account has the subscription.
-    ///
-    /// - Same account re-login: server says true → restore immediately (no voiding)
-    /// - Different account: server says false → stay locked (no leakage)
-    ///   User can tap "Restore Purchases" to explicitly transfer their Apple subscription.
-    private func performServerFirstEntitlementCheck(storeKitProducts products: [String]) {
-        Task { @MainActor in
-            let serverIsCompanion = await self.checkCompanionOnServerAndWait()
-            let (storeKitIsCompanion, _, _) = await AAStoreManager.shared.checkEntitlementsWithJWS()
-
-            os_log(.info, log: Self.log, "[ServerFirst] Server isCompanion=%{public}@ StoreKit isCompanion=%{public}@",
-                   serverIsCompanion ? "true" : "false",
-                   storeKitIsCompanion ? "true" : "false")
-
-            if serverIsCompanion {
-                // Server says this Base44 account has a subscription — trust it.
-                // No need to sync JWS (it's already on the server for this account).
+            // Build 27 FIX: Server-first — do NOT trust StoreKit alone for companion state.
+            // StoreKit reflects the Apple ID, not the Base44 account. Cross-account
+            // leakage happens when a different user logs in on the same device.
+            //
+            // Step 1: Check namespaced cache (same-account instant re-login)
+            let cached = self.readCompanionStateForCurrentUser()
+            if cached.isCompanion, cached.userId != nil {
+                os_log(.info, log: Self.log, "[PostLoginRecovery] Namespaced cache hit — immediate unlock")
+                self.clearAwaitingServerConfirmState(reason: "login-cache-hit")
                 self.persistCompanionState(true)
                 self.refreshWebEntitlements(isCompanion: true)
                 self.pushEntitlementCheckToJS(isCompanion: true, products: products)
+                // Background: confirm with server
+                self.checkCompanionOnServer()
+                return
+            }
+
+            // Step 2: Ask server — authoritative source for this Base44 account
+            let serverIsCompanion = await self.checkCompanionOnServerAndWait()
+            os_log(.info, log: Self.log, "[PostLoginRecovery] Server=%{public}@ StoreKit=%{public}@",
+                   serverIsCompanion ? "true" : "false",
+                   storeKitIsCompanion ? "true" : "false")
+
+            self.clearAwaitingServerConfirmState(reason: serverIsCompanion ? "login-server-confirmed" : "login-no-subscription")
+            if serverIsCompanion {
+                self.persistCompanionState(true)
+                self.refreshWebEntitlements(isCompanion: true)
                 self.triggerWebRefreshAfterPurchase()
             } else {
-                // Server says this account does NOT have a subscription.
-                // Even if StoreKit says true (same Apple ID, different account), do NOT auto-sync.
-                // User must explicitly tap "Restore Purchases" to transfer the subscription.
+                // Server says no — do NOT trust StoreKit alone. User must
+                // tap "Restore Purchases" to link this Apple ID's subscription.
                 self.persistCompanionState(false)
                 self.refreshWebEntitlements(isCompanion: false)
-                self.pushEntitlementCheckToJS(isCompanion: false, products: products)
+            }
+            self.pushEntitlementCheckToJS(isCompanion: serverIsCompanion, products: products)
+        }
+    }
+
+    // MARK: – Build 27: Server-First Entitlement Check
+
+    /// Asks the server which Base44 account has is_companion=true.
+    /// Build 27 FIX: Server is authoritative. StoreKit alone does NOT grant companion
+    /// (prevents cross-account leakage when Apple ID ≠ Base44 user).
+    private func performServerFirstEntitlementCheck(storeKitProducts products: [String]) {
+        Task { @MainActor in
+            let serverIsCompanion = await self.checkCompanionOnServerAndWait()
+
+            os_log(.info, log: Self.log, "[ServerFirst] Server isCompanion=%{public}@",
+                   serverIsCompanion ? "true" : "false")
+
+            self.persistCompanionState(serverIsCompanion)
+            self.refreshWebEntitlements(isCompanion: serverIsCompanion)
+            self.pushEntitlementCheckToJS(isCompanion: serverIsCompanion, products: products)
+            if serverIsCompanion {
+                self.triggerWebRefreshAfterPurchase()
             }
         }
     }
@@ -877,7 +926,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             }
 
             let serverIsCompanion = json["isCompanion"] as? Bool ?? false
-            let localIsCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+            // Build 27: Use namespaced read for local comparison
+            let localIsCompanion = self.readCompanionStateForCurrentUser().isCompanion
             let wasAwaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
 
             DispatchQueue.main.async { self.pushWorkerResponseToJS(endpoint: "/check-companion", statusCode: statusCode, error: nil) }
@@ -918,12 +968,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                                    storeKitIsCompanion ? "true" : "false", products.joined(separator: ","))
                             if storeKitIsCompanion {
                                 // StoreKit says active — server is wrong (stale expiry). Keep local state.
-                                // Also re-sync to server with fresh JWS.
-                                os_log(.info, log: Self.log, "[ServerCheck] StoreKit active — ignoring server downgrade, re-syncing JWS")
-                                let (_, _, latestJWS) = await AAStoreManager.shared.checkEntitlementsWithJWS()
-                                if let jws = latestJWS {
-                                    self.syncCompanionToServer(jws: jws)
-                                }
+                                // Build 27: Do NOT auto-sync JWS to server — prevents cross-account
+                                // leakage. User can tap "Restore Purchases" to explicitly sync.
+                                os_log(.info, log: Self.log, "[ServerCheck] StoreKit active — ignoring server downgrade (no auto-sync)")
                             } else {
                                 // StoreKit also says not subscribed — genuinely lost subscription.
                                 os_log(.info, log: Self.log, "[ServerCheck] StoreKit also not subscribed — updating local to non-companion")
@@ -1030,27 +1077,21 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Clear token from UserDefaults (native persistence layer)
         clearTokenFromUserDefaults()
 
-        // Build 24 fix 2: Clear aa_is_companion on logout to prevent account leakage.
+        // Build 27: User-namespaced entitlement cache — logout clears SESSION state only.
         //
-        // Why clear it: If Account A has a subscription and we DON'T clear it, then
-        // Account B logs in on the same device → recheckEntitlements could leak the
-        // subscription to Account B (because StoreKit sees the same Apple ID).
+        // WHAT CHANGED: We no longer wipe `aa_companion_{userId}` keys on logout.
+        // Each user's entitlement state is namespaced by their user ID, so:
+        // - User A's `aa_companion_{userA} = true` is never read when User B logs in
+        //   (User B gets `aa_companion_{userB}` which is nil → false)
+        // - Same-account re-login reads `aa_companion_{userA}` → immediate unlock
         //
-        // Why NOT set aa_awaiting_server_confirm: That flag created a massive recovery
-        // nightmare (Builds 10–23). Every build added more complex fallback chains to
-        // restore the subscription after logout→login. Don't repeat that.
-        //
-        // Instead, recheckEntitlements (after login) now uses SERVER-FIRST logic:
-        // 1. Sync auth token from localStorage → UserDefaults
-        // 2. Ask the server (GET /check-companion) — server knows which Base44 account
-        //    actually has is_companion=true
-        // 3. If server says true → restore locally (no JWS sync needed, already on server)
-        // 4. If server says false → stay locked (user can tap "Restore Purchases" to
-        //    explicitly transfer the Apple subscription to this account)
-        //
-        // This gives us: no voiding (same account restores from server) AND no leakage
-        // (different account doesn't auto-inherit Apple ID subscription).
+        // We DO set the legacy `aa_is_companion = false` for login page UI safety
+        // (JS injection reads this for `window.__aaIsCompanion` on document start).
+        // After login, `updateActiveUserId` + `readCompanionStateForCurrentUser` will
+        // read the correct namespaced key and update the legacy key via write-through.
         UserDefaults.standard.set(false, forKey: Self.companionDefaultsKey)
+        // Clear activeUserId so namespaced reads don't return stale data before login
+        UserDefaults.standard.removeObject(forKey: Self.activeUserIdKey)
         // Clear any stale awaiting flag from previous builds
         if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
             UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
@@ -1080,16 +1121,17 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         if #available(iOS 15.0, *) {
             Task { @MainActor in
                 var awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
-                let alreadyCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+                // Build 27: Use namespaced read for cold boot
+                let (alreadyCompanion, _) = self.readCompanionStateForCurrentUser()
                 let hasToken = self.hasTokenInUserDefaults()
 
                 // Build 23: If no auth token, skip persisting NEW StoreKit results (the Apple ID
                 // subscription might belong to a different app account). But still USE the existing
-                // aa_is_companion from UserDefaults — it was verified by a previous session's
-                // StoreKit check and is trustworthy. This prevents cold boot from voiding
-                // subscriptions when the token hasn't been synced from localStorage yet.
+                // namespaced state — it was verified by a previous session's StoreKit check and is
+                // trustworthy. This prevents cold boot from voiding subscriptions when the token
+                // hasn't been synced from localStorage yet.
                 if !hasToken {
-                    os_log(.info, log: Self.log, "[BOOT] No auth token — using existing UserDefaults state (aa_is_companion=%{public}@), skipping StoreKit persist", alreadyCompanion ? "true" : "false")
+                    os_log(.info, log: Self.log, "[BOOT] No auth token — using existing state (isCompanion=%{public}@), skipping StoreKit persist", alreadyCompanion ? "true" : "false")
                     self.pushEntitlementCheckToJS(isCompanion: alreadyCompanion, products: [])
                     return
                 }
@@ -1137,20 +1179,34 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 os_log(.info, log: Self.log, "[TxnUpdate] Awaiting server confirm — ignoring StoreKit update (isCompanion=%{public}@)", isCompanion ? "true" : "false")
                 return
             }
-            self.persistCompanionState(isCompanion)
-            self.refreshWebEntitlements(isCompanion: isCompanion)
+            // Build 27 FIX: Do NOT blindly trust StoreKit for companion state.
+            // StoreKit reflects Apple ID, not Base44 account. Only apply if
+            // server confirms or namespaced cache matches (same account).
+            if isCompanion {
+                // StoreKit says active — check if this is the same account (cache hit)
+                self.updateActiveUserId()
+                let cached = self.readCompanionStateForCurrentUser()
+                if cached.isCompanion, cached.userId != nil {
+                    // Same account, previously confirmed — apply immediately
+                    os_log(.info, log: Self.log, "[TxnUpdate] Cache hit — applying StoreKit companion=true")
+                    self.persistCompanionState(true)
+                    self.refreshWebEntitlements(isCompanion: true)
+                } else {
+                    // Unknown account match — ask server instead of trusting StoreKit
+                    os_log(.info, log: Self.log, "[TxnUpdate] No cache hit — checking server (not trusting StoreKit alone)")
+                    self.checkCompanionOnServer()
+                }
+            } else {
+                // StoreKit says NOT companion (expiry, refund) — safe to apply
+                os_log(.info, log: Self.log, "[TxnUpdate] StoreKit companion=false — applying")
+                self.persistCompanionState(false)
+                self.refreshWebEntitlements(isCompanion: false)
+            }
             self.sendPurchaseResult([
                 "status": "success",
                 "isCompanion": isCompanion,
                 "source": "transactionUpdate"
             ])
-            // Build 25 audit fix: Sync JWS to server for transaction updates
-            // (Ask to Buy approvals, renewals, etc.) — previously the listener
-            // did not capture the JWS, so Base44 was never updated for these events.
-            if isCompanion, let jws = jws {
-                os_log(.info, log: Self.log, "[TxnUpdate] Syncing JWS to server for transaction update")
-                self.syncCompanionToServer(jws: jws)
-            }
         }
     }
 
@@ -1317,6 +1373,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 } else {
                     os_log(.info, log: Self.log, "[TokenSync:UP] UserDefaults already has current token (len=%d)", token.count)
                 }
+                // Build 27: Update active user ID after every token sync so namespaced
+                // entitlement reads/writes target the correct user.
+                self?.updateActiveUserId(fromToken: token)
                 completion?(true)
             } else {
                 os_log(.info, log: Self.log, "[TokenSync:UP] No token found in localStorage")
@@ -1331,6 +1390,41 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         os_log(.info, log: Self.log, "[TokenSync] Cleared token from UserDefaults")
     }
 
+    /// Build 26: Retry token sync with configurable backoff delays.
+    /// Calls `syncTokenToUserDefaults` immediately, then retries at each delay if token not found.
+    /// Completion is called with `true` on first success, or `false` after all retries exhausted.
+    private func syncTokenWithRetries(delays: [Double], completion: @escaping (Bool) -> Void) {
+        syncTokenToUserDefaults { [weak self] found in
+            guard let self = self else { completion(false); return }
+            if found {
+                completion(true)
+                return
+            }
+            // Start retry chain
+            self.syncTokenRetryChain(delays: delays, attempt: 0, completion: completion)
+        }
+    }
+
+    private func syncTokenRetryChain(delays: [Double], attempt: Int, completion: @escaping (Bool) -> Void) {
+        guard attempt < delays.count else {
+            completion(false)
+            return
+        }
+        let delay = delays[attempt]
+        os_log(.info, log: Self.log, "[IAP:recheck] No token — retrying sync in %.1fs (attempt %d/%d)", delay, attempt + 1, delays.count)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self else { completion(false); return }
+            self.syncTokenToUserDefaults { [weak self] found in
+                guard let self = self else { completion(false); return }
+                if found {
+                    completion(true)
+                } else {
+                    self.syncTokenRetryChain(delays: delays, attempt: attempt + 1, completion: completion)
+                }
+            }
+        }
+    }
+
     /// Checks if UserDefaults has a stored token.
     private func hasTokenInUserDefaults() -> Bool {
         let token = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)
@@ -1340,6 +1434,48 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// Gets the stored token length (for diagnostics — never log the token itself).
     private func tokenLengthInUserDefaults() -> Int {
         return UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)?.count ?? 0
+    }
+
+    /// Build 26 safety net: After periodic token sync succeeds, check if the user is
+    /// currently marked as non-companion (e.g., after logout→login where recheckEntitlements
+    /// retries all failed). If aa_is_companion is false and we now have a token, ask the
+    /// server — it may confirm the subscription for the same account.
+    /// Cross-account safety: `checkCompanionOnServer()` calls GET /check-companion with
+    /// the current account's auth token. Server returns true only for the account that
+    /// actually has is_companion = true.
+    /// Build 27 FIX: Safety net recovery after periodic token sync.
+    /// If we have a token but companion is false, check namespaced cache first (instant
+    /// same-account), then server (authoritative). StoreKit alone does NOT grant companion
+    /// (prevents cross-account leakage when Apple ID ≠ Base44 user).
+    private func triggerPostLoginRecoveryIfNeeded(tokenFound: Bool) {
+        guard tokenFound else { return }
+
+        // Quick check: if already companion (from any source), nothing to do
+        let legacyIsCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+        if legacyIsCompanion {
+            os_log(.info, log: Self.log, "[PostLoginRecovery] Already companion — no recovery needed")
+            return
+        }
+
+        guard #available(iOS 15.0, *) else { return }
+        Task { @MainActor in
+            self.updateActiveUserId()
+
+            // Step 1: Check namespaced cache (same-account instant re-login)
+            let cached = self.readCompanionStateForCurrentUser()
+            if cached.isCompanion, cached.userId != nil {
+                os_log(.info, log: Self.log, "[PostLoginRecovery] Namespaced cache hit — immediate unlock")
+                self.persistCompanionState(true)
+                self.refreshWebEntitlements(isCompanion: true)
+                // Background: confirm with server
+                self.checkCompanionOnServer()
+                return
+            }
+
+            // Step 2: Ask server — authoritative for this Base44 account
+            os_log(.info, log: Self.log, "[PostLoginRecovery] No cache hit — checking server")
+            self.checkCompanionOnServer()
+        }
     }
 
     /// Decodes JWT payload and returns a stable user subject identifier when available.
@@ -1441,40 +1577,19 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             return
         }
 
-        os_log(.info, log: Self.log, "[AwaitingConfirm] Subject unavailable — using StoreKit+server sync recovery")
+        // Build 27 FIX: Subject unavailable — ask server (authoritative).
+        // Do NOT trust StoreKit alone — prevents cross-account leakage.
+        os_log(.info, log: Self.log, "[AwaitingConfirm] Subject unavailable — using server GET recovery (no StoreKit trust)")
         guard #available(iOS 15.0, *) else { return }
         Task { @MainActor in
-            let (storeKitIsCompanion, _, latestJWS) = await AAStoreManager.shared.checkEntitlementsWithJWS()
-            if storeKitIsCompanion, let jws = latestJWS {
-                // StoreKit says active — sync JWS to server so server state matches.
-                // The Worker validates the JWS AND uses the Bearer token (current user's
-                // auth) to PATCH the correct Base44 user entity. This is safe for ANY
-                // account because the auth token identifies the user, not the Apple ID.
-                os_log(.info, log: Self.log, "[AwaitingConfirm] StoreKit active — syncing JWS to server for current user")
-                let serverConfirmed = await self.syncCompanionToServerAndWait(jws: jws)
-                if serverConfirmed {
-                    os_log(.info, log: Self.log, "[AwaitingConfirm] Server confirmed after JWS sync — unlocking")
-                    self.clearAwaitingServerConfirmState(reason: "storekit-server-sync-recovery")
-                    self.persistCompanionState(true)
-                    self.refreshWebEntitlements(isCompanion: true)
-                    // Trigger web refresh so Base44 re-fetches /User/me with is_companion=true
-                    self.triggerWebRefreshAfterPurchase()
-                } else {
-                    // Server sync failed (network, auth, etc.) — fall back to local StoreKit
-                    // state. This is acceptable: if the user truly has an active Apple subscription,
-                    // showing them as subscribed locally while server catches up is better than
-                    // voiding and forcing a manual restore.
-                    os_log(.info, log: Self.log, "[AwaitingConfirm] Server sync failed — using local StoreKit state")
-                    self.clearAwaitingServerConfirmState(reason: "storekit-local-fallback")
-                    self.persistCompanionState(true)
-                    self.refreshWebEntitlements(isCompanion: true)
-                }
+            let serverIsCompanion = await self.checkCompanionOnServerAndWait()
+            os_log(.info, log: Self.log, "[AwaitingConfirm] Server isCompanion=%{public}@",
+                   serverIsCompanion ? "true" : "false")
+            self.clearAwaitingServerConfirmState(reason: serverIsCompanion ? "server-confirmed" : "server-not-companion")
+            if serverIsCompanion {
+                self.persistCompanionState(true)
+                self.refreshWebEntitlements(isCompanion: true)
             } else {
-                // StoreKit says no active entitlement — genuinely not subscribed on this Apple ID.
-                os_log(.info, log: Self.log, "[AwaitingConfirm] StoreKit not active — clearing flag, no subscription")
-                self.clearAwaitingServerConfirmState(reason: "storekit-not-subscribed")
-                // Don't persist false — aa_is_companion is already cleared from logout.
-                // Just refresh UI to reflect current state.
                 self.refreshWebEntitlements(isCompanion: false)
             }
         }
@@ -1544,11 +1659,20 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Token UP sync: localStorage → UserDefaults
         // Delay to let the remote site's React app mount and set tokens in localStorage.
         // Two stages: 3s (catch fast logins) and 10s (catch slow hydration).
+        // Build 26 fix: After token sync succeeds, check if aa_is_companion is false
+        // (e.g., after logout→login where recheckEntitlements retries all failed).
+        // If so, trigger a server check as a safety net recovery.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            self?.syncTokenToUserDefaults()
+            self?.syncTokenToUserDefaults { [weak self] found in
+                // Build 27: updateActiveUserId is called inside syncTokenToUserDefaults now,
+                // so the namespaced key is ready before triggerPostLoginRecoveryIfNeeded.
+                self?.triggerPostLoginRecoveryIfNeeded(tokenFound: found)
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
-            self?.syncTokenToUserDefaults()
+            self?.syncTokenToUserDefaults { [weak self] found in
+                self?.triggerPostLoginRecoveryIfNeeded(tokenFound: found)
+            }
         }
     }
 
@@ -1599,8 +1723,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 // Build 23: No auth token — skip persisting NEW StoreKit results but use existing
                 // UserDefaults state. Token may not be synced from localStorage yet.
                 if !hasToken {
-                    let existingCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
-                    os_log(.info, log: Self.log, "[RESUME] No auth token — using existing state (aa_is_companion=%{public}@), skipping StoreKit persist", existingCompanion ? "true" : "false")
+                    // Build 27: Use namespaced read for foreground resume
+                    let (existingCompanion, _) = self.readCompanionStateForCurrentUser()
+                    os_log(.info, log: Self.log, "[RESUME] No auth token — using existing state (isCompanion=%{public}@), skipping StoreKit persist", existingCompanion ? "true" : "false")
                     self.pushEntitlementCheckToJS(isCompanion: existingCompanion, products: [])
                     return
                 }
@@ -1707,11 +1832,65 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             let newURL = change?[.newKey] as? URL
             if oldURL != nil && newURL == nil && hasPerformedInitialLoad {
                 os_log(.info, log: Self.log, "KVO: URL went nil — content process may have terminated")
-                // The WebViewDelegationHandler's webViewWebContentProcessDidTerminate
-                // will handle the reload. We just log here for diagnostics.
+            }
+
+            // Build 27: Native safety net — check StoreKit on every navigation to a
+            // non-login page. This catches the case where Base44 does a full page redirect
+            // after login (window.location.href = '/') instead of SPA navigation.
+            // JS checkLoginTransition() only hooks pushState/replaceState, so a full
+            // redirect means recheckEntitlements never fires from JS.
+            if let url = newURL, url.scheme == "https",
+               !url.path.hasPrefix("/login") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.nativeEntitlementRecovery()
+                }
             }
         } else {
             super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+        }
+    }
+
+    // MARK: – Build 27: Native Entitlement Recovery
+
+    /// Safety net: checks namespaced cache + server when navigating to a non-login page.
+    /// If aa_is_companion is false but this user was previously confirmed, restore immediately.
+    /// No-op if already companion. Runs on every URL change (debounced by the guard).
+    /// Build 27 FIX: Does NOT trust StoreKit alone — prevents cross-account leakage.
+    private func nativeEntitlementRecovery() {
+        // Quick exit if already companion — nothing to do
+        let isCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+        if isCompanion { return }
+
+        guard #available(iOS 15.0, *) else { return }
+
+        // Step 1: Check namespaced cache (same-account instant re-login)
+        let cached = readCompanionStateForCurrentUser()
+        if cached.isCompanion, cached.userId != nil {
+            os_log(.info, log: Self.log, "[NativeRecovery] Namespaced cache hit — immediate unlock")
+            self.persistCompanionState(true)
+            self.refreshWebEntitlements(isCompanion: true)
+            // Background server confirm
+            self.checkCompanionOnServer()
+            return
+        }
+
+        // Step 2: Ask server — only trust server for companion state.
+        // StoreKit alone could be a different Apple ID's subscription.
+        Task { @MainActor in
+            // Ensure we have a token for the server call
+            guard self.hasTokenInUserDefaults() else {
+                os_log(.info, log: Self.log, "[NativeRecovery] No token — skipping server check")
+                return
+            }
+            self.updateActiveUserId()
+
+            let serverIsCompanion = await self.checkCompanionOnServerAndWait()
+            os_log(.info, log: Self.log, "[NativeRecovery] Server isCompanion=%{public}@",
+                   serverIsCompanion ? "true" : "false")
+            if serverIsCompanion {
+                self.persistCompanionState(true)
+                self.refreshWebEntitlements(isCompanion: true)
+            }
         }
     }
 
@@ -1889,7 +2068,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "'", with: "\\'")
 
-        let isCompanionRaw = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
+        // Build 27: Use namespaced read for companion state in JS injection
+        let isCompanionRaw = readCompanionStateForCurrentUser().isCompanion
         let awaitingConfirm = UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey)
         // Build 23: Report false if awaiting server confirm (post-logout).
         // NOTE: We trust isCompanionRaw from UserDefaults even without a token, because it was
@@ -4389,6 +4569,21 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         startObserving();
         scheduleBlankChecks();
       }
+
+      // Build 27: JS safety net — on every page load (not login page), if not
+      // companion, trigger recheckEntitlements after 3s. Catches full page reloads
+      // after login where checkLoginTransition() doesn't fire (the history hooks
+      // only catch pushState/replaceState, not window.location redirects).
+      setTimeout(function() {
+        var path = window.location.pathname;
+        var onLogin = (path === '/login' || path === '/login/');
+        if (!onLogin && !window.__aaIsCompanion) {
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.aaPurchase) {
+            console.log('[AA] Safety net: not companion after page load — rechecking StoreKit');
+            window.webkit.messageHandlers.aaPurchase.postMessage({ action: 'recheckEntitlements' });
+          }
+        }
+      }, 3000);
     })();
     """
 }

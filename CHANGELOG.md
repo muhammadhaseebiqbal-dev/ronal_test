@@ -4,6 +4,159 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-02-27 — Raouf: User-Namespaced Entitlement Cache (Build 27)
+
+**Problem:** Build 26's retry-based fix patches the symptom (token race) but the root cause is architectural — `performFullLogout()` wipes the device-global `aa_is_companion` flag, making StoreKit entitlements undetectable until a server check succeeds. Logout should clear session state, NOT entitlement state.
+
+**Architecture change:** Replace device-global `aa_is_companion` (boolean) with **user-namespaced keys**: `aa_companion_{userId}`. Each user's entitlement state is independent.
+
+**What changed (PatchedBridgeViewController.swift):**
+
+1. **New keys:** `activeUserIdKey` ("aa_active_user_id") and `companionKeyPrefix` ("aa_companion_") for user-namespaced storage.
+
+2. **5 new helper functions:**
+   - `companionKeyForUser(_:)` — returns `"aa_companion_\(userId)"`
+   - `updateActiveUserId()` / `updateActiveUserId(fromToken:)` — extracts JWT subject, saves as active user ID
+   - `readCompanionStateForCurrentUser()` — reads namespaced key, falls back to legacy for migration
+   - `readCompanionStateForUser(_:)` — reads a specific user's key
+
+3. **`persistCompanionState` reworked:** Writes to BOTH `aa_companion_{userId}` (namespaced) AND `aa_is_companion` (legacy write-through for JS injection compatibility).
+
+4. **`performFullLogout` simplified:** Sets only legacy `aa_is_companion = false` (login page UI safety) + clears `activeUserIdKey`. User-namespaced `aa_companion_{userId}` keys stay intact.
+
+5. **`syncTokenToUserDefaults` + `updateActiveUserId`:** After every token sync, extracts user ID from token so namespaced reads/writes target the correct user.
+
+6. **7 read sites migrated to namespaced reads:** `viewDidLoad`, `handleWillEnterForeground`, `buildNativeDiagJS`, `checkCompanionOnServer`, `triggerPostLoginRecoveryIfNeeded`, `recheckEntitlements` (2 places).
+
+7. **`recheckEntitlements` REWRITTEN (critical fix):** Replaced the entire handler with a clean StoreKit-first approach:
+   - **Step 1:** Check StoreKit `Transaction.currentEntitlements` immediately (no network, no token needed). If active → **instant unlock** + sync JWS to server in background.
+   - **Step 2:** If StoreKit has nothing → sync auth token → ask server for cross-device subscriptions → trust server result.
+   - This eliminates the token sync race entirely — StoreKit is checked BEFORE waiting for token. Works in test StoreKit, sandbox, and production.
+   - Removed dependency on namespaced cache for this path (cache is still maintained for other reads).
+
+8. **`performServerFirstEntitlementCheck` fixed:** Added StoreKit cross-check when server says false. Previously, server false → blindly persist false (overwrites cache). Now: server false + StoreKit active → trust StoreKit + sync JWS to fix server.
+
+9. **`triggerPostLoginRecoveryIfNeeded` rewritten:** Now checks StoreKit directly instead of only reading cache. If StoreKit active → instant unlock + sync JWS. If StoreKit inactive → server check.
+
+10. **Native entitlement recovery (root cause fix):** Added `nativeEntitlementRecovery()` triggered by KVO URL observer on every navigation to a non-login page. If `aa_is_companion` is false but StoreKit has an active entitlement, fixes it immediately. This catches the case where Base44 does a **full page redirect** after login (e.g., `window.location.href = '/'`) instead of SPA navigation — the JS `checkLoginTransition()` only hooks `pushState`/`replaceState`, so a full redirect means `recheckEntitlements` never fired from JS. The native observer fires regardless of navigation type.
+
+11. **JS safety net:** Added `setTimeout` in document-end JS injection that triggers `recheckEntitlements` 3 seconds after every non-login page load if `window.__aaIsCompanion` is false. Belt-and-suspenders with the native observer.
+
+**Scenario coverage:**
+
+| Scenario | Flow | Result |
+|----------|------|--------|
+| Same-account re-login | Logout → `aa_companion_{userA}` stays true → login → `updateActiveUserId(userA)` → namespaced read returns true → server confirms | Immediate unlock, no Restore needed |
+| Cross-account | Logout → User B logs in → `updateActiveUserId(userB)` → `aa_companion_{userB}` = nil → false → server says false | No leakage |
+| Cold boot | `activeUserIdKey=userA` persists → `aa_companion_{userA}` = true | Immediate companion UI |
+| Fresh install | No keys → `readCompanionStateForCurrentUser` → (false, nil) | Normal non-companion |
+| Build 26 upgrade | No namespaced keys → fallback to legacy `aa_is_companion` → first check creates namespaced key | Seamless migration |
+
+- **Files changed:** `PatchedBridgeViewController.swift`, `project.pbxproj` (26→27), `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅, build ✅, cap sync ✅, xcodebuild Release ✅
+
+### 2026-02-27 — Raouf: Fix Cross-Account Leakage — Server-First + No Blind StoreKit (Build 27 cont'd)
+
+**Problem (two layers):**
+
+1. **Server-side leakage (JWS POST):** Recovery paths auto-synced JWS to server via `syncCompanionToServer(jws:)`. If User B logs in on User A's Apple ID device, the JWS POST sets `is_companion=true` on User B's server account.
+
+2. **Local UI leakage (blind StoreKit trust):** Even after removing JWS POSTs, all recovery paths called `persistCompanionState(true)` purely based on StoreKit being active. StoreKit reflects the **Apple ID**, not the **Base44 account**. User B sees companion UI because User A's Apple ID has a subscription on this device.
+
+**Design rule enforced:**
+
+- **`syncCompanionToServer` (JWS POST):** Only on explicit Purchase/Restore button presses
+- **`persistCompanionState(true)` in recovery paths:** Only when one of:
+  - (a) **Namespaced cache hit** — `aa_companion_{userId}` is true (same user, previously confirmed)
+  - (b) **Server confirms** — `GET /check-companion` returns `isCompanion: true`
+  - (c) **Explicit user action** — Purchase or Restore handler
+- **StoreKit alone does NOT grant companion** in any recovery/automatic path
+
+**Recovery path changes (all in PatchedBridgeViewController.swift):**
+
+1. **`recheckEntitlements` rewritten:** Token sync → namespaced cache check (instant same-account) → server GET. StoreKit no longer checked first.
+2. **`performPostLoginRecovery` rewritten:** Namespaced cache → server GET. Removed blind StoreKit trust.
+3. **`performServerFirstEntitlementCheck` simplified:** Server-only (removed StoreKit-over-server override).
+4. **`nativeEntitlementRecovery` rewritten:** Namespaced cache → server GET. No StoreKit trust.
+5. **`triggerPostLoginRecoveryIfNeeded` rewritten:** Namespaced cache → server GET. No StoreKit trust.
+6. **Transaction listener:** StoreKit `isCompanion=true` only applied on namespaced cache hit; otherwise server GET.
+7. **`resolveAwaitingConfirmFallbackIfSafe` Path B:** Replaced StoreKit trust with server GET.
+8. **`checkCompanionOnServer` downgrade cross-check:** Kept (prevents stale server downgrade for SAME account — `localIsCompanion=true` means previously confirmed).
+
+**Cross-account safety matrix:**
+
+| Path | Source of truth | Leakage possible? |
+|------|----------------|-------------------|
+| Purchase button | StoreKit + JWS POST | No (explicit action) |
+| Restore button | StoreKit + JWS POST | No (explicit action) |
+| recheckEntitlements | Cache → Server GET | No |
+| performPostLoginRecovery | Cache → Server GET | No |
+| nativeEntitlementRecovery | Cache → Server GET | No |
+| triggerPostLoginRecoveryIfNeeded | Cache → Server GET | No |
+| Transaction updates | Cache hit → apply; else Server GET | No |
+| Awaiting-confirm fallback | Server GET | No |
+| Server downgrade check | StoreKit (only when local=true already) | No |
+
+- **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅
+
+### 2026-02-27 — Raouf: Fix Restore Purchases Cross-Account Transfer (Build 27 cont'd)
+
+**Problem:** Tapping "Restore Purchases" on a device where a different Apple ID has an active subscription transfers that subscription to the currently logged-in Base44 account. The Restore handler blindly synced JWS to the server with the current user's auth token.
+
+**Fix:** Restore Purchases now follows the same server-first rule as all recovery paths:
+
+1. StoreKit check → finds active subscription on this Apple ID
+2. Server GET (`/check-companion`) → asks if THIS Base44 account is already companion
+3. **If server says yes** → unlock (subscription already linked to this account)
+4. **If server says no** → check namespaced cache:
+   - **Cache hit (same user)** → sync JWS to re-link (handles reinstall/server data loss)
+   - **No cache hit** → do NOT transfer. Show message: "This subscription is linked to a different account."
+
+**Result:** Restore only works for the account that originally purchased the subscription (or was previously server-confirmed on this device).
+
+**Follow-up fix:** The initial implementation sent `isCompanion: true` to JS via `sendPurchaseResult` BEFORE the server check completed. JS immediately called `updateSubscriptionStatusUI(true)` and showed the success toast, bypassing the server check entirely. Fixed by deferring all JS notification until after the server check decision:
+- StoreKit active → hold result → server check → **only then** send success/rejection to JS
+- StoreKit inactive → send "nothing found" immediately (no server check needed)
+
+- **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅
+
+### 2026-02-27 — Raouf: Offline Purchase Guard (Build 27 cont'd)
+
+**Problem:** When offline, tapping Subscribe could show the Apple purchase sheet before failing. No network check was performed before calling `Product.products(for:)` / `product.purchase()`.
+
+**Fix:** Added `canReachServer()` check at the top of the "buy" handler (same pattern as Restore already had). If offline, immediately returns an error toast: "Please connect to the internet to subscribe." — the Apple sheet never appears.
+
+**Offline behavior now:**
+- **Subscribe button (offline):** Error toast "Please connect to the internet to subscribe." — no Apple sheet
+- **Restore Purchases (offline):** Info toast "Please connect to the internet to restore your subscription." (already existed)
+- **Recovery paths (offline):** Server GET fails silently, no UI disruption
+
+- **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅
+
+---
+
+### 2026-02-27 — Raouf: Fix Logout → Login Subscription Voiding (Build 26)
+
+**Problem:** When a subscribed user logs out and logs back in (same account), the subscription appears voided. Root cause: token sync race condition in `recheckEntitlements` — Base44 SPA may not have written the auth token to localStorage yet when native tries to read it. Only 1 retry at 2s, and persists `false` on failure, preventing later recovery.
+
+**Fix (3 changes in PatchedBridgeViewController.swift):**
+
+1. **More retries with backoff in `recheckEntitlements`:** Replaced single 2s retry with 3-attempt retry chain (1s → 3s → 5s) via new `syncTokenWithRetries` helper. Covers SPAs that take up to ~9s to hydrate.
+
+2. **Don't persist false on retries exhausted:** Removed `persistCompanionState(false)` when all retries fail. After logout, `aa_is_companion` is already `false` — persisting it again was redundant and harmful (prevented recovery via foreground resume or periodic check).
+
+3. **Periodic token sync triggers server check as safety net:** The 3s and 10s periodic token syncs in `capacitorDidLoad` now call `triggerPostLoginRecoveryIfNeeded` after token sync succeeds. If `aa_is_companion` is false but a token is now available, triggers `checkCompanionOnServer()` to ask the server.
+
+**Cross-account safety:** All paths use `performServerFirstEntitlementCheck()` or `checkCompanionOnServer()` which call `GET /check-companion` with the current account's auth token. Server returns `true` only for the account that actually has `is_companion = true`. No leakage.
+
+- **Files changed:** `PatchedBridgeViewController.swift`, `project.pbxproj` (25→26), `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅, build ✅, cap sync ✅, xcodebuild Release ✅
+
+---
+
 ### 2026-02-27 — Raouf: Full IAP Flow Audit (Purchase + Restore + Worker End-to-End Trace)
 
 **Traced complete IAP purchase, restore, and Worker validation flows end-to-end. Found 2 significant gaps, fixed both.**

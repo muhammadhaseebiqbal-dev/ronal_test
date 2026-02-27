@@ -5,7 +5,7 @@
 **App Name:** Abide & Anchor  
 **Client:** Roland L.  
 **Tech Stack:** React 18 + Vite 6 + Capacitor 8 (iOS) + Base44 SDK  
-**Current Phase:** Milestone B — App Store submission preparation (Build 25, Worker x5c rewrite + monthly-only)
+**Current Phase:** Milestone B — App Store submission preparation (Build 27, user-namespaced entitlement cache)
 
 ## Project Type
 Capacitor iOS app wrapping https://abideandanchor.app in WKWebView (same-origin mode).
@@ -215,6 +215,38 @@ These features require an active Companion subscription. "Companion adds a perso
 ---
 
 ## Last Change Log
+
+**2026-02-27 — Raouf: User-Namespaced Entitlement Cache (Build 27)**
+- **Problem:** Build 26's retry-based fix patches the symptom (token race) but the root cause is architectural — `performFullLogout()` wipes device-global `aa_is_companion`, making StoreKit entitlements undetectable until server check succeeds. Logout should clear session state, NOT entitlement state.
+- **Architecture change:** Replaced device-global `aa_is_companion` (boolean) with user-namespaced keys `aa_companion_{userId}`. Each user's entitlement state is independent. Logout clears session (token, cookies, activeUserId) but leaves all `aa_companion_*` keys intact.
+- **Cross-account safety:** User A's `aa_companion_{userA} = true` is never read when User B logs in — User B gets `aa_companion_{userB}` (nil → false). No leakage, no flag wiping needed.
+- **Legacy compatibility:** `aa_is_companion` kept as write-through — `persistCompanionState` writes BOTH namespaced + legacy key. All JS injection (`window.__aaIsCompanion`) works unchanged.
+- **Migration:** `readCompanionStateForCurrentUser()` falls back to legacy key when no namespaced key exists (pre-Build 27 installs).
+- **5 new helpers:** `companionKeyForUser`, `updateActiveUserId` (2 overloads), `readCompanionStateForCurrentUser`, `readCompanionStateForUser`
+- **7 read sites migrated to namespaced reads:** `viewDidLoad`, `handleWillEnterForeground`, `buildNativeDiagJS`, `checkCompanionOnServer`, `triggerPostLoginRecoveryIfNeeded`, `recheckEntitlements` (2 places)
+- **`recheckEntitlements` REWRITTEN with StoreKit-first:** Check StoreKit immediately (no network, no token needed). If active → instant unlock + background JWS sync. If nothing → sync token → ask server. Eliminates token sync race entirely.
+- **`performServerFirstEntitlementCheck` fixed:** Server false + StoreKit active → trust StoreKit (server may be stale or test mode).
+- **`triggerPostLoginRecoveryIfNeeded` rewritten:** StoreKit check instead of cache-only read.
+- **Files changed:** `PatchedBridgeViewController.swift`, `project.pbxproj` (26→27), `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅, build ✅, cap sync ✅, xcodebuild Release ✅
+
+**2026-02-27 — Raouf: Fix Cross-Account Leakage — Server-First + No Blind StoreKit (Build 27 cont'd)**
+- **Problem (2 layers):** (1) JWS POST in recovery paths → server-side leakage. (2) `persistCompanionState(true)` based on StoreKit alone → local UI leakage. StoreKit reflects Apple ID, not Base44 account.
+- **Rule enforced:** `persistCompanionState(true)` in recovery paths ONLY on: (a) namespaced cache hit (same user, previously confirmed), (b) server GET confirms, or (c) explicit Purchase/Restore. StoreKit alone does NOT grant companion.
+- **Sites rewritten:** `recheckEntitlements` (cache→server), `performPostLoginRecovery` (cache→server), `performServerFirstEntitlementCheck` (server only), `nativeEntitlementRecovery` (cache→server), `triggerPostLoginRecoveryIfNeeded` (cache→server), transaction listener (cache→server), `resolveAwaitingConfirmFallbackIfSafe` Path B (server only).
+- **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅
+
+**2026-02-27 — Raouf: Fix Restore Purchases Cross-Account Transfer (Build 27 cont'd)**
+- **Problem:** Restore sent `isCompanion:true` to JS before server check → UI unlocked immediately for wrong account.
+- **Fix:** Deferred all JS notification until after server check. StoreKit active → hold → server check → only then send success or "linked to different account" to JS. No early `sendPurchaseResult` with `isCompanion:true`.
+- **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅
+
+**2026-02-27 — Raouf: Offline Purchase Guard (Build 27 cont'd)**
+- **Fix:** Added `canReachServer()` check before purchase flow. Offline → error toast "Please connect to the internet to subscribe." Apple sheet never appears offline.
+- **Files changed:** `PatchedBridgeViewController.swift`, `AGENT.md`, `CHANGELOG.md`
+- **Verification:** lint ✅, test ✅ (42/42), build ✅, cap sync ✅, xcodebuild Release ✅
 
 **2026-02-27 — Raouf: Full IAP flow audit + 3 iOS fixes**
 - **Scope:** End-to-end IAP flow audit (purchase + restore + Worker validation), plus 3 subscription scenario audit (leakage, logout→login, cold boot).
