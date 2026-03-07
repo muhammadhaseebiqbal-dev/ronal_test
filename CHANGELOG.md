@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-03-07 — Build 32: Subscription UI Consolidation & Simulator-Verified Fixes
+
+**Summary:** Consolidated all subscription status display into a single, controlled card. Eliminated dual-status confusion by hiding Base44's native "Companion Status" section entirely. All changes verified on iOS Simulator with StoreKit sandbox testing.
+
+**Changes:**
+
+1. **Single Subscription Card (Settings page only)**
+   - Our injected SUBSCRIPTION card now appears ONLY on the Settings detail page
+   - Removed from Support page and other More sub-pages
+   - One Restore Purchases button in one location — no duplicates
+
+2. **Base44 "Companion Status" Section Hidden**
+   - Base44's native "Companion Status" heading, "isn't active" text, "Already subscribed?" helper text, and their Restore button are now always hidden
+   - Targeting uses individual element matching (leaf elements only) — no parent-walking to avoid over-hiding
+   - Our SUBSCRIPTION card replaces it as the single source of truth
+
+3. **Contradiction Suppression Fixed**
+   - `__aaSuppressContradictions()` no longer walks up the DOM tree
+   - Only hides individual leaf text elements containing contradiction phrases
+   - Prevents accidental hiding of unrelated Settings content (Preferences, Log out, Delete Account, etc.)
+
+4. **StoreKit Configuration File Added**
+   - `ios/App/Products.storekit` enables simulator purchase testing
+   - Product: `com.abideandanchor.companion.monthly` at $9.99/month
+
+**Simulator Test Results (all PASS):**
+- ✅ Purchase → immediate unlock, status shows "Companion Active"
+- ✅ Kill & relaunch → entitlement persists
+- ✅ Restore → no payment sheet, status confirmed
+- ✅ Cross-account → logout clears state, new user sees "Free"
+- ✅ No "active" + "not active" contradiction on any screen
+- ✅ Single Restore button location (Settings only)
+
 ### 2026-03-06 — Build 31: Fix Contradictory Subscription UI (Strategy Overhaul)
 
 **Problem:** Build 30 on real iOS TestFlight showed contradictory subscription states on the same screen: our injected "Companion Active" banner alongside Base44's own "Companion isn't active on this account" text. Mock tests passed because they only modeled OUR injected UI, not Base44's independent React rendering.
