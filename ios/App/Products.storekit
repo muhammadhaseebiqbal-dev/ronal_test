@@ -1,0 +1,51 @@
+{
+  "identifier" : "com.abideandanchor.companion",
+  "type" : "subscriptions",
+  "version" : 2,
+  "subscriptionGroups" : [
+    {
+      "id" : "20B0F6A3",
+      "localizations" : [
+        {
+          "description" : "Access all Companion features",
+          "displayName" : "Companion",
+          "locale" : "en_US"
+        }
+      ],
+      "name" : "Companion",
+      "subscriptions" : [
+        {
+          "adHocOffers" : [],
+          "codeOffers" : [],
+          "displayPrice" : "9.99",
+          "familyShareable" : false,
+          "groupNumber" : 1,
+          "internalID" : "6745A1B2",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Monthly access to Companion features",
+              "displayName" : "Companion Monthly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.abideandanchor.companion.monthly",
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "Companion Monthly",
+          "subscriptionGroupID" : "20B0F6A3",
+          "type" : "RecurringSubscription"
+        }
+      ]
+    }
+  ],
+  "settings" : {
+    "_failTransactionsEnabled" : false,
+    "_storeKitErrors" : [
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Load Products"
+      }
+    ]
+  }
+}
