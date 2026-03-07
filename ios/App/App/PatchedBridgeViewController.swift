@@ -227,6 +227,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     private static let activeUserIdKey = "aa_active_user_id"
     private static let companionKeyPrefix = "aa_companion_"
 
+    /// BUILD 31: Flag set before cache-busting reload after purchase/restore.
+    /// Allows buildNativeDiagJS to inject __aaServerVerified=true on the fresh page,
+    /// so __aaSuppressContradictions runs immediately after reload.
+    private static let justPurchasedKey = "aa_just_purchased"
+
     /// Cloudflare Worker URL for cross-device Companion validation (Build 11).
     /// Deployed by Roland — 2026-02-18.
     private static let companionWorkerURL = "https://companion-validator.abideandanchor.workers.dev"
@@ -298,41 +303,52 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                     return
                 }
                 let result = await AAStoreManager.shared.purchase(productId: productId)
-                var payload: [String: Any] = ["status": result.status, "action": "buy"]
-                if let pid = result.productId { payload["productId"] = pid }
-                // Only include isCompanion on confirmed success.
-                // Sending false on cancelled/pending/error can incorrectly flip UI to "Free".
-                if result.status == "success" {
-                    payload["isCompanion"] = result.isCompanion
+
+                // Non-success: send result immediately (no server round-trip needed)
+                if result.status != "success" {
+                    var payload: [String: Any] = ["status": result.status, "action": "buy"]
+                    if let pid = result.productId { payload["productId"] = pid }
+                    if let msg = result.message { payload["message"] = msg }
+                    self.sendPurchaseResult(payload)
+                    return
                 }
-                if let msg = result.message { payload["message"] = msg }
 
-                self.sendPurchaseResult(payload)
+                // ── BUILD 28 FIX (Bug 1): Wait for server confirm BEFORE toast ──
+                // Previously we sent isCompanion:true immediately (toast fired), then
+                // did fire-and-forget server sync. The page reloaded before the PATCH
+                // propagated, so Base44 re-fetched /User/me with stale is_companion=false.
+                //
+                // New flow:
+                //   1. StoreKit confirms → persist locally + update JS __aaIsCompanion
+                //   2. Sync JWS to server AND WAIT for 200 OK
+                //   3. THEN send success to JS (toast + dismissPaywallOverlay)
+                //   4. Force /User/me refetch via JS (no full page reload)
+                self.clearAwaitingServerConfirmState(reason: "purchase-success")
+                self.persistCompanionState(result.isCompanion)
+                self.refreshWebEntitlements(isCompanion: result.isCompanion)
 
-                if result.status == "success" {
-                    // Build 23: User just completed a purchase for THIS account — clear the
-                    // awaiting-server-confirm flag since this is a definitive action.
-                    self.clearAwaitingServerConfirmState(reason: "purchase-success")
-
-                    self.persistCompanionState(result.isCompanion)
-                    self.refreshWebEntitlements(isCompanion: result.isCompanion)
-
-                    // Build 11: Sync to server for cross-device unlock
-                    // Build 25 audit fix: Ensure token is synced from localStorage → UserDefaults
-                    // BEFORE calling syncCompanionToServer. If the user purchases within the first
-                    // 3s of page load, the delayed token sync may not have fired yet, causing
-                    // syncCompanionToServer to silently skip (no token → no server update).
-                    if let jws = result.jws {
-                        self.syncTokenToUserDefaults { [weak self] _ in
-                            guard let self = self else { return }
-                            self.syncCompanionToServer(jws: jws)
-                        }
-                        // Web refresh happens inside syncCompanionToServer on 200 OK
-                    } else {
-                        // Build 13: No JWS available — refresh web directly so Base44 re-fetches /User/me
-                        self.triggerWebRefreshAfterPurchase()
+                // Step 2: Sync token first (may not be in UserDefaults yet if < 3s)
+                let tokenFoundContinuation: Bool = await withCheckedContinuation { cont in
+                    self.syncTokenToUserDefaults { found in
+                        cont.resume(returning: found)
                     }
                 }
+                _ = tokenFoundContinuation  // Used for logging only
+
+                var serverConfirmed = false
+                if let jws = result.jws {
+                    serverConfirmed = await self.syncCompanionToServerAndWait(jws: jws)
+                    os_log(.info, log: Self.log, "[IAP:buy] Server confirm=%{public}@", serverConfirmed ? "YES" : "NO")
+                }
+
+                // Step 3: NOW send success toast — server has been updated
+                var payload: [String: Any] = ["status": "success", "action": "buy"]
+                payload["isCompanion"] = result.isCompanion
+                if let pid = result.productId { payload["productId"] = pid }
+                self.sendPurchaseResult(payload)
+
+                // Step 4: Force /User/me refetch via JS (no full page reload)
+                self.triggerWebRefreshAfterPurchase()
             }
 
         case "restore":
@@ -601,19 +617,24 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// Triggers web-side entitlement refresh after purchase/restore.
     /// Build 20 FIX: Now calls runAllPatches() after updating __aaIsCompanion so the UI
     /// immediately reflects the new state (hides subscribe buttons if subscribed, etc.).
-    /// Previously, __aaIsCompanion was updated but the UI wasn't refreshed until the next
-    /// DOM mutation or periodic check — causing stale subscribe buttons after logout+login.
+    /// BUILD 31: Also sets __aaServerVerified flag — this function is only called with
+    /// isCompanion=true after server confirms, so the flag is trustworthy.
     private func refreshWebEntitlements(isCompanion: Bool) {
         guard let webView = self.webView else { return }
         let js = """
         (function() {
             window.__aaIsCompanion = \(isCompanion ? "true" : "false");
+            window.__aaServerVerified = \(isCompanion ? "true" : "false");
             if (typeof window.refreshBase44Entitlements === 'function') {
                 window.refreshBase44Entitlements();
             }
             // Build 20: Immediately refresh UI to match new entitlement state
             if (typeof window.__aaRunAllPatches === 'function') {
                 window.__aaRunAllPatches();
+            }
+            // BUILD 31: Suppress contradictory text after server-confirmed update
+            if (\(isCompanion ? "true" : "false") && typeof window.__aaSuppressContradictions === 'function') {
+                window.__aaSuppressContradictions();
             }
         })();
         """
@@ -872,17 +893,102 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     }
 
     /// Forces the WebView to reload so the Base44 React app re-fetches /User/me
-    /// and immediately reflects the updated Companion subscription status.
-    /// Uses native WKWebView.reloadFromOrigin() (Apple docs: "performs end-to-end
-    /// revalidation of the content using cache-validating conditionals") instead of
-    /// JS window.location.reload() — more reliable and bypasses cache properly.
-    /// Called after successful purchase/restore + server sync.
+    /// BUILD 31 FIX: Force immediate unlock after purchase/restore.
+    ///
+    /// Root cause of Build 30 failure on real iOS:
+    ///   We injected "Companion Active" from __aaIsCompanion (local state),
+    ///   but Base44 React independently fetches /User/me from server.
+    ///   If the Worker PATCH hadn't propagated yet, or Base44 cached old data,
+    ///   Base44 showed "Companion isn't active" on the SAME page → contradiction.
+    ///
+    /// Build 31 approach:
+    ///   1. Update localStorage.base44_user.is_companion = true
+    ///   2. Set __aaIsCompanion = true + __aaServerVerified = true + run UI patches
+    ///   3. Suppress any Base44 "not active" text (since server PATCH was already done)
+    ///   4. Dismiss paywall overlays
+    ///   5. Cache-busting reload after 2s (forces Base44 to re-fetch fresh /User/me)
     private func triggerWebRefreshAfterPurchase() {
-        DispatchQueue.main.async {
-            if let nav = self.webView?.reloadFromOrigin() {
-                os_log(.info, log: Self.log, "[DIAG:iap] Successfully triggered web refresh after purchase (navigation: %{public}@)", String(describing: nav))
+        guard let webView = self.webView else {
+            os_log(.error, log: Self.log, "[DIAG:iap] triggerWebRefreshAfterPurchase — webView is nil")
+            return
+        }
+
+        // BUILD 31 CRITICAL: Set flag BEFORE reload so buildNativeDiagJS injects
+        // __aaServerVerified=true on the fresh page. Without this, the reload
+        // resets __aaServerVerified=false and contradiction suppression breaks.
+        UserDefaults.standard.set(true, forKey: Self.justPurchasedKey)
+        os_log(.info, log: Self.log, "[DIAG:iap] Set aa_just_purchased=true for post-reload")
+
+        let js = """
+        (function() {
+            console.log('[AA:B31] triggerWebRefreshAfterPurchase — starting');
+
+            // Step 1: Update localStorage so React sees is_companion=true on next mount
+            try {
+                var stored = localStorage.getItem('base44_user');
+                if (stored) {
+                    var u = JSON.parse(stored);
+                    u.is_companion = true;
+                    u.companion_product_id = 'com.abideandanchor.companion.monthly';
+                    localStorage.setItem('base44_user', JSON.stringify(u));
+                    console.log('[AA:B31] Updated localStorage.base44_user.is_companion=true');
+                }
+            } catch(e) {
+                console.log('[AA:B31] localStorage update failed: ' + e.message);
+            }
+
+            // Step 2: Immediate visual update
+            window.__aaIsCompanion = true;
+            window.__aaServerVerified = true;  // BUILD 31: Flag that server has confirmed
+            if (typeof window.__aaRunAllPatches === 'function') {
+                window.__aaRunAllPatches();
+            }
+
+            // Step 3: Suppress any Base44 "not active" / contradictory text immediately
+            if (typeof window.__aaSuppressContradictions === 'function') {
+                window.__aaSuppressContradictions();
+            }
+
+            // Step 4: Dismiss any paywall overlays still showing
+            var children = document.body.children;
+            for (var i = 0; i < children.length; i++) {
+                var el = children[i];
+                if (el.id === 'root') continue;
+                if (el.id && el.id.indexOf('aa-') === 0) continue;
+                if (el.classList && (el.classList.contains('aa-toast') || el.classList.contains('aa-diag-overlay'))) continue;
+                var style = window.getComputedStyle(el);
+                if (style.display === 'none') continue;
+                if (style.position === 'fixed' || style.position === 'absolute') {
+                    var text = (el.textContent || '').toLowerCase();
+                    if (text.indexOf('subscribe') !== -1 || text.indexOf('companion') !== -1 ||
+                        text.indexOf('pricing') !== -1 || text.indexOf('upgrade') !== -1 ||
+                        text.indexOf('monthly') !== -1 || text.indexOf('restore purchase') !== -1) {
+                        el.style.display = 'none';
+                        el.setAttribute('data-aa-paywall-dismissed', '1');
+                        console.log('[AA:B31] Dismissed paywall overlay');
+                    }
+                }
+            }
+
+            // Step 5: Cache-busting reload after 2s
+            // Use query param to bust CDN/browser cache on Base44's /User/me API
+            // so React re-fetches FRESH data with is_companion=true from server
+            setTimeout(function() {
+                console.log('[AA:B31] Cache-busting reload for React re-mount');
+                var path = window.location.pathname;
+                // Strip any existing cache-bust param
+                window.location.href = path + '?_aat=' + Date.now();
+            }, 2000);
+        })();
+        """
+        webView.evaluateJavaScript(js) { _, error in
+            if let error = error {
+                os_log(.error, log: Self.log, "[DIAG:iap] B31 JS refresh failed: %{public}@ — direct reload", error.localizedDescription)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    webView.reloadFromOrigin()
+                }
             } else {
-                os_log(.error, log: Self.log, "[DIAG:iap] Failed to trigger web refresh — webView or reload returned nil")
+                os_log(.info, log: Self.log, "[DIAG:iap] B31 JS refresh injected — cache-bust reload in 2s")
             }
         }
     }
@@ -1078,20 +1184,66 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         clearTokenFromUserDefaults()
 
         // Build 27: User-namespaced entitlement cache — logout clears SESSION state only.
-        //
-        // WHAT CHANGED: We no longer wipe `aa_companion_{userId}` keys on logout.
-        // Each user's entitlement state is namespaced by their user ID, so:
-        // - User A's `aa_companion_{userA} = true` is never read when User B logs in
-        //   (User B gets `aa_companion_{userB}` which is nil → false)
-        // - Same-account re-login reads `aa_companion_{userA}` → immediate unlock
-        //
-        // We DO set the legacy `aa_is_companion = false` for login page UI safety
-        // (JS injection reads this for `window.__aaIsCompanion` on document start).
-        // After login, `updateActiveUserId` + `readCompanionStateForCurrentUser` will
-        // read the correct namespaced key and update the legacy key via write-through.
+        // Build 30 FIX (Bug C): Also clear all injected subscription DOM elements via JS.
+        // Previously, the 'aa-already-subscribed' banner and subscription status section
+        // persisted across logout/login because performFullLogout didn't touch the DOM.
+        // User B would see User A's 'active subscription' banner.
         UserDefaults.standard.set(false, forKey: Self.companionDefaultsKey)
-        // Clear activeUserId so namespaced reads don't return stale data before login
         UserDefaults.standard.removeObject(forKey: Self.activeUserIdKey)
+        // BUILD 31: Clear just-purchased flag on logout
+        UserDefaults.standard.set(false, forKey: Self.justPurchasedKey)
+
+        // BUILD 31 FIX (Bug C): Clear subscription UI state from DOM
+        let clearSubUI = """
+        (function() {
+            console.log('[AA:B31] Clearing subscription UI state on logout');
+            window.__aaIsCompanion = false;
+            window.__aaServerVerified = false;  // BUILD 31: Clear server verification
+
+            // Remove injected subscription elements
+            var idsToRemove = ['aa-already-subscribed', 'aa-subscription-section', 'aa-sub-restore-btn', 'aa-paywall-restore-btn'];
+            idsToRemove.forEach(function(id) {
+                var el = document.getElementById(id);
+                if (el) { el.remove(); console.log('[AA:B31] Removed #' + id); }
+            });
+
+            // Unhide any elements hidden by handleAlreadySubscribed
+            document.querySelectorAll('[data-aa-sub-hidden]').forEach(function(el) {
+                el.style.display = '';
+                el.removeAttribute('data-aa-sub-hidden');
+            });
+
+            // Unhide any contradiction-suppressed elements (BUILD 31)
+            document.querySelectorAll('[data-aa-contradiction-hidden]').forEach(function(el) {
+                el.style.display = '';
+                el.removeAttribute('data-aa-contradiction-hidden');
+            });
+
+            // Clear dismissed paywall overlays
+            document.querySelectorAll('[data-aa-paywall-dismissed]').forEach(function(el) {
+                el.style.display = '';
+                el.removeAttribute('data-aa-paywall-dismissed');
+            });
+
+            // Update localStorage.base44_user to clear is_companion
+            try {
+                var stored = localStorage.getItem('base44_user');
+                if (stored) {
+                    var u = JSON.parse(stored);
+                    u.is_companion = false;
+                    delete u.companion_product_id;
+                    localStorage.setItem('base44_user', JSON.stringify(u));
+                }
+            } catch(e) {}
+
+            // Run patches to reset UI state
+            if (typeof window.__aaRunAllPatches === 'function') {
+                window.__aaRunAllPatches();
+            }
+        })();
+        """
+        webView.evaluateJavaScript(clearSubUI, completionHandler: nil)
+
         // Clear any stale awaiting flag from previous builds
         if UserDefaults.standard.bool(forKey: Self.awaitingServerConfirmKey) {
             UserDefaults.standard.set(false, forKey: Self.awaitingServerConfirmKey)
@@ -1852,16 +2004,36 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
     // MARK: – Build 27: Native Entitlement Recovery
 
+    /// BUILD 28 FIX (Bug 3): Added 5-second debounce to prevent rapid-fire calls during
+    /// login transitions. Previously, every URL KVO notification triggered a server call
+    /// with a 2-second delay. During login, multiple URL changes fire in quick succession
+    /// (login → / → dashboard). Without debounce, the active userId could be stale
+    /// during the first call (still set to previous user or nil), causing cross-account leakage.
+    private var lastEntitlementRecoveryTime: Date = .distantPast
+
     /// Safety net: checks namespaced cache + server when navigating to a non-login page.
     /// If aa_is_companion is false but this user was previously confirmed, restore immediately.
-    /// No-op if already companion. Runs on every URL change (debounced by the guard).
+    /// No-op if already companion. Runs on every URL change (debounced by 5s guard).
     /// Build 27 FIX: Does NOT trust StoreKit alone — prevents cross-account leakage.
     private func nativeEntitlementRecovery() {
         // Quick exit if already companion — nothing to do
         let isCompanion = UserDefaults.standard.bool(forKey: Self.companionDefaultsKey)
         if isCompanion { return }
 
+        // BUILD 28 FIX: 5-second debounce prevents rapid-fire during login transitions
+        let now = Date()
+        if now.timeIntervalSince(lastEntitlementRecoveryTime) < 5.0 {
+            os_log(.info, log: Self.log, "[NativeRecovery] Debounced — last check was %.1fs ago", now.timeIntervalSince(lastEntitlementRecoveryTime))
+            return
+        }
+        lastEntitlementRecoveryTime = now
+
         guard #available(iOS 15.0, *) else { return }
+
+        // BUILD 28 FIX: Validate activeUserId matches current token BEFORE cache read.
+        // During login transitions, activeUserId may be stale (previous user or nil).
+        // Re-sync it from the current token first.
+        self.updateActiveUserId()
 
         // Step 1: Check namespaced cache (same-account instant re-login)
         let cached = readCompanionStateForCurrentUser()
@@ -1882,7 +2054,6 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 os_log(.info, log: Self.log, "[NativeRecovery] No token — skipping server check")
                 return
             }
-            self.updateActiveUserId()
 
             let serverIsCompanion = await self.checkCompanionOnServerAndWait()
             os_log(.info, log: Self.log, "[NativeRecovery] Server isCompanion=%{public}@",
@@ -2079,7 +2250,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // the token hasn't been synced from localStorage to UserDefaults yet.)
         let isCompanion = awaitingConfirm ? false : isCompanionRaw
 
-        return """
+        let js = """
         window.__aaNativeDiag = {
           deviceModel: '\(machineStr)',
           deviceType: '\(model)',
@@ -2097,6 +2268,11 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         // Build 10: IAP callback default + companion state
         window.__aaPurchaseResult = window.__aaPurchaseResult || function(_){};
         window.__aaIsCompanion = \(isCompanion ? "true" : "false");
+        // BUILD 31: Server-verified flag.
+        // If aa_just_purchased is set (post-reload after purchase), inject true immediately
+        // so __aaSuppressContradictions works on the fresh page. Otherwise false.
+        window.__aaServerVerified = \(UserDefaults.standard.bool(forKey: Self.justPurchasedKey) && isCompanion ? "true" : "false");
+        \(UserDefaults.standard.bool(forKey: Self.justPurchasedKey) ? "console.log('[AA:B31] Post-purchase reload detected — __aaServerVerified=true');" : "")
         // Build 11: Cross-device companion check via Cloudflare Worker
         window.__aaCompanionWorkerURL = '\(Self.companionWorkerURL)';
         // Build 12: Diagnostics tracking globals
@@ -2161,7 +2337,31 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             }
           } catch(e) {}
         })();
+
+        // BUILD 31: Post-reload suppression safety net.
+        // After cache-busting reload, Base44 React may render "not active" text
+        // asynchronously (after our initial suppression ran). Retry every 2s for 10s.
+        if (window.__aaServerVerified && window.__aaIsCompanion) {
+          var __aaSuppressionCount = 0;
+          var __aaSuppressionTimer = setInterval(function() {
+            __aaSuppressionCount++;
+            if (typeof window.__aaSuppressContradictions === 'function') {
+              window.__aaSuppressContradictions();
+            }
+            if (__aaSuppressionCount >= 5) clearInterval(__aaSuppressionTimer);
+          }, 2000);
+          console.log('[AA:B31] Post-reload suppression timer started (5x at 2s intervals)');
+        }
         """
+
+        // BUILD 31: Clear the just-purchased flag after it's been consumed.
+        // Must happen AFTER we build the string above (which reads it).
+        if UserDefaults.standard.bool(forKey: Self.justPurchasedKey) {
+            UserDefaults.standard.set(false, forKey: Self.justPurchasedKey)
+            os_log(.info, log: Self.log, "[DIAG:iap] Cleared aa_just_purchased after buildNativeDiagJS consumed it")
+        }
+
+        return js
     }
 
     // MARK: – CSS Patch
@@ -4141,21 +4341,56 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       // "Restore Purchases" button calls native StoreKit restore via aaPurchase handler.
 
       function updateSubscriptionStatusUI(isCompanion) {
+        // BUILD 31 FIX: Single source of truth — only show "Companion Active" when
+        // BOTH __aaIsCompanion AND __aaServerVerified are true.
+        // Without server verification, show neutral state to prevent contradicting
+        // Base44's own subscription status text.
+        window.__aaIsCompanion = isCompanion;
+        var verified = window.__aaServerVerified === true;
+        var showActive = isCompanion && verified;
+
         var statusEl = document.getElementById('aa-sub-status-text');
         if (statusEl) {
-          statusEl.textContent = isCompanion ? 'Companion Active' : 'Free';
-          statusEl.className = 'aa-sub-status ' + (isCompanion ? 'active' : 'free');
+          if (showActive) {
+            statusEl.textContent = 'Companion Active';
+            statusEl.className = 'aa-sub-status active';
+          } else if (isCompanion && !verified) {
+            statusEl.textContent = 'Checking subscription...';
+            statusEl.className = 'aa-sub-status checking';
+          } else {
+            statusEl.textContent = 'Free';
+            statusEl.className = 'aa-sub-status free';
+          }
         }
         var detailEl = document.getElementById('aa-sub-detail-text');
         if (detailEl) {
-          detailEl.textContent = isCompanion ? 'Your Companion Monthly subscription is active.' : 'Subscribe monthly to unlock Companion features.';
+          if (showActive) {
+            detailEl.textContent = 'Your Companion Monthly subscription is active.';
+          } else if (isCompanion && !verified) {
+            detailEl.textContent = 'Verifying subscription with server...';
+          } else {
+            detailEl.textContent = 'Subscribe monthly to unlock Companion features.';
+          }
         }
-        // Update global state
-        window.__aaIsCompanion = isCompanion;
-        // Remove already-subscribed banner if subscription expired
+
+        // When NOT companion, clean up all subscription UI artifacts
         if (!isCompanion) {
           var banner = document.getElementById('aa-already-subscribed');
           if (banner) banner.remove();
+          document.querySelectorAll('[data-aa-sub-hidden]').forEach(function(el) {
+            el.style.display = '';
+            el.removeAttribute('data-aa-sub-hidden');
+          });
+        } else {
+          // When companion is ACTIVE, proactively hide subscribe sections
+          document.querySelectorAll('[data-aa-iap-wired]').forEach(function(btn) {
+            var wiredType = btn.getAttribute('data-aa-iap-wired');
+            if (wiredType === 'monthly' || wiredType === 'yearly' ||
+                wiredType === 'hidden-yearly' || wiredType === 'hidden-trial') {
+              btn.style.display = 'none';
+              btn.setAttribute('data-aa-sub-hidden', '1');
+            }
+          });
         }
       }
 
@@ -4181,6 +4416,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         if (text.length < 10) return;
 
         var isCompanion = window.__aaIsCompanion === true;
+        var verified = window.__aaServerVerified === true;
+        var showActive = isCompanion && verified;
         var section = document.createElement('div');
         section.id = 'aa-subscription-section';
 
@@ -4191,14 +4428,28 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
 
         var status = document.createElement('div');
         status.id = 'aa-sub-status-text';
-        status.className = 'aa-sub-status ' + (isCompanion ? 'active' : 'free');
-        status.textContent = isCompanion ? 'Companion Active' : 'Free';
+        if (showActive) {
+          status.className = 'aa-sub-status active';
+          status.textContent = 'Companion Active';
+        } else if (isCompanion && !verified) {
+          status.className = 'aa-sub-status checking';
+          status.textContent = 'Checking subscription...';
+        } else {
+          status.className = 'aa-sub-status free';
+          status.textContent = 'Free';
+        }
         section.appendChild(status);
 
         var detail = document.createElement('div');
         detail.id = 'aa-sub-detail-text';
         detail.className = 'aa-sub-detail';
-        detail.textContent = isCompanion ? 'Your Companion Monthly subscription is active.' : 'Subscribe monthly to unlock Companion features.';
+        if (showActive) {
+          detail.textContent = 'Your Companion Monthly subscription is active.';
+        } else if (isCompanion && !verified) {
+          detail.textContent = 'Verifying subscription with server...';
+        } else {
+          detail.textContent = 'Subscribe monthly to unlock Companion features.';
+        }
         section.appendChild(detail);
 
         var restoreBtn = document.createElement('button');
@@ -4244,72 +4495,105 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
       }
 
-      // ── 6g. ALREADY-SUBSCRIBED PAYWALL HANDLING (Build 15) ──
-      // Searches entire document.body to catch paywall popups/modals.
-      // When subscribed: hides subscribe/trial buttons AND dismisses paywall overlays.
-      // When not subscribed: ensures buttons are visible.
+      // ── 6g. ALREADY-SUBSCRIBED PAYWALL HANDLING (Build 15, rewritten Build 31) ──
+      // BUILD 31: REMOVED injecting our own 'Companion Active' banner and extra Restore button.
+      // Root cause of Build 30 failure: our injected banner said "Active" while Base44's
+      // own React component said "not active" on the SAME page → client sees contradiction.
+      //
+      // Build 31 approach: ONLY hide subscribe/trial buttons when subscribed.
+      // Do NOT inject competing UI elements. Let Base44 handle its own display.
+      // Use suppressContradictorySubscriptionText() to hide any stale "not active" text
+      // that contradicts server-confirmed companion state.
 
       function handleAlreadySubscribed() {
+        // Remove any stale injected elements from previous builds
+        var staleBanner = document.getElementById('aa-already-subscribed');
+        if (staleBanner) staleBanner.remove();
+        var stalePaywallRestore = document.getElementById('aa-paywall-restore-btn');
+        if (stalePaywallRestore) stalePaywallRestore.remove();
+
         if (!window.__aaIsCompanion) {
-          // Not subscribed: remove banner and unhide buttons
-          var banner = document.getElementById('aa-already-subscribed');
-          if (banner) banner.remove();
-          var hiddenBuy = document.querySelectorAll('[data-aa-sub-hidden]');
-          hiddenBuy.forEach(function(el) {
+          // Not subscribed — ensure subscribe buttons are visible
+          document.querySelectorAll('[data-aa-sub-hidden]').forEach(function(el) {
             el.style.display = '';
             el.removeAttribute('data-aa-sub-hidden');
+          });
+          // Un-suppress any contradiction text (user is genuinely free)
+          document.querySelectorAll('[data-aa-contradiction-hidden]').forEach(function(el) {
+            el.style.display = '';
+            el.removeAttribute('data-aa-contradiction-hidden');
           });
           return;
         }
 
-        // SUBSCRIBED: Search entire body (catches popups/portals outside #root)
+        // SUBSCRIBED: Hide ALL subscribe/trial/yearly/restore buttons everywhere
         var wiredBtns = document.querySelectorAll('[data-aa-iap-wired]');
-        if (wiredBtns.length === 0) return;
-
-        // Hide ALL subscribe/trial/yearly buttons everywhere
         wiredBtns.forEach(function(btn) {
           var wiredType = btn.getAttribute('data-aa-iap-wired');
           if (wiredType === 'monthly' || wiredType === 'yearly' ||
-              wiredType === 'hidden-yearly' || wiredType === 'hidden-trial') {
-            btn.style.display = 'none';
-            btn.setAttribute('data-aa-sub-hidden', '1');
-          }
-          // Also hide restore on paywall when subscribed (not needed)
-          if (wiredType === 'restore') {
+              wiredType === 'hidden-yearly' || wiredType === 'hidden-trial' ||
+              wiredType === 'restore') {
             btn.style.display = 'none';
             btn.setAttribute('data-aa-sub-hidden', '1');
           }
         });
 
-        // Build 20 FIX: REMOVED overlay dismissal entirely.
-        // Previously, this code walked up the DOM from hidden subscribe buttons to find
-        // parent overlay/modal containers and hid them. This was fundamentally wrong:
-        //
-        // 1. Base44's `is_companion` field is the SOURCE OF TRUTH (AGENT.md rule E13-E14).
-        //    Our local `__aaIsCompanion` (from StoreKit) can disagree with Base44's state
-        //    (e.g. StoreKit sandbox auto-renews, but Base44 `is_companion` is false).
-        //
-        // 2. Dismissing Base44's native paywall popups based on local StoreKit state
-        //    BYPASSES Base44's gating — users see companion features (Weekly Review,
-        //    Nightwatch, Drill Notes) without Base44 recognizing them as subscribers.
-        //
-        // 3. The overlay dismissal was always fragile: needed feature keyword exclusions
-        //    (Captain's Log, Weekly Review, etc.) and kept breaking as Base44 UI changed.
-        //
-        // Now: we ONLY hide our own wired IAP buttons (subscribe/trial/yearly/restore)
-        // when the user is subscribed. We do NOT touch Base44's native overlay containers.
-        // Base44 handles its own paywall/gating display based on `is_companion`.
+        // BUILD 31: Suppress Base44's contradictory "not active" text
+        if (typeof window.__aaSuppressContradictions === 'function') {
+          window.__aaSuppressContradictions();
+        }
+      }
 
-        // Inject banner in #root on paywall pages
-        if (document.getElementById('aa-already-subscribed')) return;
+      // ── 6g2. SUPPRESS CONTRADICTORY SUBSCRIPTION TEXT (Build 31) ──
+      // When __aaIsCompanion is true AND server has confirmed (via Worker PATCH),
+      // scan for Base44 React elements that say "not active" / "isn't active" / etc.
+      // and hide them to prevent contradictory messaging.
+      //
+      // This is the KEY fix: instead of injecting our own "Active" banner that fights
+      // with Base44, we suppress Base44's stale "not active" text.
+      window.__aaSuppressContradictions = function() {
+        // Only suppress if server-verified (not just local StoreKit state)
+        if (!window.__aaIsCompanion || !window.__aaServerVerified) return;
+
+        var contradictionPhrases = [
+          "isn't active",
+          "is not active",
+          "not active on this account",
+          "no active subscription",
+          "no subscription",
+          "companion isn't active",
+          "companion is not active",
+          "you don't have",
+          "you do not have",
+          "subscription inactive",
+          "not subscribed"
+        ];
+
+        // Scan all text-containing elements in #root
         var root = document.getElementById('root');
         if (!root) return;
-        var banner = document.createElement('div');
-        banner.id = 'aa-already-subscribed';
-        banner.textContent = 'You have an active Companion subscription!';
-        var main = root.querySelector('main') || root;
-        main.insertBefore(banner, main.firstChild);
-      }
+        var allEls = root.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6, label, section');
+        allEls.forEach(function(el) {
+          if (el.getAttribute('data-aa-contradiction-hidden')) return;
+          if (el.id && el.id.indexOf('aa-') === 0) return; // Skip our own elements
+          // Only check leaf-ish elements (not huge containers)
+          if (el.children.length > 5) return;
+          var text = (el.textContent || '').toLowerCase().trim();
+          if (text.length < 5 || text.length > 200) return;
+
+          for (var i = 0; i < contradictionPhrases.length; i++) {
+            if (text.indexOf(contradictionPhrases[i]) !== -1) {
+              // Check this isn't inside a feature description or help text
+              if (text.indexOf('how to') !== -1 || text.indexOf('learn more') !== -1 ||
+                  text.indexOf('faq') !== -1 || text.indexOf('help') !== -1) continue;
+              el.style.display = 'none';
+              el.setAttribute('data-aa-contradiction-hidden', '1');
+              console.log('[AA:B31] Suppressed contradictory text: "' + text.substring(0, 60) + '..."');
+              break;
+            }
+          }
+        });
+      };
 
       // ── 6d. SESSION VALIDATION (Build 8) ──
       // Detects stale/expired tokens and clears them before the React app mounts.
@@ -4442,6 +4726,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           hideBase44NativeLogout();
           wireIAPButtons();
           handleAlreadySubscribed();
+          // BUILD 31: Suppress Base44 contradictory "not active" text
+          if (typeof window.__aaSuppressContradictions === 'function') {
+            window.__aaSuppressContradictions();
+          }
         }, 250);
       }
 

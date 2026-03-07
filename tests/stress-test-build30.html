@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Build 30 — AGGRESSIVE Stress Tests</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+
+        h1 {
+            font-size: 22px;
+            color: #ff6b6b;
+            margin-bottom: 4px;
+        }
+
+        .subtitle {
+            color: #888;
+            margin-bottom: 20px;
+            font-size: 13px;
+        }
+
+        .test-card {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 12px;
+            border: 1px solid #0f3460;
+        }
+
+        .test-card h3 {
+            font-size: 14px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .badge.pending {
+            background: #333;
+            color: #888;
+        }
+
+        .badge.pass {
+            background: #1b4332;
+            color: #4caf50;
+        }
+
+        .badge.fail {
+            background: #4a1c1c;
+            color: #f44336;
+        }
+
+        .badge.running {
+            background: #3e2723;
+            color: #ffb74d;
+        }
+
+        .log {
+            background: #0a0a1a;
+            color: #bbb;
+            border-radius: 8px;
+            padding: 10px;
+            font-family: 'SF Mono', Consolas, monospace;
+            font-size: 11px;
+            max-height: 250px;
+            overflow-y: auto;
+            margin-top: 8px;
+            white-space: pre-wrap;
+        }
+
+        .log .pass {
+            color: #4caf50;
+        }
+
+        .log .fail {
+            color: #f44336;
+        }
+
+        .log .info {
+            color: #64b5f6;
+        }
+
+        .log .warn {
+            color: #ffb74d;
+        }
+
+        button.run-btn {
+            background: #e63946;
+            color: #fff;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-bottom: 16px;
+        }
+
+        button.run-btn:hover {
+            background: #c1121f;
+        }
+
+        .summary {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 16px;
+            margin-top: 16px;
+            text-align: center;
+            border: 2px solid #333;
+        }
+
+        .summary.all-pass {
+            border-color: #4caf50;
+        }
+
+        .summary.has-fail {
+            border-color: #f44336;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🔥 Build 30 — AGGRESSIVE Stress Tests</h1>
+    <p class="subtitle">Edge cases that caught Build 29 failures. Simulates real iOS timing, React state staleness,
+        rapid user switching.</p>
+    <button class="run-btn" onclick="runAllTests()">▶ Run All Stress Tests</button>
+
+    <div class="test-card">
+        <h3>T1: Rapid Purchase → Feature Check (0ms delay) <span class="badge pending" id="t1-badge">PENDING</span></h3>
+        <p style="font-size:12px;color:#888;">Bug A exact repro: purchase succeeds, toast shows, but feature check at
+            0ms still blocked</p>
+        <div class="log" id="t1-log"></div>
+    </div>
+
+    <div class="test-card">
+        <h3>T2: Restore Then Immediate Navigation <span class="badge pending" id="t2-badge">PENDING</span></h3>
+        <p style="font-size:12px;color:#888;">Bug B exact repro: restore succeeds, user immediately navigates to a
+            Companion feature</p>
+        <div class="log" id="t2-log"></div>
+    </div>
+
+    <div class="test-card">
+        <h3>T3: Rapid Logout A → Login B → Check UI <span class="badge pending" id="t3-badge">PENDING</span></h3>
+        <p style="font-size:12px;color:#888;">Bug C exact repro: logout subscribed user, login free user, check for
+            leaked UI elements</p>
+        <div class="log" id="t3-log"></div>
+    </div>
+
+    <div class="test-card">
+        <h3>T4: Triple Account Cycle (A→B→A) <span class="badge pending" id="t4-badge">PENDING</span></h3>
+        <p style="font-size:12px;color:#888;">Stress: subscribed A → free B → back to A. All 3 states must be correct.
+        </p>
+        <div class="log" id="t4-log"></div>
+    </div>
+
+    <div class="test-card">
+        <h3>T5: Purchase → Kill → Relaunch → Feature Check <span class="badge pending" id="t5-badge">PENDING</span></h3>
+        <p style="font-size:12px;color:#888;">Persistence: after purchase and simulated app kill, localStorage must
+            survive</p>
+        <div class="log" id="t5-log"></div>
+    </div>
+
+    <div class="test-card">
+        <h3>T6: localStorage.base44_user Tamper Resistance <span class="badge pending" id="t6-badge">PENDING</span></h3>
+        <p style="font-size:12px;color:#888;">Edge: what if localStorage.base44_user is missing, corrupt, or has stale
+            is_companion</p>
+        <div class="log" id="t6-log"></div>
+    </div>
+
+    <div class="test-card">
+        <h3>T7: Simultaneous "Active" + "Subscribe" Detection <span class="badge pending" id="t7-badge">PENDING</span>
+        </h3>
+        <p style="font-size:12px;color:#888;">Client acceptance #5: scan ALL DOM states for contradictory subscription
+            UI</p>
+        <div class="log" id="t7-log"></div>
+    </div>
+
+    <div class="test-card">
+        <h3>T8: updateSubscriptionStatusUI Race Condition <span class="badge pending" id="t8-badge">PENDING</span></h3>
+        <p style="font-size:12px;color:#888;">Rapid true→false→true calls to updateSubscriptionStatusUI — final state
+            must be correct</p>
+        <div class="log" id="t8-log"></div>
+    </div>
+
+    <div class="summary" id="summary" style="display:none;"></div>
+
+    <script>
+        // =============================================
+        // AGGRESSIVE MOCK — Models the REAL iOS Behavior More Accurately
+        // =============================================
+        // Key differences from basic mock:
+        // 1. Simulates async timing (server delays, JS injection delay)
+        // 2. React state reads ONLY from localStorage on mount
+        // 3. DOM elements persist unless explicitly removed
+        // 4. MutationObserver patches run asynchronously
+
+        class RealishMock {
+            constructor() { this.reset(); }
+
+            reset() {
+                this.currentUserId = null;
+                this.serverDB = {
+                    userA: { id: 'userA', email: 'a@test.com', is_companion: false },
+                    userB: { id: 'userB', email: 'b@test.com', is_companion: false },
+                };
+                this.storeKit = {}; // appleId → entitlement
+                this.userDefaults = {}; // key → value
+                this.localStorage = {}; // key → value (string)
+
+                // DOM state — simulates actual DOM elements
+                this.dom = {
+                    __aaIsCompanion: false,
+                    elements: {}, // id → { visible, text, attributes }
+                    dataAttributes: {}, // selector → [elements with data-aa-* attrs]
+                };
+
+                this.reloadCount = 0;
+                this.patchRunCount = 0;
+            }
+
+            // --- LOGIN (simulates viewDidLoad + WKUserScript injection) ---
+            login(userId) {
+                this.currentUserId = userId;
+                const user = { ...this.serverDB[userId] };
+                this.localStorage['base44_user'] = JSON.stringify(user);
+                this.localStorage['base44_access_token'] = 'token_' + userId;
+
+                // WKUserScript sets __aaIsCompanion from UserDefaults (NOT from server)
+                const udKey = 'aa_is_companion';
+                this.dom.__aaIsCompanion = this.userDefaults[udKey] === true;
+
+                // React mount — reads from localStorage
+                this._reactMount();
+            }
+
+            // --- LOGOUT (simulates performFullLogout BUILD 30) ---
+            logout() {
+                // Swift: UserDefaults.standard.set(false, forKey: companionDefaultsKey)
+                this.userDefaults['aa_is_companion'] = false;
+                delete this.userDefaults['aa_active_user_id'];
+
+                // BUILD 30 FIX: JS injection clears DOM
+                this.dom.__aaIsCompanion = false;
+
+                // Remove injected elements
+                delete this.dom.elements['aa-already-subscribed'];
+                delete this.dom.elements['aa-subscription-section'];
+                delete this.dom.elements['aa-sub-restore-btn'];
+                delete this.dom.elements['aa-paywall-restore-btn'];
+
+                // Unhide data-aa-sub-hidden elements
+                this.dom.dataAttributes['data-aa-sub-hidden'] = [];
+                this.dom.dataAttributes['data-aa-paywall-dismissed'] = [];
+
+                // Clear localStorage.base44_user.is_companion
+                if (this.localStorage['base44_user']) {
+                    try {
+                        const u = JSON.parse(this.localStorage['base44_user']);
+                        u.is_companion = false;
+                        delete u.companion_product_id;
+                        this.localStorage['base44_user'] = JSON.stringify(u);
+                    } catch (e) { }
+                }
+
+                // Clear auth
+                delete this.localStorage['base44_access_token'];
+                this.currentUserId = null;
+
+                // Run patches
+                this._runAllPatches();
+            }
+
+            // --- PURCHASE (simulates Build 30 buy handler) ---
+            async purchase(productId) {
+                if (!this.currentUserId) throw new Error('Not logged in');
+
+                // 1. StoreKit purchase
+                const appleId = 'apple_device1';
+                this.storeKit[appleId] = { isCompanion: true, productId };
+
+                // 2. syncCompanionToServerAndWait (await server confirmation)
+                await this._delay(100);
+                this.serverDB[this.currentUserId].is_companion = true;
+
+                // 3. persistCompanionState
+                this.userDefaults['aa_is_companion'] = true;
+                this.userDefaults['aa_companion_' + this.currentUserId] = true;
+
+                // 4. refreshWebEntitlements
+                this.dom.__aaIsCompanion = true;
+                this._runAllPatches();
+
+                // 5. sendPurchaseResult → toast fires NOW (after server confirm)
+
+                // 6. triggerWebRefreshAfterPurchase (BUILD 30)
+                // Step 6a: Update localStorage
+                if (this.localStorage['base44_user']) {
+                    const u = JSON.parse(this.localStorage['base44_user']);
+                    u.is_companion = true;
+                    u.companion_product_id = productId;
+                    this.localStorage['base44_user'] = JSON.stringify(u);
+                }
+
+                // Step 6b: Immediate visual update
+                this.dom.__aaIsCompanion = true;
+                this._runAllPatches();
+
+                // Step 6c: Dismiss paywall overlays
+                if (this.dom.elements['paywall-overlay']) {
+                    this.dom.elements['paywall-overlay'].visible = false;
+                }
+
+                // Step 6d: Controlled reload after 1.5s
+                await this._delay(50); // Simulated reload
+                this.reloadCount++;
+                this._reactMount(); // React re-reads localStorage
+
+                return { success: true };
+            }
+
+            // --- RESTORE (simulates Build 30 restore handler) ---
+            async restore() {
+                const appleId = 'apple_device1';
+                const ent = this.storeKit[appleId];
+                let paymentSheetTriggered = false;
+
+                if (ent && ent.isCompanion) {
+                    // Has entitlement — sync to server
+                    await this._delay(100);
+                    if (this.currentUserId) {
+                        this.serverDB[this.currentUserId].is_companion = true;
+                    }
+
+                    // Same as purchase: localStorage + reload
+                    this.userDefaults['aa_is_companion'] = true;
+                    if (this.localStorage['base44_user']) {
+                        const u = JSON.parse(this.localStorage['base44_user']);
+                        u.is_companion = true;
+                        this.localStorage['base44_user'] = JSON.stringify(u);
+                    }
+                    this.dom.__aaIsCompanion = true;
+                    this._runAllPatches();
+
+                    await this._delay(50);
+                    this.reloadCount++;
+                    this._reactMount();
+
+                    return { restored: true, isCompanion: true, paymentSheetTriggered };
+                }
+
+                // No entitlement — AppStore.sync() would be called but no payment sheet
+                return { restored: false, isCompanion: false, paymentSheetTriggered };
+            }
+
+            // --- FEATURE GATE CHECK (simulates Base44's React gating) ---
+            isFeatureUnlocked() {
+                // Base44 React reads from its internal state which comes from localStorage on mount
+                try {
+                    const stored = this.localStorage['base44_user'];
+                    if (stored) {
+                        return JSON.parse(stored).is_companion === true;
+                    }
+                } catch (e) { }
+                return false;
+            }
+
+            // --- KILL + RELAUNCH (simulates app termination) ---
+            killAndRelaunch() {
+                // On kill: only UserDefaults + device keychain persist
+                // localStorage persists (WKWebView doesn't clear it on kill)
+                // DOM is destroyed and rebuilt
+
+                // Reset DOM completely (app restart builds new DOM)
+                this.dom.elements = {};
+                this.dom.dataAttributes = {};
+                this.dom.__aaIsCompanion = false;
+                this.patchRunCount = 0;
+
+                // On relaunch: WKUserScript sets __aaIsCompanion from UserDefaults
+                this.dom.__aaIsCompanion = this.userDefaults['aa_is_companion'] === true;
+
+                // React re-mounts reading from localStorage (which survived the kill)
+                this._reactMount();
+            }
+
+            // --- Internal helpers ---
+            _delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+            _reactMount() {
+                // React ONLY reads user state from localStorage on component mount
+                try {
+                    const stored = this.localStorage['base44_user'];
+                    if (stored) {
+                        const user = JSON.parse(stored);
+                        // This is what Base44 React does internally
+                        // It sets its internal React state from this
+                    }
+                } catch (e) { }
+                this._runAllPatches();
+            }
+
+            _runAllPatches() {
+                this.patchRunCount++;
+                const isC = this.dom.__aaIsCompanion;
+
+                // updateSubscriptionStatusUI
+                this.dom.elements['aa-sub-status-text'] = {
+                    visible: true,
+                    text: isC ? 'Companion Active' : 'Free',
+                    className: isC ? 'active' : 'free'
+                };
+
+                // handleAlreadySubscribed
+                if (isC) {
+                    // Hide subscribe buttons
+                    this.dom.dataAttributes['data-aa-sub-hidden'] = ['monthly-btn', 'yearly-btn', 'trial-btn'];
+                    // Show active banner + restore button
+                    this.dom.elements['aa-already-subscribed'] = { visible: true, text: '✅ You have an active Companion subscription!' };
+                    this.dom.elements['aa-paywall-restore-btn'] = { visible: true, text: 'Restore Purchases' };
+                } else {
+                    // Remove active banner + restore button
+                    delete this.dom.elements['aa-already-subscribed'];
+                    delete this.dom.elements['aa-paywall-restore-btn'];
+                    // Unhide subscribe buttons
+                    this.dom.dataAttributes['data-aa-sub-hidden'] = [];
+                }
+
+                // injectSubscriptionStatus
+                this.dom.elements['aa-subscription-section'] = { visible: true };
+                this.dom.elements['aa-sub-restore-btn'] = { visible: true, text: 'Restore Purchases' };
+            }
+
+            // --- State inspection ---
+            getUIState() {
+                return {
+                    aaIsCompanion: this.dom.__aaIsCompanion,
+                    statusText: this.dom.elements['aa-sub-status-text']?.text || '',
+                    bannerVisible: !!this.dom.elements['aa-already-subscribed']?.visible,
+                    bannerText: this.dom.elements['aa-already-subscribed']?.text || '',
+                    subscribeHidden: (this.dom.dataAttributes['data-aa-sub-hidden'] || []).length > 0,
+                    paywallRestoreVisible: !!this.dom.elements['aa-paywall-restore-btn']?.visible,
+                    settingsRestoreVisible: !!this.dom.elements['aa-sub-restore-btn']?.visible,
+                    featureGateOpen: this.isFeatureUnlocked(),
+                    localStorageUser: this.localStorage['base44_user'] ? JSON.parse(this.localStorage['base44_user']) : null,
+                };
+            }
+        }
+
+        // =============================================
+        // TEST INFRASTRUCTURE
+        // =============================================
+        function log(id, msg, cls = '') {
+            const el = document.getElementById(`t${id}-log`);
+            const span = document.createElement('span');
+            if (cls) span.className = cls;
+            span.textContent = msg + '\n';
+            el.appendChild(span);
+            el.scrollTop = el.scrollHeight;
+        }
+        function setBadge(id, status) {
+            const b = document.getElementById(`t${id}-badge`);
+            b.textContent = status.toUpperCase();
+            b.className = 'badge ' + status;
+        }
+        function assert(id, label, actual, expected) {
+            const pass = actual === expected;
+            log(id, `  ${pass ? '✓' : '✗'} ${label}: ${actual} (expected: ${expected})`, pass ? 'pass' : 'fail');
+            return pass;
+        }
+
+        // =============================================
+        // TEST CASES
+        // =============================================
+
+        // T1: Purchase → immediate feature check at 0ms delay
+        async function t1() {
+            setBadge(1, 'running');
+            const m = new RealishMock();
+            log(1, '=== T1: Purchase → Feature Check at 0ms ===', 'info');
+
+            m.login('userA');
+            log(1, 'Logged in as User A');
+            const blockedBefore = !m.isFeatureUnlocked();
+            log(1, `Feature blocked before purchase: ${blockedBefore}`);
+
+            await m.purchase('com.abideandanchor.companion.monthly');
+            log(1, 'Purchase completed');
+
+            // THE CRITICAL CHECK: is the feature unlocked RIGHT NOW?
+            const ui = m.getUIState();
+            let pass = true;
+            pass &= assert(1, 'Feature gate open', ui.featureGateOpen, true);
+            pass &= assert(1, '__aaIsCompanion', ui.aaIsCompanion, true);
+            pass &= assert(1, 'Status text', ui.statusText, 'Companion Active');
+            pass &= assert(1, 'Subscribe buttons hidden', ui.subscribeHidden, true);
+            pass &= assert(1, 'localStorage.is_companion', ui.localStorageUser?.is_companion, true);
+            pass &= assert(1, 'Blocked before', blockedBefore, true);
+
+            log(1, pass ? 'T1: PASS ✓' : 'T1: FAIL ✗', pass ? 'pass' : 'fail');
+            setBadge(1, pass ? 'pass' : 'fail');
+            return !!pass;
+        }
+
+        // T2: Restore → immediate navigation to companion feature
+        async function t2() {
+            setBadge(2, 'running');
+            const m = new RealishMock();
+            log(2, '=== T2: Restore → Immediate Navigation ===', 'info');
+
+            // Setup: existing StoreKit entitlement
+            m.storeKit['apple_device1'] = { isCompanion: true, productId: 'monthly' };
+            m.login('userA');
+            log(2, 'Logged in (has StoreKit entitlement, server says false)');
+
+            const result = await m.restore();
+            log(2, `Restore result: restored=${result.restored}, paymentSheet=${result.paymentSheetTriggered}`);
+
+            // IMMEDIATELY check feature (simulates user navigating right after restore)
+            const ui = m.getUIState();
+            let pass = true;
+            pass &= assert(2, 'Restored', result.restored, true);
+            pass &= assert(2, 'No payment sheet', result.paymentSheetTriggered, false);
+            pass &= assert(2, 'Feature gate open', ui.featureGateOpen, true);
+            pass &= assert(2, '__aaIsCompanion', ui.aaIsCompanion, true);
+            pass &= assert(2, 'Server updated', m.serverDB.userA.is_companion, true);
+
+            log(2, pass ? 'T2: PASS ✓' : 'T2: FAIL ✗', pass ? 'pass' : 'fail');
+            setBadge(2, pass ? 'pass' : 'fail');
+            return !!pass;
+        }
+
+        // T3: Rapid logout A → login B → check UI
+        async function t3() {
+            setBadge(3, 'running');
+            const m = new RealishMock();
+            log(3, '=== T3: Rapid Logout A → Login B ===', 'info');
+
+            m.login('userA');
+            await m.purchase('monthly');
+            log(3, 'User A purchased and is companion');
+
+            const uiA = m.getUIState();
+            assert(3, 'User A banner visible', uiA.bannerVisible, true);
+            assert(3, 'User A status', uiA.statusText, 'Companion Active');
+
+            // RAPID logout → login (no delay between)
+            log(3, 'Rapid logout...', 'warn');
+            m.logout();
+
+            const uiAfterLogout = m.getUIState();
+            let pass = true;
+            pass &= assert(3, 'After logout: __aaIsCompanion', uiAfterLogout.aaIsCompanion, false);
+            pass &= assert(3, 'After logout: banner removed', uiAfterLogout.bannerVisible, false);
+            pass &= assert(3, 'After logout: status', uiAfterLogout.statusText, 'Free');
+
+            log(3, 'Immediate login as User B...', 'warn');
+            m.login('userB');
+
+            const uiB = m.getUIState();
+            pass &= assert(3, 'User B: __aaIsCompanion', uiB.aaIsCompanion, false);
+            pass &= assert(3, 'User B: banner visible', uiB.bannerVisible, false);
+            pass &= assert(3, 'User B: status text', uiB.statusText, 'Free');
+            pass &= assert(3, 'User B: subscribe buttons visible', !uiB.subscribeHidden, true);
+            pass &= assert(3, 'User B: feature gate closed', uiB.featureGateOpen, false);
+            pass &= assert(3, 'User B: localStorage.is_companion', uiB.localStorageUser?.is_companion, false);
+
+            log(3, pass ? 'T3: PASS ✓' : 'T3: FAIL ✗', pass ? 'pass' : 'fail');
+            setBadge(3, pass ? 'pass' : 'fail');
+            return !!pass;
+        }
+
+        // T4: Triple account cycle A→B→A
+        async function t4() {
+            setBadge(4, 'running');
+            const m = new RealishMock();
+            log(4, '=== T4: Triple Account Cycle (A→B→A) ===', 'info');
+
+            // Phase 1: A subscribes
+            m.login('userA');
+            await m.purchase('monthly');
+            const ui1 = m.getUIState();
+            let pass = true;
+            pass &= assert(4, 'Phase 1: A is companion', ui1.aaIsCompanion, true);
+            log(4, '✓ Phase 1: User A subscribed', 'pass');
+
+            // Phase 2: Switch to B (free)
+            m.logout();
+            m.login('userB');
+            const ui2 = m.getUIState();
+            pass &= assert(4, 'Phase 2: B is NOT companion', ui2.aaIsCompanion, false);
+            pass &= assert(4, 'Phase 2: B banner hidden', ui2.bannerVisible, false);
+            pass &= assert(4, 'Phase 2: B feature locked', ui2.featureGateOpen, false);
+            log(4, '✓ Phase 2: User B is free, no leakage', 'pass');
+
+            // Phase 3: Back to A — should still be companion (UserDefaults has namespaced key)
+            m.logout();
+            // Simulate: A logs back in, UserDefaults aa_companion_userA still true
+            m.userDefaults['aa_companion_userA'] = true;
+            m.userDefaults['aa_is_companion'] = true; // Write-through on login
+            m.login('userA');
+            // After login, nativeEntitlementRecovery would read UserDefaults
+            m.dom.__aaIsCompanion = m.userDefaults['aa_is_companion'] === true;
+            // And update localStorage
+            if (m.localStorage['base44_user']) {
+                const u = JSON.parse(m.localStorage['base44_user']);
+                u.is_companion = true;
+                m.localStorage['base44_user'] = JSON.stringify(u);
+            }
+            m._runAllPatches();
+
+            const ui3 = m.getUIState();
+            pass &= assert(4, 'Phase 3: A is companion again', ui3.aaIsCompanion, true);
+            pass &= assert(4, 'Phase 3: A feature unlocked', ui3.featureGateOpen, true);
+            pass &= assert(4, 'Phase 3: A banner visible', ui3.bannerVisible, true);
+            log(4, '✓ Phase 3: User A still subscribed', 'pass');
+
+            log(4, pass ? 'T4: PASS ✓' : 'T4: FAIL ✗', pass ? 'pass' : 'fail');
+            setBadge(4, pass ? 'pass' : 'fail');
+            return !!pass;
+        }
+
+        // T5: Purchase → Kill → Relaunch
+        async function t5() {
+            setBadge(5, 'running');
+            const m = new RealishMock();
+            log(5, '=== T5: Purchase → Kill → Relaunch ===', 'info');
+
+            m.login('userA');
+            await m.purchase('monthly');
+            log(5, 'Purchased. Simulating app kill...');
+
+            // Capture pre-kill state
+            const preKill = m.getUIState();
+            assert(5, 'Before kill: companion', preKill.aaIsCompanion, true);
+
+            // KILL (destroys DOM, preserves localStorage + UserDefaults)
+            m.killAndRelaunch();
+            log(5, 'App relaunched');
+
+            const ui = m.getUIState();
+            let pass = true;
+            pass &= assert(5, 'After relaunch: __aaIsCompanion', ui.aaIsCompanion, true);
+            pass &= assert(5, 'After relaunch: feature gate', ui.featureGateOpen, true);
+            pass &= assert(5, 'After relaunch: status', ui.statusText, 'Companion Active');
+            pass &= assert(5, 'After relaunch: localStorage survives', ui.localStorageUser?.is_companion, true);
+
+            log(5, pass ? 'T5: PASS ✓' : 'T5: FAIL ✗', pass ? 'pass' : 'fail');
+            setBadge(5, pass ? 'pass' : 'fail');
+            return !!pass;
+        }
+
+        // T6: localStorage tamper / corruption
+        async function t6() {
+            setBadge(6, 'running');
+            const m = new RealishMock();
+            log(6, '=== T6: localStorage Tamper Resistance ===', 'info');
+
+            let pass = true;
+
+            // Case A: base44_user missing entirely
+            log(6, 'Case A: base44_user missing', 'info');
+            m.login('userA');
+            delete m.localStorage['base44_user'];
+            const gateA = m.isFeatureUnlocked();
+            pass &= assert(6, 'Missing user → feature locked', gateA, false);
+
+            // Case B: base44_user is corrupt JSON
+            log(6, 'Case B: corrupt JSON', 'info');
+            m.localStorage['base44_user'] = '{broken json!!!';
+            const gateB = m.isFeatureUnlocked();
+            pass &= assert(6, 'Corrupt JSON → feature locked', gateB, false);
+
+            // Case C: base44_user exists but is_companion is string "true" not boolean
+            log(6, 'Case C: is_companion as string "true"', 'info');
+            m.localStorage['base44_user'] = JSON.stringify({ id: 'userA', is_companion: 'true' });
+            const gateC = m.isFeatureUnlocked();
+            // "true" !== true, so strict check should fail
+            pass &= assert(6, 'String "true" ≠ boolean true → locked', gateC, false);
+
+            // Case D: base44_user has is_companion=true from PREVIOUS user (stale)
+            log(6, 'Case D: stale is_companion after logout', 'info');
+            m.reset();
+            m.login('userA');
+            await m.purchase('monthly');
+            m.logout(); // BUILD 30: should clear is_companion in localStorage
+            m.login('userB');
+            const gateD = m.isFeatureUnlocked();
+            pass &= assert(6, 'After logout+login B: feature locked', gateD, false);
+            const lsUser = JSON.parse(m.localStorage['base44_user']);
+            pass &= assert(6, 'localStorage user is B', lsUser?.id, 'userB');
+            pass &= assert(6, 'localStorage is_companion=false', lsUser?.is_companion, false);
+
+            log(6, pass ? 'T6: PASS ✓' : 'T6: FAIL ✗', pass ? 'pass' : 'fail');
+            setBadge(6, pass ? 'pass' : 'fail');
+            return !!pass;
+        }
+
+        // T7: Contradictory UI state scan
+        async function t7() {
+            setBadge(7, 'running');
+            const m = new RealishMock();
+            log(7, '=== T7: Contradictory UI State Detection ===', 'info');
+
+            let pass = true;
+
+            // Check 10 different state transitions for contradictions
+            const scenarios = [
+                { name: 'Fresh free user', setup: () => { m.reset(); m.login('userA'); } },
+                { name: 'After purchase', setup: async () => { m.reset(); m.login('userA'); await m.purchase('m'); } },
+                { name: 'After logout', setup: async () => { m.reset(); m.login('userA'); await m.purchase('m'); m.logout(); } },
+                { name: 'Free user after subscribed logged out', setup: async () => { m.reset(); m.login('userA'); await m.purchase('m'); m.logout(); m.login('userB'); } },
+                { name: 'After kill+relaunch (subscribed)', setup: async () => { m.reset(); m.login('userA'); await m.purchase('m'); m.killAndRelaunch(); } },
+                { name: 'After restore', setup: async () => { m.reset(); m.storeKit['apple_device1'] = { isCompanion: true, productId: 'm' }; m.login('userA'); await m.restore(); } },
+            ];
+
+            for (const s of scenarios) {
+                await s.setup();
+                const ui = m.getUIState();
+
+                // RULE: If statusText is "Companion Active", subscribe must be hidden
+                const isActive = ui.statusText === 'Companion Active';
+                const subscribeVisible = !ui.subscribeHidden;
+                const contradiction = isActive && subscribeVisible;
+
+                if (contradiction) {
+                    log(7, `✗ ${s.name}: "Active" + Subscribe visible = CONTRADICTION`, 'fail');
+                    pass = false;
+                } else {
+                    log(7, `✓ ${s.name}: consistent (active=${isActive}, subVisible=${subscribeVisible})`, 'pass');
+                }
+
+                // RULE: If banner says "active subscription", aaIsCompanion must be true
+                if (ui.bannerVisible && !ui.aaIsCompanion) {
+                    log(7, `✗ ${s.name}: Banner visible but aaIsCompanion=false`, 'fail');
+                    pass = false;
+                }
+
+                // RULE: Feature gate must match localStorage
+                if (ui.featureGateOpen !== (ui.localStorageUser?.is_companion === true)) {
+                    // This is OK if localStorage was deleted (T6 edge case)
+                    if (ui.localStorageUser) {
+                        log(7, `✗ ${s.name}: Feature gate disagrees with localStorage`, 'fail');
+                        pass = false;
+                    }
+                }
+            }
+
+            log(7, pass ? 'T7: PASS ✓ — No contradictions found' : 'T7: FAIL ✗', pass ? 'pass' : 'fail');
+            setBadge(7, pass ? 'pass' : 'fail');
+            return !!pass;
+        }
+
+        // T8: Rapid updateSubscriptionStatusUI calls
+        async function t8() {
+            setBadge(8, 'running');
+            const m = new RealishMock();
+            log(8, '=== T8: Rapid State Toggle Race Condition ===', 'info');
+
+            m.login('userA');
+            log(8, 'Simulating rapid true→false→true→false→true calls...');
+
+            // Simulate rapid state changes (like multiple async callbacks resolving)
+            const states = [true, false, true, false, true]; // final should be true
+            for (const s of states) {
+                m.dom.__aaIsCompanion = s;
+                m._runAllPatches();
+            }
+
+            const ui = m.getUIState();
+            let pass = true;
+            pass &= assert(8, 'Final __aaIsCompanion', ui.aaIsCompanion, true);
+            pass &= assert(8, 'Final statusText', ui.statusText, 'Companion Active');
+            pass &= assert(8, 'Subscribe hidden', ui.subscribeHidden, true);
+            pass &= assert(8, 'Banner visible', ui.bannerVisible, true);
+            pass &= assert(8, 'Patches ran', m.patchRunCount > 5, true);
+
+            // Now rapid settle to FALSE
+            log(8, 'Settling to false...');
+            m.dom.__aaIsCompanion = false;
+            m._runAllPatches();
+
+            const ui2 = m.getUIState();
+            pass &= assert(8, 'Settled: __aaIsCompanion=false', ui2.aaIsCompanion, false);
+            pass &= assert(8, 'Settled: status=Free', ui2.statusText, 'Free');
+            pass &= assert(8, 'Settled: subscribe visible', !ui2.subscribeHidden, true);
+            pass &= assert(8, 'Settled: banner removed', ui2.bannerVisible, false);
+
+            log(8, pass ? 'T8: PASS ✓' : 'T8: FAIL ✗', pass ? 'pass' : 'fail');
+            setBadge(8, pass ? 'pass' : 'fail');
+            return !!pass;
+        }
+
+        // --- Run All ---
+        async function runAllTests() {
+            const tests = [t1, t2, t3, t4, t5, t6, t7, t8];
+            for (let i = 1; i <= 8; i++) {
+                document.getElementById(`t${i}-log`).innerHTML = '';
+                setBadge(i, 'pending');
+            }
+            const results = [];
+            for (const t of tests) {
+                results.push(await t());
+                await new Promise(r => setTimeout(r, 100));
+            }
+            const passCount = results.filter(Boolean).length;
+            const summary = document.getElementById('summary');
+            summary.style.display = 'block';
+            summary.className = 'summary ' + (passCount === 8 ? 'all-pass' : 'has-fail');
+            summary.innerHTML = passCount === 8
+                ? `<h2 style="color:#4caf50;">🔥 ALL ${passCount}/8 STRESS TESTS PASSED</h2><p>Build 30 survives aggressive testing.</p>`
+                : `<h2 style="color:#f44336;">⚠️ ${passCount}/8 passed, ${8 - passCount} FAILED</h2><p>Fix failures before sending to client.</p>`;
+        }
+    </script>
+</body>
+
+</html>

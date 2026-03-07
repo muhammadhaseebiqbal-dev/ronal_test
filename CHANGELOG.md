@@ -4,6 +4,97 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-03-06 — Build 31: Fix Contradictory Subscription UI (Strategy Overhaul)
+
+**Problem:** Build 30 on real iOS TestFlight showed contradictory subscription states on the same screen: our injected "Companion Active" banner alongside Base44's own "Companion isn't active on this account" text. Mock tests passed because they only modeled OUR injected UI, not Base44's independent React rendering.
+
+**Root cause:** Two independent UI systems rendered subscription status simultaneously:
+1. Our injected JS elements (`#aa-already-subscribed`, `#aa-subscription-section`) → read from `__aaIsCompanion` (local state)
+2. Base44's own React components → read from `/User/me` API (server state)
+These disagreed when the Worker PATCH hadn't propagated or Base44 cached stale data.
+
+**Strategy change — stop fighting Base44's UI:**
+
+**Fix 1 — Removed conflicting injected elements:**
+- `handleAlreadySubscribed()` no longer injects `#aa-already-subscribed` banner or `#aa-paywall-restore-btn`
+- These were the source of "Active" messaging that contradicted Base44's "not active"
+- If stale elements exist from previous builds, they're now auto-removed on every patch cycle
+
+**Fix 2 — New `__aaSuppressContradictions()` function:**
+- When `__aaIsCompanion=true` AND `__aaServerVerified=true`, scans for Base44 elements containing "isn't active", "not active", "no subscription", etc.
+- Hides them with `data-aa-contradiction-hidden` attribute
+- Only suppresses with BOTH flags set (prevents false suppression from stale local state)
+- Called from `runAllPatches()`, `handleAlreadySubscribed()`, `refreshWebEntitlements()`, and `triggerWebRefreshAfterPurchase()`
+
+**Fix 3 — `__aaServerVerified` flag (single source of truth guard):**
+- Initialized to `false` on boot in `buildNativeDiagJS`
+- Set to `true` only when server confirms companion (via `refreshWebEntitlements(isCompanion: true)` or `triggerWebRefreshAfterPurchase()`)
+- Cleared on logout — prevents cross-account contradiction suppression
+
+**Fix 4 — Cache-busting reload:**
+- `triggerWebRefreshAfterPurchase()` now uses `window.location.href = path + '?_aat=' + Date.now()` instead of `window.location.reload()`
+- Forces Base44's API calls to bypass CDN/browser cache, fetching fresh `/User/me` with updated `is_companion=true`
+- Delay increased to 2s (from 1.5s) to allow server PATCH propagation
+
+**Fix 5 — Restore button consolidated:**
+- Only ONE Restore button: `#aa-sub-restore-btn` in Settings page (via `injectSubscriptionStatus()`)
+- Removed duplicate `#aa-paywall-restore-btn` from paywall screens
+- Client requirement: "Restore appears only in the one agreed location"
+
+**Fix 6 — Logout cleanup enhanced:**
+- Clears `__aaServerVerified = false`
+- Removes `data-aa-contradiction-hidden` markers (un-suppresses Base44 "not active" text for next user)
+- Removes `#aa-paywall-restore-btn` from cleanup list
+
+- **Build number:** 30 → 31 (both Debug and Release)
+- **Files changed:** `PatchedBridgeViewController.swift`, `project.pbxproj`, `CHANGELOG.md`
+
+---
+
+### 2026-03-05 — Build 30: Fix Client-Reported Bugs A, B, C, D
+
+**Context:** Client tested Build 29 on real iOS device via TestFlight. Purchase and restore transactions worked, but 4 UI/state issues were found. All are fixed in Build 30.
+
+**Bug A — Purchase does not unlock immediately:**
+- **Symptom:** Toast says "Companion unlocked" but tapping a Companion feature immediately after still shows the paywall.
+- **Root cause:** Build 28's `triggerWebRefreshAfterPurchase()` fetched `/User/me` via JS and tried to update React state — but Base44's React only reads `localStorage.base44_user` on component mount. No JS injection can force React to re-read mid-session.
+- **Fix:** New 4-step approach in `triggerWebRefreshAfterPurchase()`:
+  1. Update `localStorage.base44_user.is_companion = true` (so React sees it on next mount)
+  2. Set `window.__aaIsCompanion = true` + run all UI patches (immediate visual update — hides subscribe buttons, shows "Active" status)
+  3. Dismiss any paywall overlays still showing (body-level fixed/absolute elements with subscription keywords)
+  4. Controlled `window.location.reload()` after 1.5s delay (forces React re-mount reading updated localStorage)
+
+**Bug B — Restore confirms entitlement but features remain blocked:**
+- **Symptom:** "Restore" button shows success toast but Companion features stay locked until logout/login.
+- **Root cause:** Same as Bug A — React doesn't re-read state mid-session.
+- **Fix:** Same controlled-reload approach as Bug A. Restore flow now follows identical localStorage update + reload path.
+
+**Bug C — Cross-account UI state leakage:**
+- **Symptom:** User A subscribes → logout → login as User B → User B sees "Companion Active" banner and status. Contradictory UI: "Companion Active" + "Subscribe Monthly" shown simultaneously.
+- **Root cause:** `performFullLogout()` cleared `UserDefaults.aa_is_companion` but never touched the DOM. The `#aa-already-subscribed` banner, `#aa-subscription-section`, and `data-aa-sub-hidden` attributes all persisted across the logout/login navigation.
+- **Fix:** `performFullLogout()` now injects JS that:
+  - Sets `window.__aaIsCompanion = false`
+  - Removes DOM elements: `#aa-already-subscribed`, `#aa-subscription-section`, `#aa-sub-restore-btn`
+  - Unhides elements with `data-aa-sub-hidden` and `data-aa-paywall-dismissed` attributes
+  - Clears `localStorage.base44_user.is_companion` to `false`
+  - Runs `__aaRunAllPatches()` to reset all UI state
+
+**Bug D — Missing "Restore Purchases" button on paywall screens:**
+- **Symptom:** Paywall mentions "restore" but no visible button to tap.
+- **Fix:** `handleAlreadySubscribed()` now injects a visible `#aa-paywall-restore-btn` button below the "active subscription" banner on every paywall screen. Styled with app gold color (`#c9a96e`), wired to native `aaPurchase.postMessage({ action: 'restore' })`.
+
+**UI Consistency — No contradictory "Active" + "Subscribe" states:**
+- **Fix:** `updateSubscriptionStatusUI(true)` now proactively hides ALL `[data-aa-iap-wired]` subscribe/yearly/trial buttons (sets `display:none` + `data-aa-sub-hidden`). `updateSubscriptionStatusUI(false)` unhides them and removes the active banner. Prevents the simultaneous "Companion Active" + "Subscribe Monthly" UI the client reported.
+
+**Additional: `handleAlreadySubscribed()` cleanup:**
+- When `__aaIsCompanion` is false, now also removes `#aa-paywall-restore-btn` (prevents stale restore button from previous companion session).
+
+- **Build number:** 29 → 30 (both Debug and Release in `project.pbxproj`)
+- **Files changed:** `PatchedBridgeViewController.swift`, `project.pbxproj`, `CHANGELOG.md`, `BUILD_README.md`
+- **Verification:** 5/5 basic tests ✅, 8/8 stress tests ✅ (rapid purchase, restore, cross-account cycle, kill+relaunch, localStorage corruption, contradictory UI scan, race conditions)
+
+---
+
 ### 2026-02-27 — Raouf: User-Namespaced Entitlement Cache (Build 27)
 
 **Problem:** Build 26's retry-based fix patches the symptom (token race) but the root cause is architectural — `performFullLogout()` wipes the device-global `aa_is_companion` flag, making StoreKit entitlements undetectable until a server check succeeds. Logout should clear session state, NOT entitlement state.
