@@ -4764,6 +4764,52 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         }
       })();
 
+      // ── 6h. HIDE BASE44 COMPANION STATUS (Build 31) ──
+      // ALWAYS hide Base44's own "Companion Status" section on the Settings page.
+      // Our injected SUBSCRIPTION card is the single source of truth.
+      // This prevents having two competing status sections regardless of sub state.
+      function hideBase44CompanionStatus() {
+        var root = document.getElementById('root');
+        if (!root) return;
+        var allEls = root.querySelectorAll('div, section, span, h1, h2, h3, h4, h5, h6');
+        allEls.forEach(function(el) {
+          if (el.getAttribute('data-aa-base44-hidden')) return;
+          if (el.closest('#aa-subscription-section')) return;
+          if (el.id && el.id.indexOf('aa-') === 0) return;
+          var text = (el.textContent || '').trim().toLowerCase();
+          // Match the "Companion Status" heading
+          if (text === 'companion status') {
+            // Walk up to find the containing card/section
+            var target = el;
+            var parent = el.parentElement;
+            for (var d = 0; d < 4 && parent; d++) {
+              if (parent.id === 'root' || parent.tagName === 'MAIN' || parent.tagName === 'BODY') break;
+              var pText = (parent.textContent || '').toLowerCase();
+              if (pText.indexOf('companion status') !== -1 &&
+                  (pText.indexOf('restore') !== -1 || pText.indexOf('active') !== -1)) {
+                target = parent;
+              }
+              parent = parent.parentElement;
+            }
+            target.style.display = 'none';
+            target.setAttribute('data-aa-base44-hidden', '1');
+          }
+        });
+        // Also hide any Base44 native "Restore purchases" buttons outside our section
+        var allBtns = root.querySelectorAll('button, a, [role="button"]');
+        allBtns.forEach(function(btn) {
+          if (btn.id === 'aa-sub-restore-btn') return;
+          if (btn.closest('#aa-subscription-section')) return;
+          if (btn.getAttribute('data-aa-base44-hidden')) return;
+          if (btn.getAttribute('data-aa-iap-wired')) return;
+          var btnText = (btn.textContent || '').trim().toLowerCase();
+          if (btnText === 'restore purchases' || btnText === 'restore purchase') {
+            btn.style.display = 'none';
+            btn.setAttribute('data-aa-base44-hidden', '1');
+          }
+        });
+      }
+
       // ── 7. ORCHESTRATOR ──
 
       var patchTimer = null;
@@ -4782,6 +4828,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           injectSubscriptionStatus();
           injectLogoutButton();
           hideBase44NativeLogout();
+          hideBase44CompanionStatus();
           wireIAPButtons();
           handleAlreadySubscribed();
           // BUILD 31: Suppress Base44 contradictory "not active" text
