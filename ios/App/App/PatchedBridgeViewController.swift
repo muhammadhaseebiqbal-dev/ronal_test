@@ -4400,6 +4400,26 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           if (stale) stale.remove();
           return;
         }
+        // BUILD 31: Only inject on the actual Settings detail page, not every More sub-page.
+        // Detect Settings page by checking for 'Preferences' heading or 'Companion Status'
+        // or a path containing '/settings'. This prevents duplicate cards on Support page etc.
+        var path = window.location.pathname.toLowerCase();
+        var hash = (window.location.hash || '').toLowerCase();
+        var isSettingsPage = path === '/settings' || path.indexOf('/settings/') === 0 ||
+                             hash.indexOf('/settings') !== -1;
+        if (!isSettingsPage) {
+          // Also detect by DOM content — look for Base44's own settings indicators
+          var bodyText = (document.body.innerText || '').toLowerCase();
+          isSettingsPage = bodyText.indexOf('preferences') !== -1 &&
+                           (bodyText.indexOf('companion status') !== -1 ||
+                            bodyText.indexOf('delete account') !== -1 ||
+                            bodyText.indexOf('quick links') !== -1);
+        }
+        if (!isSettingsPage) {
+          var stale2 = document.getElementById('aa-subscription-section');
+          if (stale2) stale2.remove();
+          return;
+        }
         // Build 20 FIX: If section exists, update it in case __aaIsCompanion changed
         // (e.g. async StoreKit check completed after initial render)
         if (document.getElementById('aa-subscription-section')) {
