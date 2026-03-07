@@ -4589,66 +4589,28 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           "not subscribed"
         ];
 
-        // Scan all text-containing elements in #root
         var root = document.getElementById('root');
         if (!root) return;
         var allEls = root.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6, label, section');
         allEls.forEach(function(el) {
           if (el.getAttribute('data-aa-contradiction-hidden')) return;
-          if (el.id && el.id.indexOf('aa-') === 0) return; // Skip our own elements
-          if (el.closest('#aa-subscription-section')) return; // Skip our injected section
-          // Only check leaf-ish elements (not huge containers)
-          if (el.children.length > 5) return;
+          if (el.getAttribute('data-aa-base44-hidden')) return;
+          if (el.id && el.id.indexOf('aa-') === 0) return;
+          if (el.closest('#aa-subscription-section')) return;
+          // ONLY target leaf elements — no parent walking
+          if (el.children.length > 3) return;
           var text = (el.textContent || '').toLowerCase().trim();
           if (text.length < 5 || text.length > 200) return;
 
           for (var i = 0; i < contradictionPhrases.length; i++) {
             if (text.indexOf(contradictionPhrases[i]) !== -1) {
-              // Check this isn't inside a feature description or help text
               if (text.indexOf('how to') !== -1 || text.indexOf('learn more') !== -1 ||
                   text.indexOf('faq') !== -1 || text.indexOf('help') !== -1) continue;
-
-              // BUILD 31: Walk UP to find the parent container section and hide the
-              // entire block (including the heading, Restore button, helper text etc.)
-              // This removes Base44's whole "Companion Status" section, not just the text.
-              var target = el;
-              var parent = el.parentElement;
-              for (var depth = 0; depth < 5 && parent; depth++) {
-                if (parent.id === 'root' || parent.tagName === 'MAIN' || parent.tagName === 'BODY') break;
-                // Check if the parent contains a heading like "Companion Status"
-                var parentText = (parent.textContent || '').toLowerCase();
-                if (parentText.indexOf('companion status') !== -1 &&
-                    parentText.indexOf('restore') !== -1) {
-                  target = parent;
-                  break;
-                }
-                // If parent is a card/section container (small enough to be one logical block)
-                if (parent.children.length <= 6 && parentText.length < 500) {
-                  target = parent;
-                }
-                parent = parent.parentElement;
-              }
-
-              target.style.display = 'none';
-              target.setAttribute('data-aa-contradiction-hidden', '1');
-              console.log('[AA:B31] Suppressed section: "' + (target.textContent || '').substring(0, 80) + '..."');
+              // Hide ONLY this element, not its parent
+              el.style.display = 'none';
+              el.setAttribute('data-aa-contradiction-hidden', '1');
               break;
             }
-          }
-        });
-
-        // BUILD 31: Also hide any Base44 native "Restore purchases" buttons that are
-        // NOT our injected button, to prevent duplicate Restore locations.
-        var allButtons = root.querySelectorAll('button, a, [role="button"]');
-        allButtons.forEach(function(btn) {
-          if (btn.id === 'aa-sub-restore-btn') return; // Keep our button
-          if (btn.closest('#aa-subscription-section')) return; // Skip our section
-          if (btn.getAttribute('data-aa-contradiction-hidden')) return;
-          if (btn.getAttribute('data-aa-iap-wired')) return; // Already handled
-          var btnText = (btn.textContent || '').trim().toLowerCase();
-          if (btnText === 'restore purchases' || btnText === 'restore purchase') {
-            btn.style.display = 'none';
-            btn.setAttribute('data-aa-contradiction-hidden', '1');
           }
         });
       };
