@@ -4771,31 +4771,39 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
       function hideBase44CompanionStatus() {
         var root = document.getElementById('root');
         if (!root) return;
-        var allEls = root.querySelectorAll('div, section, span, h1, h2, h3, h4, h5, h6');
+
+        // Target specific text content to hide INDIVIDUALLY — no parent walking.
+        // These are the elements Base44 renders in its "Companion Status" section.
+        var hideTexts = [
+          'companion status',                        // Section heading
+          "companion isn't active on this account",  // Status text
+          "companion is not active on this account",
+          "companion isn't active",
+          "companion is not active",
+          'already subscribed on this apple id',     // Helper text
+          'tap restore purchases'                    // Helper text continued
+        ];
+
+        var allEls = root.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6, label, section');
         allEls.forEach(function(el) {
           if (el.getAttribute('data-aa-base44-hidden')) return;
           if (el.closest('#aa-subscription-section')) return;
           if (el.id && el.id.indexOf('aa-') === 0) return;
+          // Skip large containers — only target leaf-ish elements
+          if (el.children.length > 3) return;
           var text = (el.textContent || '').trim().toLowerCase();
-          // Match the "Companion Status" heading
-          if (text === 'companion status') {
-            // Walk up to find the containing card/section
-            var target = el;
-            var parent = el.parentElement;
-            for (var d = 0; d < 4 && parent; d++) {
-              if (parent.id === 'root' || parent.tagName === 'MAIN' || parent.tagName === 'BODY') break;
-              var pText = (parent.textContent || '').toLowerCase();
-              if (pText.indexOf('companion status') !== -1 &&
-                  (pText.indexOf('restore') !== -1 || pText.indexOf('active') !== -1)) {
-                target = parent;
-              }
-              parent = parent.parentElement;
+          if (text.length < 5 || text.length > 300) return;
+
+          for (var i = 0; i < hideTexts.length; i++) {
+            if (text.indexOf(hideTexts[i]) !== -1) {
+              el.style.display = 'none';
+              el.setAttribute('data-aa-base44-hidden', '1');
+              break;
             }
-            target.style.display = 'none';
-            target.setAttribute('data-aa-base44-hidden', '1');
           }
         });
-        // Also hide any Base44 native "Restore purchases" buttons outside our section
+
+        // Hide any Base44 native "Restore purchases" buttons outside our section
         var allBtns = root.querySelectorAll('button, a, [role="button"]');
         allBtns.forEach(function(btn) {
           if (btn.id === 'aa-sub-restore-btn') return;
