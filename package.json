@@ -16,7 +16,9 @@
     "test:e2e": "npm run build && playwright test",
     "test:regression": "npm run test && npm run test:e2e && node scripts/generate-regression-summary.js",
     "verify:ios": "node scripts/verify-ios-build.js",
-    "build:ios": "npm run build && npm run verify:ios && npx cap sync ios"
+    "patch:spm": "node scripts/patch-cap-spm.js",
+    "build:ios": "npm run build && npm run verify:ios && npx cap sync ios && npm run patch:spm",
+    "postinstall": "npm run patch:spm"
   },
   "dependencies": {
     "@base44/sdk": "^0.8.3",
