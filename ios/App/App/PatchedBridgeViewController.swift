@@ -2868,6 +2868,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             showAAToast(result.message || 'Purchase failed. Please try again.', 'error');
           } else if (status === 'pending') {
             showAAToast('Purchase pending approval.', 'info');
+          } else if (status === 'info') {
+            showAAToast(result.message || 'Notice', 'info');
           }
           // cancelled: no toast — user initiated it
         }
