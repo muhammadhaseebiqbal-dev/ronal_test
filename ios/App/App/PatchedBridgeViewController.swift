@@ -313,27 +313,22 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                     return
                 }
 
-                // ── BUILD 28 FIX (Bug 1): Wait for server confirm BEFORE toast ──
-                // Previously we sent isCompanion:true immediately (toast fired), then
-                // did fire-and-forget server sync. The page reloaded before the PATCH
-                // propagated, so Base44 re-fetched /User/me with stale is_companion=false.
-                //
-                // New flow:
-                //   1. StoreKit confirms → persist locally + update JS __aaIsCompanion
-                //   2. Sync JWS to server AND WAIT for 200 OK
-                //   3. THEN send success to JS (toast + dismissPaywallOverlay)
-                //   4. Force /User/me refetch via JS (no full page reload)
-                self.clearAwaitingServerConfirmState(reason: "purchase-success")
-                self.persistCompanionState(result.isCompanion)
-                self.refreshWebEntitlements(isCompanion: result.isCompanion)
+                // ── BUILD 34.1 FIX: Server-Authoritative Buy Flow ──
+                // Previously, we updated __aaIsCompanion and the UI immediately upon StoreKit success.
+                // If the user's Apple ID was already subscribed to a DIFFERENT Base44 account,
+                // StoreKit returns success (existing transaction), but the server rejects the JWS sync.
+                // We must WAIT for the server to accept the JWS before granting access locally.
+                
+                self.clearAwaitingServerConfirmState(reason: "purchase-storekit-active")
 
-                // Step 2: Sync token first (may not be in UserDefaults yet if < 3s)
+                // Step 2: Sync token first (needed to identify the user for JWS sync)
                 let tokenFoundContinuation: Bool = await withCheckedContinuation { cont in
                     self.syncTokenToUserDefaults { found in
                         cont.resume(returning: found)
                     }
                 }
-                _ = tokenFoundContinuation  // Used for logging only
+                _ = tokenFoundContinuation
+                self.updateActiveUserId()
 
                 var serverConfirmed = false
                 if let jws = result.jws {
@@ -341,14 +336,31 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                     os_log(.info, log: Self.log, "[IAP:buy] Server confirm=%{public}@", serverConfirmed ? "YES" : "NO")
                 }
 
-                // Step 3: NOW send success toast — server has been updated
-                var payload: [String: Any] = ["status": "success", "action": "buy"]
-                payload["isCompanion"] = result.isCompanion
-                if let pid = result.productId { payload["productId"] = pid }
-                self.sendPurchaseResult(payload)
+                if serverConfirmed {
+                    // Step 3: Server accepted the JWS and linked it to THIS account.
+                    // NOW we can persist the state and update the UI.
+                    self.persistCompanionState(true)
+                    self.refreshWebEntitlements(isCompanion: true)
 
-                // Step 4: Force /User/me refetch via JS (no full page reload)
-                self.triggerWebRefreshAfterPurchase()
+                    var payload: [String: Any] = ["status": "success", "action": "buy"]
+                    payload["isCompanion"] = true
+                    if let pid = result.productId { payload["productId"] = pid }
+                    self.sendPurchaseResult(payload)
+
+                    // Step 4: Force /User/me refetch via JS (no full page reload)
+                    self.triggerWebRefreshAfterPurchase()
+                } else {
+                    // Step 3 (Failed): Server rejected the sync or network failed.
+                    // This happens when the Apple ID subscription is already claimed by
+                    // a different Base44 account, and the current user trying to "buy" it
+                    // is not allowed to steal it.
+                    os_log(.info, log: Self.log, "[IAP:buy] StoreKit active but server rejected — subscription belongs to different account")
+                    self.sendPurchaseResult([
+                        "status": "info",
+                        "action": "buy",
+                        "message": "This Apple ID subscription is already linked to a different Companion account. Please log in with the account that originally purchased the subscription."
+                    ])
+                }
             }
 
         case "restore":
