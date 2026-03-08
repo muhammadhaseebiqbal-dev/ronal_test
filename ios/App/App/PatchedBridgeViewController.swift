@@ -1343,22 +1343,41 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                     os_log(.info, log: Self.log, "[TxnUpdate] Cache hit — applying StoreKit companion=true")
                     self.persistCompanionState(true)
                     self.refreshWebEntitlements(isCompanion: true)
+                    self.sendPurchaseResult([
+                        "status": "success",
+                        "isCompanion": true,
+                        "source": "transactionUpdate"
+                    ])
                 } else {
                     // Unknown account match — ask server instead of trusting StoreKit
                     os_log(.info, log: Self.log, "[TxnUpdate] No cache hit — checking server (not trusting StoreKit alone)")
-                    self.checkCompanionOnServer()
+                    Task { @MainActor in
+                        let serverIsCompanion = await self.checkCompanionOnServerAndWait()
+                        if serverIsCompanion {
+                            self.persistCompanionState(true)
+                            self.refreshWebEntitlements(isCompanion: true)
+                            self.sendPurchaseResult([
+                                "status": "success",
+                                "isCompanion": true,
+                                "source": "transactionUpdate"
+                            ])
+                        } else {
+                            os_log(.info, log: Self.log, "[TxnUpdate] Server rejected StoreKit Apple ID subscription for this Base44 user. Reverting StoreKit leak.")
+                            // Do NOT send success to JS — it's not their subscription!
+                        }
+                    }
                 }
             } else {
                 // StoreKit says NOT companion (expiry, refund) — safe to apply
                 os_log(.info, log: Self.log, "[TxnUpdate] StoreKit companion=false — applying")
                 self.persistCompanionState(false)
                 self.refreshWebEntitlements(isCompanion: false)
+                self.sendPurchaseResult([
+                    "status": "success",
+                    "isCompanion": false,
+                    "source": "transactionUpdate"
+                ])
             }
-            self.sendPurchaseResult([
-                "status": "success",
-                "isCompanion": isCompanion,
-                "source": "transactionUpdate"
-            ])
         }
     }
 
@@ -2267,11 +2286,14 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         };
         // Build 10: IAP callback default + companion state
         window.__aaPurchaseResult = window.__aaPurchaseResult || function(_){};
-        window.__aaIsCompanion = \(isCompanion ? "true" : "false");
+        
+        // BUILD 34 FIX: On login screen, force states false to prevent UI flash from old UserDefaults 
+        // state before recheckEntitlements syncs the new user's actual state.
+        var isOnLogin = window.location.pathname.indexOf('/login') !== -1;
+        window.__aaIsCompanion = isOnLogin ? false : \(isCompanion ? "true" : "false");
+        
         // BUILD 31: Server-verified flag.
-        // If aa_just_purchased is set (post-reload after purchase), inject true immediately
-        // so __aaSuppressContradictions works on the fresh page. Otherwise false.
-        window.__aaServerVerified = \(UserDefaults.standard.bool(forKey: Self.justPurchasedKey) && isCompanion ? "true" : "false");
+        window.__aaServerVerified = isOnLogin ? false : \(UserDefaults.standard.bool(forKey: Self.justPurchasedKey) && isCompanion ? "true" : "false");
         \(UserDefaults.standard.bool(forKey: Self.justPurchasedKey) ? "console.log('[AA:B31] Post-purchase reload detected — __aaServerVerified=true');" : "")
         // Build 11: Cross-device companion check via Cloudflare Worker
         window.__aaCompanionWorkerURL = '\(Self.companionWorkerURL)';
@@ -2807,10 +2829,9 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         var status = result.status;
         var action = result.action || '';
         var source = result.source || '';
-        // Background renewal/refund
         if (source === 'transactionUpdate') {
           if (result.isCompanion) { showAAToast('Subscription renewed', 'success'); }
-          else { showAAToast('Subscription status changed', 'info'); }
+          // Removed the confusing "Subscription status changed" info toast for non-subscribers
           updateSubscriptionStatusUI(result.isCompanion);
           return;
         }
@@ -3927,7 +3948,7 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           }
 
           // MONTHLY SUBSCRIBE — broad matching for all subscribe-like actions
-          if (!isRestore && !isTrial && !isYearly) {
+          if (!isRestore && !isYearly) {
             // Exact patterns
             if (text === 'subscribe' || text === 'subscribe monthly' || text === 'monthly') {
               isMonthlySubscribe = true;
@@ -3961,6 +3982,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             if (text === 'upgrade' || text === 'upgrade now' || text === 'start now' ||
                 text === 'choose plan' || text === 'select plan') {
               isMonthlySubscribe = true;
+            }
+            // Also override trial hiding if this is the primary button
+            if (isMonthlySubscribe && isTrial) {
+              isTrial = false;
             }
           }
 
@@ -4381,6 +4406,10 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             el.style.display = '';
             el.removeAttribute('data-aa-sub-hidden');
           });
+          document.querySelectorAll('[data-aa-contradiction-hidden]').forEach(function(el) {
+            el.style.display = '';
+            el.removeAttribute('data-aa-contradiction-hidden');
+          });
         } else {
           // When companion is ACTIVE, proactively hide subscribe sections
           document.querySelectorAll('[data-aa-iap-wired]').forEach(function(btn) {
@@ -4707,6 +4736,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
           authKeys.forEach(function(key) {
             try { localStorage.removeItem(key); } catch(e) {}
           });
+          // BUILD 34 FIX: Clear companion state immediately to prevent leakage to next login
+          window.__aaIsCompanion = false;
+          window.__aaServerVerified = false;
+          if (typeof updateSubscriptionStatusUI === 'function') {
+            updateSubscriptionStatusUI(false);
+          }
           // Recompute after clearing
           window.__AA_TOKEN_META = computeTokenMeta();
           return;

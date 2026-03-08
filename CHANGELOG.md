@@ -1941,3 +1941,10 @@ Login persistence remains correct. The same-origin mode (`server.url: https://ab
 
 **Scope:** iOS token persistence, Base44 App ID wiring  
 **Summary:** Fixed critical bugs where App ID was null in iOS builds and auth tokens were lost on cold restart.
+
+## [1.0.0 (34)] - 2026-03-08
+### Fixed
+- Fixed a major cross-account leakage issue where the StoreKit transaction listener would apply Apple ID entitlements to un-subscribed Base44 accounts, causing misleading 'Companion Active' status.
+- Fixed an issue where the primary Subscribe button could be completely hidden if Base44 included 'trial' in its text.
+- Fixed a UI flashing issue on the login screen where the previous session's entitlement status would briefly appear before the native sync completed.
+- Fixed a cosmetic issue during Restore Purchases where non-subscribers would see 'Subscription status changed' rather than 'No active subscription found'.
