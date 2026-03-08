@@ -1518,6 +1518,22 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
     /// The optional completion handler is called on the main thread with `true` if a token
     /// was found and saved (or already present), `false` otherwise.
     private func syncTokenToUserDefaults(completion: ((Bool) -> Void)?) {
+        // Build 37: Read directly from native Capacitor Preferences FIRST.
+        // This flawlessly bypasses WebKit tracking prevention that blocks localStorage
+        // on fresh simulator installs or strict privacy settings.
+        if let capToken = UserDefaults.standard.string(forKey: "CapacitorStorage.base44_auth_token"), !capToken.isEmpty {
+            let existing = UserDefaults.standard.string(forKey: Self.tokenDefaultsKey)
+            if existing != capToken {
+                UserDefaults.standard.set(capToken, forKey: Self.tokenDefaultsKey)
+                os_log(.info, log: Self.log, "[TokenSync:Native] Saved token to UserDefaults (len=%d)", capToken.count)
+            } else {
+                os_log(.info, log: Self.log, "[TokenSync:Native] UserDefaults already has current token (len=%d)", capToken.count)
+            }
+            updateActiveUserId(fromToken: capToken)
+            completion?(true)
+            return
+        }
+
         guard let webView = self.webView else {
             completion?(false)
             return
