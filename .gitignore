@@ -9,10 +9,6 @@ yarn-debug.log*
 pnpm-debug.log*
 
 # Env files (keep templates)
-.env
-.env.*
-!.env.example
-!.env.production
 
 # OS
 .DS_Store
