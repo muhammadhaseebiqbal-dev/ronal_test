@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-03-08 — Build 33: CapApp-SPM Xcode Resolution Fix
+
+**Summary:** Fixed a critical build-blocking issue where the `CapApp-SPM` auto-generated package contained Windows-style backslashes for local paths (e.g. `..\..\..\node_modules`). This prevented Xcode on macOS from resolving the `CapApp-SPM` package product, halting the archive process.
+
+**Changes:**
+1. **CapApp-SPM Package Paths Fixed**
+   - Modified `ios/App/CapApp-SPM/Package.swift` to use macOS-compatible forward slashes (`../../../node_modules`) for `@capacitor/app`, `@capacitor/browser`, and `@capacitor/preferences` local dependencies.
+2. **Build Validation**
+   - Bumped `CURRENT_PROJECT_VERSION` to 33.
+
 ### 2026-03-07 — Build 32: Subscription UI Consolidation & Simulator-Verified Fixes
 
 **Summary:** Consolidated all subscription status display into a single, controlled card. Eliminated dual-status confusion by hiding Base44's native "Companion Status" section entirely. All changes verified on iOS Simulator with StoreKit sandbox testing.
