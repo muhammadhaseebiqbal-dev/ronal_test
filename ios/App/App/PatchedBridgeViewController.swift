@@ -816,7 +816,12 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            os_log(.info, log: Self.log, "[Reachability] Server responded with %d", statusCode)
+            
+            if statusCode == 404 || statusCode == 405 {
+                os_log(.info, log: Self.log, "[Reachability] Online (Cloudflare Worker active, Status %d)", statusCode)
+            } else {
+                os_log(.info, log: Self.log, "[Reachability] Online (Server responded with %d)", statusCode)
+            }
             
             // Any HTTP response (even 404 or 405 from a HEAD request) proves we have internet access
             return statusCode > 0
