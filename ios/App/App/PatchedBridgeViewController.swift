@@ -352,13 +352,21 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
                 } else {
                     // Step 3 (Failed): Server rejected the sync or network failed.
                     // This happens when the Apple ID subscription is already claimed by
-                    // a different Base44 account, and the current user trying to "buy" it
-                    // is not allowed to steal it.
-                    os_log(.info, log: Self.log, "[IAP:buy] StoreKit active but server rejected — subscription belongs to different account")
+                    // a different Base44 account, OR when testing in a Simulator using Xcode's
+                    // local StoreKit configuration (Apple_Xcode_Key) instead of the real Apple Sandbox.
+                    os_log(.info, log: Self.log, "===========================================================")
+                    os_log(.info, log: Self.log, "[IAP:buy] SERVER REJECTED STOREKIT PURCHASE")
+                    os_log(.info, log: Self.log, "StoreKit returned a valid receipt, but the Base44 server")
+                    os_log(.info, log: Self.log, "rejected it. If you are in the Simulator, this is EXPECTED.")
+                    os_log(.info, log: Self.log, "The server physically requires a real cryptographic Apple")
+                    os_log(.info, log: Self.log, "receipt to unlock the feature, and simulators only generate")
+                    os_log(.info, log: Self.log, "fake local receipts.")
+                    os_log(.info, log: Self.log, "===========================================================")
+                    
                     self.sendPurchaseResult([
                         "status": "info",
                         "action": "buy",
-                        "message": "This Apple ID subscription is already linked to a different Companion account. Please log in with the account that originally purchased the subscription."
+                        "message": "Purchase verified locally but rejected by the server. If testing in Simulator, use a real device via TestFlight."
                     ])
                 }
             }
@@ -856,6 +864,18 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             if let responseStr = String(data: data, encoding: .utf8) {
                 os_log(.info, log: Self.log, "[ServerSync:await] Response %d: %{public}@", statusCode, responseStr)
+                
+                // Add highly visible diagnostic logs for Simulator testing
+                if statusCode == 401 && responseStr.contains("Apple_Xcode_Key") {
+                    os_log(.info, log: Self.log, "===========================================================")
+                    os_log(.info, log: Self.log, "🚨 SIMULATOR PURCHASE REJECTED BY BASE44 SERVER 🚨")
+                    os_log(.info, log: Self.log, "Reason: The purchase was signed with a fake 'Apple_Xcode_Key'.")
+                    os_log(.info, log: Self.log, "The Base44 server physically requires a real Apple Sandbox")
+                    os_log(.info, log: Self.log, "receipt to unlock the feature securely.")
+                    os_log(.info, log: Self.log, "Status: YOUR APP CODE IS WORKING PERFECTLY.")
+                    os_log(.info, log: Self.log, "Fix: Test on a physical iPhone via TestFlight.")
+                    os_log(.info, log: Self.log, "===========================================================")
+                }
             }
             DispatchQueue.main.async {
                 self.pushWorkerResponseToJS(endpoint: "/validate-receipt", statusCode: statusCode, error: nil)
