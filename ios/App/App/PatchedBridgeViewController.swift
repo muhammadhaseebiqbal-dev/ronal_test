@@ -817,6 +817,8 @@ class PatchedBridgeViewController: CAPBridgeViewController, WKScriptMessageHandl
             let (_, response) = try await URLSession.shared.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             os_log(.info, log: Self.log, "[Reachability] Server responded with %d", statusCode)
+            
+            // Any HTTP response (even 404 or 405 from a HEAD request) proves we have internet access
             return statusCode > 0
         } catch {
             os_log(.info, log: Self.log, "[Reachability] Server unreachable: %{public}@", error.localizedDescription)
